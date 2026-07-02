@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PBD 椭球调试</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #111; overflow: hidden; font-family: monospace; }
+        canvas { display: block; cursor: crosshair; }
+
+        #hud {
+            position: fixed; top: 12px; left: 12px; z-index: 10;
+            color: #ccc; font-size: 13px; line-height: 1.7;
+            pointer-events: none;
+        }
+        #hud .val { color: #0f0; }
+
+        #info {
+            position: fixed; bottom: 16px; left: 50%;
+            transform: translateX(-50%);
+            color: #888; font-size: 12px; z-index: 10;
+            pointer-events: none;
+        }
+
+        #panel {
+            position: fixed; top: 12px; right: 12px; z-index: 20;
+            background: rgba(0,0,0,0.8);
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 14px 18px;
+            color: #ccc;
+            font-size: 13px;
+            min-width: 220px;
+            pointer-events: all;
+            user-select: none;
+        }
+        #panel label { display: block; margin: 8px 0 2px; color: #aaa; }
+        #panel input[type=range] { width: 100%; margin: 0; accent-color: #ff4444; }
+        #panel .val { color: #ff4444; float: right; }
+        #panel h3 { margin: 0 0 6px; color: #fff; font-size: 14px; }
+    </style>
+</head>
+<body>
+
+    <div id="hud">
+        <div>FPS: <span class="val" id="fps">--</span></div>
+        <div>帧耗时: <span class="val" id="framems">--</span> ms</div>
+        <div>顶点: <span class="val" id="vcount">--</span></div>
+        <div>三角形: <span class="val" id="tcount">--</span></div>
+        <div>皮筋: <span class="val" id="bcount">0</span></div>
+        <div>体积: <span class="val" id="vratio">100</span>%</div>
+        <div>当前体积: <span class="val" id="cvol">--</span></div>
+        <div>rest体积: <span class="val" id="rvol">--</span></div>
+        <div>PBD迭代: <span class="val" id="pbditer">--</span></div>
+    </div>
+    <div id="info">🖱️ 点击椭球表面绑皮筋 &nbsp; R 键割一根</div>
+
+    <div id="panel">
+        <h3>🔧 PBD 参数</h3>
+        <label>皮筋刚度 <span class="val" id="sv_bs">0.50</span></label>
+        <input type="range" id="sl_bs" min="0.05" max="1.0" step="0.05" value="0.50">
+        <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
+        <input type="range" id="sl_vs" min="0.05" max="1.0" step="0.05" value="0.40">
+        <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
+        <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
+        <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
+        <input type="range" id="sl_pi" min="1" max="20" step="1" value="10">
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ──────────────────────────────────────
+        // DOM
+        // ──────────────────────────────────────
+        const $ = id => document.getElementById(id);
+        const H = {
+            fps: $('fps'), framems: $('framems'),
+            vcount: $('vcount'), tcount: $('tcount'),
+            bcount: $('bcount'), vratio: $('vratio'),
+            cvol: $('cvol'), rvol: $('rvol'), pbditer: $('pbditer'),
+        };
+
+        // ──────────────────────────────────────
+        // Three.js setup
+        // ──────────────────────────────────────
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#111122');
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 50);
+        camera.position.set(2, 2, 4);
+        camera.lookAt(0, 0, 0);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 0, 0);
+        controls.enableDamping = true;
+        controls.update();
+
+        // Lighting
+        scene.add(new THREE.AmbientLight('#fff', 0.5));
+        scene.add(new THREE.DirectionalLight('#fff', 1.5).translateY(5));
+
+        // ──────────────────────────────────────
+        // Ellipsoid parameters
+        // ──────────────────────────────────────
+        const ELLI_RX = 0.5;   // X radius
+        const ELLI_RY = 1.5;   // Y radius (taller → pineapple shape)
+        const ELLI_RZ = 0.5;   // Z radius
+        const RINGS = 5;       // latitude rings (not counting poles)
+        const SEGS = 8;        // longitude segments per ring
+        // Total vertices = 1 (top pole) + RINGS * SEGS + 1 (bottom pole)
+        const TOTAL_V = 1 + RINGS * SEGS + 1;
+
+        // ──────────────────────────────────────
+        // PBD params (adjustable via sliders)
+        // ──────────────────────────────────────
+        let BAND_STIFFNESS = 0.5;
+        let VOLUME_STIFFNESS = 0.4;
+        let BAND_INFLUENCE = 0.6;
+        let PBD_ITERATIONS = 10;
+        const BAND_INITIAL_TIGHTNESS = 0.80;
+
+        // Slider wiring
+        const slBS = document.getElementById('sl_bs');
+        const slVS = document.getElementById('sl_vs');
+        const slBI = document.getElementById('sl_bi');
+        const slPI = document.getElementById('sl_pi');
+        const svBS = document.getElementById('sv_bs');
+        const svVS = document.getElementById('sv_vs');
+        const svBI = document.getElementById('sv_bi');
+        const svPI = document.getElementById('sv_pi');
+
+        slBS.addEventListener('input', () => {
+            BAND_STIFFNESS = parseFloat(slBS.value);
+            svBS.textContent = BAND_STIFFNESS.toFixed(2);
+            for (const b of bands) b.stiffness = BAND_STIFFNESS;
+        });
+        slVS.addEventListener('input', () => {
+            VOLUME_STIFFNESS = parseFloat(slVS.value);
+            svVS.textContent = VOLUME_STIFFNESS.toFixed(2);
+        });
+        slBI.addEventListener('input', () => {
+            BAND_INFLUENCE = parseFloat(slBI.value);
+            svBI.textContent = BAND_INFLUENCE.toFixed(2);
+            for (const b of bands) b.influence = BAND_INFLUENCE;
+        });
+        slPI.addEventListener('input', () => {
+            PBD_ITERATIONS = parseInt(slPI.value);
+            svPI.textContent = PBD_ITERATIONS;
+            H.pbditer.textContent = PBD_ITERATIONS;
+        });
+
+        // ──────────────────────────────────────
+        // Build ellipsoid geometry
+        // ──────────────────────────────────────
+        function buildEllipsoid(rx, ry, rz, rings, segs) {
+            // Vertex layout:
+            //   index 0: top pole (0, ry, 0)
+            //   index 1..rings*segs: ring vertices, ring 0 (topmost) first
+            //   index rings*segs+1: bottom pole (0, -ry, 0)
+            const positions = [];
+            const normals = [];
+
+            // Top pole
+            positions.push(0, ry, 0);
+            normals.push(0, 1, 0);
+
+            // Ring vertices
+            for (let ring = 0; ring < rings; ring++) {
+                // phi: 0 at top pole, PI at bottom pole
+                // ring 0 is closest to top, ring rings-1 closest to bottom
+                const phi = Math.PI * (ring + 1) / (rings + 1);
+                const sinPhi = Math.sin(phi);
+                const cosPhi = Math.cos(phi);
+                const yr = ry * cosPhi;
+                const rr = Math.sqrt((rx * sinPhi) ** 2 + (rz * sinPhi) ** 2);
+                // Simplified: use average radius in XZ plane
+                const rxz = (rx + rz) / 2 * sinPhi;
+
+                for (let seg = 0; seg < segs; seg++) {
+                    const theta = 2 * Math.PI * seg / segs;
+                    const x = rx * sinPhi * Math.cos(theta);
+                    const z = rz * sinPhi * Math.sin(theta);
+                    const y = ry * cosPhi;
+                    positions.push(x, y, z);
+                    // Normal (approximate for ellipsoid)
+                    const nx = x / (rx * rx);
+                    const ny = y / (ry * ry);
+                    const nz = z / (rz * rz);
+                    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                    normals.push(nx / nl, ny / nl, nz / nl);
+                }
+            }
+
+            // Bottom pole
+            positions.push(0, -ry, 0);
+            normals.push(0, -1, 0);
+
+            // Build index array (triangles)
+            const indices = [];
+            const topPole = 0;
+            const bottomPole = TOTAL_V - 1;
+
+            // Top fan: top pole to first ring
+            for (let seg = 0; seg < segs; seg++) {
+                const curr = 1 + seg;
+                const next = 1 + (seg + 1) % segs;
+                indices.push(topPole, curr, next);
+            }
+
+            // Middle quads (2 triangles each)
+            for (let ring = 0; ring < rings - 1; ring++) {
+                const ringStart = 1 + ring * segs;
+                const nextRingStart = 1 + (ring + 1) * segs;
+                for (let seg = 0; seg < segs; seg++) {
+                    const a = ringStart + seg;
+                    const b = ringStart + (seg + 1) % segs;
+                    const c = nextRingStart + seg;
+                    const d = nextRingStart + (seg + 1) % segs;
+                    indices.push(a, c, b);
+                    indices.push(b, c, d);
+                }
+            }
+
+            // Bottom fan: last ring to bottom pole
+            const lastRingStart = 1 + (rings - 1) * segs;
+            for (let seg = 0; seg < segs; seg++) {
+                const curr = lastRingStart + seg;
+                const next = lastRingStart + (seg + 1) % segs;
+                indices.push(curr, bottomPole, next);
+            }
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+            geo.setIndex(indices);
+            return geo;
+        }
+
+        const ellipsoidGeo = buildEllipsoid(ELLI_RX, ELLI_RY, ELLI_RZ, RINGS, SEGS);
+
+        // ──────────────────────────────────────
+        // Mesh (wireframe + translucent surface)
+        // ──────────────────────────────────────
+        const surfaceMat = new THREE.MeshPhongMaterial({
+            color: '#ffaa00',
+            transparent: true,
+            opacity: 0.3,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+        });
+        const ellipsoidMesh = new THREE.Mesh(ellipsoidGeo, surfaceMat);
+        scene.add(ellipsoidMesh);
+
+        const wireframeMat = new THREE.MeshBasicMaterial({
+            color: '#ffffff',
+            wireframe: true,
+            transparent: true,
+            opacity: 0.5,
+        });
+        const wireframe = new THREE.Mesh(ellipsoidGeo, wireframeMat);
+        scene.add(wireframe);
+
+        // ──────────────────────────────────────
+        // Vertex number sprites
+        // ──────────────────────────────────────
+        const spriteGroup = new THREE.Group();
+        scene.add(spriteGroup);
+
+        function makeNumberSprite(n) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#00ff88';
+            ctx.font = 'bold 18px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(String(n), 32, 16);
+
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.minFilter = THREE.LinearFilter;
+            const mat = new THREE.SpriteMaterial({
+                map: tex,
+                depthTest: false,
+                depthWrite: false,
+                transparent: true,
+            });
+            const sprite = new THREE.Sprite(mat);
+            sprite.scale.set(0.25, 0.125, 1);
+            return sprite;
+        }
+
+        function rebuildSprites() {
+            // Clear old sprites
+            while (spriteGroup.children.length > 0) {
+                const s = spriteGroup.children[0];
+                s.material.map?.dispose();
+                s.material.dispose();
+                spriteGroup.remove(s);
+            }
+
+            const pos = ellipsoidGeo.attributes.position;
+            for (let i = 0; i < pos.count; i++) {
+                const sprite = makeNumberSprite(i);
+                sprite.position.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+                sprite.userData.vertexIndex = i;
+                spriteGroup.add(sprite);
+            }
+        }
+        rebuildSprites();
+
+        // ──────────────────────────────────────
+        // PBD State
+        // ──────────────────────────────────────
+        let restPositions = null;   // Float32Array
+        let restVolume = 0;
+        let restSurfaceArea = 0;
+
+        const bands = [];           // { centerY, targetRadius, stiffness, influence }
+        const bandVisuals = [];     // THREE.Mesh (torus)
+        const BAND_VIS_COUNT = 20;  // pool size
+        for (let i = 0; i < BAND_VIS_COUNT; i++) {
+            const geo = new THREE.TorusGeometry(1.0, 0.02, 16, 48);
+            const mat = new THREE.MeshBasicMaterial({ color: '#ff3333', transparent: true, opacity: 0.7, depthTest: false, depthWrite: false });
+            const torus = new THREE.Mesh(geo, mat);
+            torus.rotation.x = -Math.PI / 2;
+            torus.visible = false;
+            torus.renderOrder = 1;
+            scene.add(torus);
+            bandVisuals.push(torus);
+        }
+
+        function initPBDRestState() {
+            const pos = ellipsoidGeo.attributes.position;
+            restPositions = new Float32Array(pos.array);
+
+            // Compute rest volume & surface area
+            const idx = ellipsoidGeo.index.array;
+            const p = pos.array;
+            let vol = 0, area = 0;
+            const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+            for (let i = 0; i < idx.length; i += 3) {
+                const ai = idx[i] * 3, bi = idx[i + 1] * 3, ci = idx[i + 2] * 3;
+                a.set(p[ai], p[ai + 1], p[ai + 2]);
+                b.set(p[bi], p[bi + 1], p[bi + 2]);
+                c.set(p[ci], p[ci + 1], p[ci + 2]);
+                vol += (a.x * (b.y * c.z - b.z * c.y) +
+                        a.y * (b.z * c.x - b.x * c.z) +
+                        a.z * (b.x * c.y - b.y * c.x)) / 6;
+                const ab = new THREE.Vector3().subVectors(b, a);
+                const ac = new THREE.Vector3().subVectors(c, a);
+                area += 0.5 * new THREE.Vector3().crossVectors(ab, ac).length();
+            }
+            restVolume = Math.abs(vol);
+            restSurfaceArea = area;
+
+            H.vcount.textContent = pos.count;
+            H.tcount.textContent = idx.length / 3;
+            H.rvol.textContent = restVolume.toFixed(4);
+            H.pbditer.textContent = PBD_ITERATIONS;
+
+            console.log('PBD 初始化:',
+                '顶点', pos.count,
+                '三角形', idx.length / 3,
+                'restVolume', restVolume.toFixed(4),
+                'restSurfaceArea', restSurfaceArea.toFixed(2));
+        }
+        initPBDRestState();
+
+        // ──────────────────────────────────────
+        // Utility
+        // ──────────────────────────────────────
+        function smoothstep(e0, e1, x) {
+            const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+            return t * t * (3 - 2 * t);
+        }
+
+        // ──────────────────────────────────────
+        // Band management
+        // ──────────────────────────────────────
+        function addBand(centerY) {
+            const margin = BAND_INFLUENCE * 0.3;
+            const meshMinY = -ELLI_RY;
+            const meshMaxY = ELLI_RY;
+            centerY = Math.max(meshMinY + margin, Math.min(meshMaxY - margin, centerY));
+
+            // Current surface radius at this height
+            const pos = ellipsoidGeo.attributes.position;
+            let sumR = 0, count = 0;
+            for (let i = 0; i < pos.count; i++) {
+                if (Math.abs(pos.getY(i) - centerY) < BAND_INFLUENCE * 0.4) {
+                    sumR += Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
+                    count++;
+                }
+            }
+            const currentR = count > 1 ? sumR / count : ELLI_RX;
+
+            bands.push({
+                centerY,
+                targetRadius: currentR * BAND_INITIAL_TIGHTNESS,
+                stiffness: BAND_STIFFNESS,
+                influence: BAND_INFLUENCE,
+            });
+
+            // Show a visual torus
+            const vi = bands.length - 1;
+            if (vi < bandVisuals.length) {
+                bandVisuals[vi].visible = true;
+                bandVisuals[vi].position.y = centerY;
+                bandVisuals[vi].scale.setScalar(currentR);
+            }
+
+            H.bcount.textContent = bands.length;
+            console.log(`皮筋 #${bands.length}  y=${centerY.toFixed(3)}  r=${currentR.toFixed(3)}  target=${(currentR * BAND_INITIAL_TIGHTNESS).toFixed(3)}`);
+        }
+
+        function removeBand() {
+            if (bands.length === 0) return;
+            const vi = bands.length - 1;
+            if (vi < bandVisuals.length) bandVisuals[vi].visible = false;
+            bands.pop();
+            H.bcount.textContent = bands.length;
+        }
+
+        // ──────────────────────────────────────
+        // PBD Solver
+        // ──────────────────────────────────────
+        function pbdApplyBand(band, posArr) {
+            const cy = band.centerY;
+            const tightR = band.targetRadius;
+            const stiffness = band.stiffness;
+            const influence = band.influence;
+
+            const count = ellipsoidGeo.attributes.position.count;
+            for (let i = 0; i < count; i++) {
+                const i3 = i * 3;
+                const y = posArr[i3 + 1];
+                const dy = Math.abs(y - cy);
+                if (dy >= influence) continue;
+
+                const x = posArr[i3];
+                const z = posArr[i3 + 2];
+                const r = Math.sqrt(x * x + z * z);
+                if (r < 1e-6) continue;
+
+                // Interpolated effective target (U-shaped depression)
+                const t = dy / influence;
+                const st = smoothstep(0, 1, t);
+                const effectiveTarget = tightR + (r - tightR) * st;
+
+                if (r > effectiveTarget) {
+                    const displacement = stiffness * (r - effectiveTarget);
+                    const scale = Math.max(0.01, (r - displacement) / r);
+                    posArr[i3] *= scale;
+                    posArr[i3 + 2] *= scale;
+                }
+            }
+        }
+
+        function pbdApplyVolume(posArr, idxArr) {
+            // Compute current volume
+            let currentVolume = 0;
+            const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+            for (let i = 0; i < idxArr.length; i += 3) {
+                const ai = idxArr[i] * 3, bi = idxArr[i + 1] * 3, ci = idxArr[i + 2] * 3;
+                a.set(posArr[ai], posArr[ai + 1], posArr[ai + 2]);
+                b.set(posArr[bi], posArr[bi + 1], posArr[bi + 2]);
+                c.set(posArr[ci], posArr[ci + 1], posArr[ci + 2]);
+                currentVolume += (a.x * (b.y * c.z - b.z * c.y) +
+                                  a.y * (b.z * c.x - b.x * c.z) +
+                                  a.z * (b.x * c.y - b.y * c.x)) / 6;
+            }
+            currentVolume = Math.abs(currentVolume);
+
+            const deficit = restVolume - currentVolume;
+            if (Math.abs(deficit) < 1e-9) return currentVolume;
+
+            const basePush = VOLUME_STIFFNESS * deficit / restSurfaceArea;
+            const bandFreeRadius = BAND_INFLUENCE * 1.0;
+            const count = ellipsoidGeo.attributes.position.count;
+
+            for (let i = 0; i < count; i++) {
+                const i3 = i * 3;
+                const y = posArr[i3 + 1];
+
+                // Distance to nearest band
+                let minDist = bandFreeRadius + 999;
+                for (const band of bands) {
+                    const d = Math.abs(y - band.centerY);
+                    if (d < minDist) minDist = d;
+                }
+                const freedom = smoothstep(0, bandFreeRadius, minDist);
+
+                const x = posArr[i3];
+                const z = posArr[i3 + 2];
+                const r = Math.sqrt(x * x + z * z);
+                if (r < 1e-6) continue;
+
+                const push = basePush * freedom;
+                const scale = (r + push) / r;
+                const safeScale = Math.max(0.7, Math.min(1.3, scale));
+                posArr[i3] *= safeScale;
+                posArr[i3 + 2] *= safeScale;
+            }
+            return currentVolume;
+        }
+
+        function runPBD() {
+            const pos = ellipsoidGeo.attributes.position;
+            const posArr = pos.array;
+            const idxArr = ellipsoidGeo.index.array;
+            let finalVolume = restVolume;
+
+            for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
+                for (const band of bands) {
+                    pbdApplyBand(band, posArr);
+                }
+                finalVolume = pbdApplyVolume(posArr, idxArr);
+            }
+
+            pos.needsUpdate = true;
+            ellipsoidGeo.computeVertexNormals();
+
+            H.cvol.textContent = finalVolume.toFixed(4);
+            H.vratio.textContent = (finalVolume / restVolume * 100).toFixed(1);
+
+            // Update sprites & band visuals
+            for (let i = 0; i < spriteGroup.children.length; i++) {
+                const s = spriteGroup.children[i];
+                const vi = s.userData.vertexIndex;
+                if (vi !== undefined && vi < pos.count) {
+                    s.position.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi));
+                }
+            }
+            for (let b = 0; b < bands.length; b++) {
+                const vis = bandVisuals[b];
+                if (!vis || !vis.visible) continue;
+                const cy = bands[b].centerY;
+                let sumR = 0, cnt = 0;
+                for (let i = 0; i < pos.count; i++) {
+                    if (Math.abs(pos.getY(i) - cy) < BAND_INFLUENCE * 0.3) {
+                        sumR += Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
+                        cnt++;
+                    }
+                }
+                if (cnt > 1) {
+                    vis.position.y = cy;
+                    vis.scale.setScalar(sumR / cnt);
+                }
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Mouse interaction
+        // ──────────────────────────────────────
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const mouseDown = new THREE.Vector2();
+        let previewRing = null;
+
+        function ensurePreviewRing() {
+            if (previewRing) return;
+            const geo = new THREE.TorusGeometry(1.0, 0.025, 16, 48);
+            const mat = new THREE.MeshBasicMaterial({
+                color: '#ffff00',
+                transparent: true,
+                opacity: 0.5,
+                depthTest: false,
+                depthWrite: false,
+            });
+            previewRing = new THREE.Mesh(geo, mat);
+            previewRing.rotation.x = -Math.PI / 2;
+            previewRing.visible = false;
+            previewRing.renderOrder = 2;
+            scene.add(previewRing);
+        }
+
+        window.addEventListener('mousemove', (e) => {
+            ensurePreviewRing();
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const hits = raycaster.intersectObject(ellipsoidMesh, false);
+            if (hits.length > 0) {
+                const y = hits[0].point.y;
+                const clampedY = Math.max(-ELLI_RY + 0.1, Math.min(ELLI_RY - 0.1, y));
+                previewRing.position.y = clampedY;
+                previewRing.visible = true;
+                // Estimate radius
+                const pos = ellipsoidGeo.attributes.position;
+                let sumR = 0, cnt = 0;
+                for (let i = 0; i < pos.count; i++) {
+                    if (Math.abs(pos.getY(i) - clampedY) < 0.15) {
+                        sumR += Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
+                        cnt++;
+                    }
+                }
+                if (cnt > 1) previewRing.scale.setScalar(sumR / cnt);
+            } else {
+                previewRing.visible = false;
+            }
+        });
+
+        window.addEventListener('mousedown', (e) => { mouseDown.set(e.clientX, e.clientY); });
+
+        window.addEventListener('mouseup', (e) => {
+            const dx = e.clientX - mouseDown.x;
+            const dy = e.clientY - mouseDown.y;
+            if (Math.sqrt(dx * dx + dy * dy) > 3) return; // drag
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const hits = raycaster.intersectObject(ellipsoidMesh, false);
+            if (hits.length > 0) {
+                addBand(hits[0].point.y);
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'r') removeBand();
+        });
+
+        // ──────────────────────────────────────
+        // Resize
+        // ──────────────────────────────────────
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // ──────────────────────────────────────
+        // Animation loop
+        // ──────────────────────────────────────
+        const clock = new THREE.Clock();
+        let fpsFrames = 0, fpsTime = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.1);
+            const t0 = performance.now();
+
+            controls.update();
+
+            if (bands.length > 0) {
+                runPBD();
+            }
+
+            renderer.render(scene, camera);
+
+            const ms = performance.now() - t0;
+            fpsFrames++;
+            fpsTime += dt;
+            if (fpsTime >= 1.0) {
+                H.fps.textContent = Math.round(fpsFrames / fpsTime);
+                H.framems.textContent = ms.toFixed(1);
+                fpsFrames = 0;
+                fpsTime = 0;
+            }
+        }
+
+        console.log('🔧 PBD 椭球调试环境就绪');
+        console.log(`   顶点: ${TOTAL_V}  (编号 0~${TOTAL_V - 1})`);
+        console.log('   顶点 0 = 顶部极点, 顶点', TOTAL_V - 1, '= 底部极点');
+        console.log('   环 0-4 各', SEGS, '个顶点 (编号 1~40)');
+        console.log('   🖱️ 点击椭球表面 = 绑皮筋,  R = 割皮筋');
+
+        animate();
+    </script>
+</body>
+</html>

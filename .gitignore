@@ -1,0 +1,20 @@
+# Python virtual environment
+.venv/
+
+# Node modules (if any)
+node_modules/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large binary files (not needed in git for source tracking)
+# *.glb  – uncomment if you don't want to track model files
+# *.exr
+
+# Build output
+dist/
+build/

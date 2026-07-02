@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>爆菠萝 - PBD 物理原型</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --panel-bg: rgba(0, 0, 0, 0.75);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            overflow: hidden;
+            font-family: 'Segoe UI', monospace;
+            height: 100vh;
+            width: 100vw;
+        }
+        canvas { display: block; }
+
+        /* Loading overlay */
+        #loading {
+            position: fixed; inset: 0; z-index: 100;
+            background: var(--bg);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: #ffd700;
+            transition: opacity 0.5s;
+        }
+        #loading.hidden { opacity: 0; pointer-events: none; }
+        #loading .spinner {
+            width: 48px; height: 48px;
+            border: 4px solid #333;
+            border-top-color: #ffd700;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 16px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #loading .text { font-size: 18px; }
+        #loading .sub { font-size: 13px; color: #999; margin-top: 6px; }
+
+        /* HUD */
+        #hud {
+            position: fixed; top: 16px; left: 16px; z-index: 10;
+            color: #fff; font-size: 14px; line-height: 1.8;
+            pointer-events: none;
+        }
+        #hud .label { color: #999; }
+        #hud .val { color: #ffd700; font-weight: bold; }
+        #hud .warn { color: #ff4444; }
+
+        /* Stress bar */
+        #stress-bar-wrap {
+            position: fixed; bottom: 32px; left: 50%;
+            transform: translateX(-50%);
+            width: 320px; height: 12px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 6px; z-index: 10;
+            border: 1px solid rgba(255,255,255,0.2);
+            overflow: hidden;
+        }
+        #stress-bar-fill {
+            height: 100%; width: 0%;
+            background: linear-gradient(90deg, #4f4, #ff0, #f40);
+            border-radius: 6px; transition: width 0.1s;
+        }
+        /* Instruction */
+        #instructions {
+            position: fixed; bottom: 80px; left: 50%;
+            transform: translateX(-50%);
+            color: rgba(255,255,255,0.6); font-size: 13px;
+            z-index: 10; text-align: center;
+            pointer-events: none;
+        }
+        #instructions kbd {
+            background: rgba(255,255,255,0.15);
+            border: 1px solid rgba(255,255,255,0.3);
+            border-radius: 4px; padding: 1px 7px;
+            font-family: inherit; font-size: 12px;
+        }
+        /* Cursor hint */
+        canvas { cursor: crosshair; }
+    </style>
+</head>
+<body>
+
+    <!-- Loading -->
+    <div id="loading">
+        <div class="spinner"></div>
+        <div class="text">加载菠萝模型中…</div>
+        <div class="sub" id="load-sub"></div>
+    </div>
+
+    <!-- HUD -->
+    <div id="hud">
+        <div><span class="label">FPS: </span><span class="val" id="fps">--</span></div>
+        <div><span class="label">顶点数: </span><span class="val" id="vcount">--</span></div>
+        <div><span class="label">三角形: </span><span class="val" id="tcount">--</span></div>
+        <div><span class="label">皮筋数量: </span><span class="val" id="bcount">0</span></div>
+        <div><span class="label">体积保持: </span><span class="val" id="vratio">100%</span></div>
+        <div><span class="label">PBD 迭代: </span><span class="val" id="pbditer">5</span></div>
+        <div><span class="label">每帧耗时: </span><span class="val" id="framems">--</span></div>
+    </div>
+
+    <!-- Stress -->
+    <div id="stress-label">🍍 压力 <span id="stress-pct">0</span>%</div>
+    <div id="stress-bar-wrap"><div id="stress-bar-fill"></div></div>
+    <div id="instructions">🖱️ <kbd>点击</kbd> 菠萝表面绑皮筋 &nbsp; <kbd>R</kbd> 割一根</div>
+
+    <!-- Three.js Import Map -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // ──────────────────────────────────────
+        // DOM refs
+        // ──────────────────────────────────────
+        const $ = id => document.getElementById(id);
+        const elFPS = $('fps'), elVCount = $('vcount'), elTCount = $('tcount');
+        const elBCount = $('bcount'), elVRatio = $('vratio'), elPBDIter = $('pbditer');
+        const elFrameMs = $('framems'), elStressPct = $('stress-pct');
+        const elStressFill = $('stress-bar-fill');
+        const elLoading = $('loading'), elLoadSub = $('load-sub');
+
+        // ──────────────────────────────────────
+        // Three.js setup
+        // ──────────────────────────────────────
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#1a1a2e');
+        scene.fog = new THREE.Fog('#1a1a2e', 5, 20);
+
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 50);
+        camera.position.set(3, 1.5, 5);
+        camera.lookAt(0, 0.5, 0);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 0.5, 0);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        controls.minDistance = 1.5;
+        controls.maxDistance = 10;
+        controls.update();
+
+        // Lighting
+        scene.add(new THREE.AmbientLight('#ffffff', 0.6));
+        const keyLight = new THREE.DirectionalLight('#ffffff', 2.5);
+        keyLight.position.set(5, 8, 5);
+        keyLight.castShadow = true;
+        scene.add(keyLight);
+        const rimLight = new THREE.DirectionalLight('#ff9944', 1.2);
+        rimLight.position.set(-3, 2, -2);
+        scene.add(rimLight);
+        const fillLight = new THREE.DirectionalLight('#4466ff', 0.6);
+        fillLight.position.set(1, -1, 3);
+        scene.add(fillLight);
+
+        // Ground plane (visual reference)
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: '#222233', roughness: 0.9 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = -2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // ──────────────────────────────────────
+        // PBD State
+        // ──────────────────────────────────────
+        const BAND_INITIAL_TIGHTNESS = 0.80; // target radius = current * tightness
+        const BAND_STIFFNESS = 0.65;
+        const BAND_INFLUENCE = 0.40;         // kernel radius (world units)
+        const VOLUME_STIFFNESS = 0.3;
+        const PBD_ITERATIONS = 5;
+        const STRESS_EXPLODE = 95;
+        const VOLUME_CLAMP_MIN = 0.85;
+        const VOLUME_CLAMP_MAX = 1.15;
+
+        let pineappleMesh = null;
+        let restPositions = null;       // Float32Array copy of original positions
+        let restNormals = null;         // Float32Array copy of original normals
+        let restVolume = 0;
+        let restSurfaceArea = 0;
+        let meshCentroid = new THREE.Vector3();
+        let meshHeight = 0;
+        let meshMinY = 0, meshMaxY = 0;
+
+        // Bands
+        const bands = [];               // { centerY, targetRadius, stiffness, influence }
+        const bandMeshes = [];          // THREE.Mesh (torus) for visual
+
+        // Explosion
+        let exploded = false;
+        let explosionParticles = null;
+        let explosionTime = 0;
+
+        // Stats
+        let frameTimes = [];
+        let stressValue = 0;
+        let totalBandsAdded = 0;
+
+        // ──────────────────────────────────────
+        // Utility functions
+        // ──────────────────────────────────────
+        function smoothstep(edge0, edge1, x) {
+            const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+            return t * t * (3 - 2 * t);
+        }
+
+        function computeTriangleArea(a, b, c) {
+            const ab = new THREE.Vector3().subVectors(b, a);
+            const ac = new THREE.Vector3().subVectors(c, a);
+            return 0.5 * new THREE.Vector3().crossVectors(ab, ac).length();
+        }
+
+        function computeTriangleVolume(a, b, c) {
+            // Contribution of triangle (a,b,c) to total volume via divergence theorem
+            // V += (1/6) * (a × b) · c
+            return (a.x * (b.y * c.z - b.z * c.y) +
+                    a.y * (b.z * c.x - b.x * c.z) +
+                    a.z * (b.x * c.y - b.y * c.x)) / 6.0;
+        }
+
+        function radialScale(px, pz, newR, oldR) {
+            if (oldR < 1e-8) return [px, pz];
+            const s = newR / oldR;
+            return [px * s, pz * s];
+        }
+
+        // ──────────────────────────────────────
+        // Load model
+        // ──────────────────────────────────────
+        async function loadModel() {
+            elLoadSub.textContent = '读取文件中 (56 MB)...';
+            const loader = new GLTFLoader();
+
+            const gltf = await new Promise((resolve, reject) => {
+                loader.load(
+                    'pineapple.glb',
+                    resolve,
+                    (progress) => {
+                        if (progress.total > 0) {
+                            const pct = Math.round(progress.loaded / progress.total * 100);
+                            elLoadSub.textContent = `下载中 ${pct}%...`;
+                        } else {
+                            elLoadSub.textContent = `已读取 ${(progress.loaded / 1048576).toFixed(1)} MB...`;
+                        }
+                    },
+                    reject
+                );
+            });
+
+            elLoadSub.textContent = '解析模型中...';
+
+            // Extract geometries
+            const geometries = [];
+            gltf.scene.traverse(child => {
+                if (child.isMesh && child.geometry) {
+                    geometries.push({ mesh: child, geo: child.geometry });
+                }
+            });
+
+            if (geometries.length === 0) throw new Error('模型中没有找到网格');
+
+            elLoadSub.textContent = `找到 ${geometries.length} 个网格部件，合并中...`;
+
+            // Merge all geometries into one
+            let mergedGeo;
+            if (geometries.length === 1) {
+                mergedGeo = geometries[0].geo.clone();
+                pineappleMesh = geometries[0].mesh;
+            } else {
+                // Use BufferGeometryUtils.mergeGeometries
+                const geosOnly = geometries.map(g => g.geo);
+                // Simple merge: use the first mesh, merge others into its geometry
+                mergedGeo = geosOnly[0].clone();
+                // Apply transforms and merge
+                const mergedPositions = [];
+                const mergedNormals = [];
+                let mergedIndex = [];
+                let vertexOffset = 0;
+
+                for (const { mesh, geo } of geometries) {
+                    mesh.updateWorldMatrix(true, false);
+                    const tempGeo = geo.clone();
+                    tempGeo.applyMatrix4(mesh.matrixWorld);
+                    const pos = tempGeo.attributes.position;
+                    const nor = tempGeo.attributes.normal;
+                    const idx = tempGeo.index;
+
+                    for (let i = 0; i < pos.count; i++) {
+                        mergedPositions.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+                        if (nor) {
+                            mergedNormals.push(nor.getX(i), nor.getY(i), nor.getZ(i));
+                        }
+                    }
+                    if (idx) {
+                        for (let i = 0; i < idx.count; i++) {
+                            mergedIndex.push(idx.getX(i) + vertexOffset);
+                        }
+                    } else {
+                        for (let i = 0; i < pos.count; i++) {
+                            mergedIndex.push(i + vertexOffset);
+                        }
+                    }
+                    vertexOffset += pos.count;
+                }
+
+                mergedGeo = new THREE.BufferGeometry();
+                mergedGeo.setAttribute('position', new THREE.Float32BufferAttribute(mergedPositions, 3));
+                if (mergedNormals.length > 0) {
+                    mergedGeo.setAttribute('normal', new THREE.Float32BufferAttribute(mergedNormals, 3));
+                }
+                mergedGeo.setIndex(mergedIndex);
+
+                // Create new mesh
+                const material = new THREE.MeshStandardMaterial({
+                    color: '#e8a830',
+                    roughness: 0.55,
+                    metalness: 0.05,
+                });
+                pineappleMesh = new THREE.Mesh(mergedGeo, material);
+            }
+
+            // Ensure we have normals
+            if (!mergedGeo.attributes.normal) {
+                mergedGeo.computeVertexNormals();
+            }
+
+            // Center and scale
+            mergedGeo.computeBoundingBox();
+            const bbox = mergedGeo.boundingBox;
+            const center = new THREE.Vector3();
+            bbox.getCenter(center);
+            const size = new THREE.Vector3();
+            bbox.getSize(size);
+
+            // Translate geometry so center is at origin
+            const positions = mergedGeo.attributes.position;
+            for (let i = 0; i < positions.count; i++) {
+                positions.setXYZ(i,
+                    positions.getX(i) - center.x,
+                    positions.getY(i) - center.y,
+                    positions.getZ(i) - center.z
+                );
+            }
+            positions.needsUpdate = true;
+            mergedGeo.computeVertexNormals();
+
+            // Scale to a target height of ~3 units
+            const targetHeight = 3.0;
+            const scaleFactor = targetHeight / size.y;
+            for (let i = 0; i < positions.count; i++) {
+                positions.setXYZ(i,
+                    positions.getX(i) * scaleFactor,
+                    positions.getY(i) * scaleFactor,
+                    positions.getZ(i) * scaleFactor
+                );
+            }
+            positions.needsUpdate = true;
+            mergedGeo.computeVertexNormals();
+
+            // Recompute bounding box
+            mergedGeo.computeBoundingBox();
+            meshMinY = mergedGeo.boundingBox.min.y;
+            meshMaxY = mergedGeo.boundingBox.max.y;
+            meshHeight = meshMaxY - meshMinY;
+            meshCentroid.set(0, (meshMinY + meshMaxY) / 2, 0);
+
+            // Count stats
+            const vCount = positions.count;
+            const tCount = mergedGeo.index ? mergedGeo.index.count / 3 : positions.count / 3;
+
+            elVCount.textContent = vCount.toLocaleString();
+            elTCount.textContent = Math.round(tCount).toLocaleString();
+
+            // Store rest state
+            restPositions = new Float32Array(positions.array);
+            restNormals = new Float32Array(mergedGeo.attributes.normal.array);
+
+            // Compute rest volume and surface area
+            elLoadSub.textContent = '计算体积和表面积...';
+            await new Promise(r => setTimeout(r, 50)); // let UI update
+
+            const posArr = positions.array;
+            const idxArr = mergedGeo.index ? mergedGeo.index.array : null;
+            const faceCount = idxArr ? idxArr.length / 3 : posArr.length / 9;
+
+            let vol = 0, area = 0;
+            if (idxArr) {
+                for (let i = 0; i < idxArr.length; i += 3) {
+                    const ai = idxArr[i] * 3, bi = idxArr[i + 1] * 3, ci = idxArr[i + 2] * 3;
+                    const a = new THREE.Vector3(posArr[ai], posArr[ai + 1], posArr[ai + 2]);
+                    const b = new THREE.Vector3(posArr[bi], posArr[bi + 1], posArr[bi + 2]);
+                    const c = new THREE.Vector3(posArr[ci], posArr[ci + 1], posArr[ci + 2]);
+                    vol += computeTriangleVolume(a, b, c);
+                    area += computeTriangleArea(a, b, c);
+                }
+            } else {
+                for (let i = 0; i < posArr.length; i += 9) {
+                    const a = new THREE.Vector3(posArr[i], posArr[i + 1], posArr[i + 2]);
+                    const b = new THREE.Vector3(posArr[i + 3], posArr[i + 4], posArr[i + 5]);
+                    const c = new THREE.Vector3(posArr[i + 6], posArr[i + 7], posArr[i + 8]);
+                    vol += computeTriangleVolume(a, b, c);
+                    area += computeTriangleArea(a, b, c);
+                }
+            }
+            restVolume = Math.abs(vol);
+            restSurfaceArea = area;
+
+            elLoadSub.textContent = `体积: ${restVolume.toFixed(3)}, 面积: ${restSurfaceArea.toFixed(1)}, 面数: ${Math.round(faceCount).toLocaleString()}`;
+
+            // Add mesh to scene
+            scene.add(pineappleMesh);
+
+            // Hide loading
+            setTimeout(() => elLoading.classList.add('hidden'), 400);
+
+            console.log('✅ 模型加载完成');
+            console.log(`   顶点: ${vCount.toLocaleString()}`);
+            console.log(`   三角形: ${Math.round(faceCount).toLocaleString()}`);
+            console.log(`   高度: ${meshHeight.toFixed(2)} units`);
+            console.log(`   体积: ${restVolume.toFixed(4)}`);
+            console.log(`   表面积: ${restSurfaceArea.toFixed(1)}`);
+            console.log(`   预计每帧 PBD 迭代 ${PBD_ITERATIONS} 次`);
+            console.log('   按 空格键 手动添加皮筋，按 R 移除皮筋');
+        }
+
+        // ──────────────────────────────────────
+        // Band management
+        // ──────────────────────────────────────
+        function createBandVisual(centerY, radius) {
+            const geo = new THREE.TorusGeometry(1.0, 0.012, 16, 64);
+            const mat = new THREE.MeshStandardMaterial({
+                color: 0xff4444,
+                roughness: 0.3,
+                metalness: 0.2,
+                emissive: 0x330000,
+                emissiveIntensity: 0.4,
+            });
+            const torus = new THREE.Mesh(geo, mat);
+            torus.rotation.x = -Math.PI / 2; // lay flat (XZ plane)
+            torus.position.y = centerY;
+            torus.scale.setScalar(radius);
+            torus.castShadow = true;
+            scene.add(torus);
+            return torus;
+        }
+
+        function addBand(centerY) {
+            if (exploded) return;
+            // Clamp centerY to mesh bounds
+            const margin = BAND_INFLUENCE;
+            centerY = Math.max(meshMinY + margin, Math.min(meshMaxY - margin, centerY));
+
+            // Compute current surface radius at this height
+            let sumR = 0, count = 0;
+            const pos = pineappleMesh.geometry.attributes.position;
+            for (let i = 0; i < pos.count; i++) {
+                const y = pos.getY(i);
+                if (Math.abs(y - centerY) < BAND_INFLUENCE * 0.5) {
+                    const x = pos.getX(i);
+                    const z = pos.getZ(i);
+                    sumR += Math.sqrt(x * x + z * z);
+                    count++;
+                }
+            }
+            const currentRadius = count > 0 ? sumR / count : 0.5;
+
+            const band = {
+                centerY,
+                targetRadius: currentRadius * BAND_INITIAL_TIGHTNESS,
+                stiffness: BAND_STIFFNESS,
+                influence: BAND_INFLUENCE,
+            };
+            bands.push(band);
+
+            const visual = createBandVisual(centerY, currentRadius);
+            bandMeshes.push(visual);
+
+            totalBandsAdded++;
+            elBCount.textContent = bands.length;
+            console.log(`🟡 皮筋 #${totalBandsAdded} 添加在 y=${centerY.toFixed(2)}, r=${currentRadius.toFixed(3)}, 目标r=${band.targetRadius.toFixed(3)}`);
+        }
+
+        function removeBand() {
+            if (bands.length === 0) return;
+            bands.pop();
+            const visual = bandMeshes.pop();
+            if (visual) {
+                visual.geometry.dispose();
+                visual.material.dispose();
+                scene.remove(visual);
+            }
+            elBCount.textContent = bands.length;
+            console.log(`🔴 移除一根皮筋，剩余 ${bands.length}`);
+        }
+
+        // ──────────────────────────────────────
+        // PBD Solver
+        // ──────────────────────────────────────
+        function pbdApplyBandConstraint(band, positions) {
+            const cy = band.centerY;
+            const tightR = band.targetRadius;   // tightest radius at band center
+            const stiffness = band.stiffness;
+            const influence = band.influence;
+
+            for (let i = 0; i < positions.count; i++) {
+                const y = positions.getY(i);
+                const dy = Math.abs(y - cy);
+                if (dy >= influence) continue;
+
+                const x = positions.getX(i);
+                const z = positions.getZ(i);
+                const r = Math.sqrt(x * x + z * z);
+                if (r < 0.001) continue;
+
+                // Interpolate effective target radius:
+                //   dy=0 (center) → target = tightR  (tightest)
+                //   dy=influence  → target = r itself (no push at edge)
+                // This creates a smooth U-shaped depression, not a flat bottom.
+                const t = dy / influence;           // 0..1
+                const st = smoothstep(0, 1, t);     // smooth falloff
+                const effectiveTarget = tightR + (r - tightR) * st;
+
+                if (r > effectiveTarget) {
+                    const displacement = stiffness * (r - effectiveTarget);
+                    const scale = Math.max(0.01, (r - displacement) / r);
+                    positions.setXYZ(i, x * scale, y, z * scale);
+                }
+            }
+        }
+
+        function pbdApplyVolumeConstraint(positions, indexArray, _normals) {
+            // Compute current volume (iterate all faces)
+            const posArr = positions.array;
+            let currentVolume = 0;
+            if (indexArray) {
+                for (let i = 0; i < indexArray.length; i += 3) {
+                    const ai = indexArray[i] * 3, bi = indexArray[i + 1] * 3, ci = indexArray[i + 2] * 3;
+                    const a = new THREE.Vector3(posArr[ai], posArr[ai + 1], posArr[ai + 2]);
+                    const b = new THREE.Vector3(posArr[bi], posArr[bi + 1], posArr[bi + 2]);
+                    const c = new THREE.Vector3(posArr[ci], posArr[ci + 1], posArr[ci + 2]);
+                    currentVolume += computeTriangleVolume(a, b, c);
+                }
+            } else {
+                for (let i = 0; i < posArr.length; i += 9) {
+                    const a = new THREE.Vector3(posArr[i], posArr[i + 1], posArr[i + 2]);
+                    const b = new THREE.Vector3(posArr[i + 3], posArr[i + 4], posArr[i + 5]);
+                    const c = new THREE.Vector3(posArr[i + 6], posArr[i + 7], posArr[i + 8]);
+                    currentVolume += computeTriangleVolume(a, b, c);
+                }
+            }
+            currentVolume = Math.abs(currentVolume);
+
+            const volumeRatio = currentVolume / restVolume;
+
+            // Clamp: if volume is way off, do a hard correction
+            if (volumeRatio > VOLUME_CLAMP_MAX) {
+                const scale = Math.pow(1 / volumeRatio, 1 / 3);
+                for (let i = 0; i < positions.count; i++) {
+                    const rx = posArr[i * 3];
+                    const ry = posArr[i * 3 + 1] - meshCentroid.y;
+                    const rz = posArr[i * 3 + 2];
+                    positions.setXYZ(i,
+                        rx * scale,
+                        meshCentroid.y + ry * scale,
+                        rz * scale,
+                    );
+                }
+                return currentVolume;
+            }
+
+            const deficit = restVolume - currentVolume;
+            if (Math.abs(deficit) < 1e-8) return currentVolume;
+
+            // --- Weighted radial push ---
+            // Vertices FAR from ALL bands → full push (bulge freely)
+            // Vertices NEAR a band → reduced push (band already controls this area)
+            // This creates natural "squeezed middle, bulging ends" deformation.
+
+            const basePush = VOLUME_STIFFNESS * deficit / restSurfaceArea;
+            const bandFreeRadius = BAND_INFLUENCE * 1.0; // distance beyond which vertex is "free" to bulge
+
+            for (let i = 0; i < positions.count; i++) {
+                const y = posArr[i * 3 + 1];
+
+                // Find distance to nearest band
+                let minDistToBand = bandFreeRadius + 1; // default: very far
+                for (const band of bands) {
+                    const d = Math.abs(y - band.centerY);
+                    if (d < minDistToBand) minDistToBand = d;
+                }
+
+                // freedom: 0 at band center, 1 in band-free zones
+                const freedom = smoothstep(0, bandFreeRadius, minDistToBand);
+
+                const x = posArr[i * 3];
+                const z = posArr[i * 3 + 2];
+                const r = Math.sqrt(x * x + z * z);
+                if (r < 1e-6) continue;
+
+                const push = basePush * freedom;
+                const scale = (r + push) / r;
+                const safeScale = Math.max(0.7, Math.min(1.3, scale));
+                positions.setXYZ(i,
+                    x * safeScale,
+                    y,
+                    z * safeScale,
+                );
+            }
+
+            return currentVolume;
+        }
+
+        function runPBD() {
+            if (!pineappleMesh || exploded) return;
+
+            const geo = pineappleMesh.geometry;
+            const positions = geo.attributes.position;
+            const indexArray = geo.index ? geo.index.array : null;
+
+            // --- PBD iteration loop ---
+            // Each iteration: apply all band constraints, then volume constraint
+            let finalVolume = restVolume;
+
+            for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
+                // 1. Apply all band constraints (push vertices inward radially)
+                for (const band of bands) {
+                    pbdApplyBandConstraint(band, positions);
+                }
+
+                // 2. Apply volume constraint (push all vertices outward radially)
+                finalVolume = pbdApplyVolumeConstraint(positions, indexArray, null);
+
+                // If volume was clamped due to runaway expansion, break early
+                const ratio = finalVolume / restVolume;
+                if (ratio > VOLUME_CLAMP_MAX || ratio < VOLUME_CLAMP_MIN) {
+                    // After clamp, run one more volume iteration to stabilize
+                    finalVolume = pbdApplyVolumeConstraint(positions, indexArray, null);
+                }
+            }
+
+            // Update HUD
+            const ratio = (finalVolume / restVolume * 100);
+            elVRatio.textContent = ratio.toFixed(1) + '%';
+            if (ratio < 85) {
+                elVRatio.classList.add('warn');
+            } else {
+                elVRatio.classList.remove('warn');
+            }
+
+            // Final normal update for rendering
+            geo.computeVertexNormals();
+            geo.attributes.position.needsUpdate = true;
+        }
+
+        // ──────────────────────────────────────
+        // Stress computation
+        // ──────────────────────────────────────
+        function computeStress() {
+            if (bands.length === 0) return 0;
+            if (!pineappleMesh) return 0;
+
+            // Simple stress: how much volume has been lost + band count factor
+            const pos = pineappleMesh.geometry.attributes.position;
+            const indexArray = pineappleMesh.geometry.index ? pineappleMesh.geometry.index.array : null;
+            const posArr = pos.array;
+            let currentVolume = 0;
+            if (indexArray) {
+                for (let i = 0; i < indexArray.length; i += 3) {
+                    const ai = indexArray[i] * 3, bi = indexArray[i + 1] * 3, ci = indexArray[i + 2] * 3;
+                    const a = new THREE.Vector3(posArr[ai], posArr[ai + 1], posArr[ai + 2]);
+                    const b = new THREE.Vector3(posArr[bi], posArr[bi + 1], posArr[bi + 2]);
+                    const c = new THREE.Vector3(posArr[ci], posArr[ci + 1], posArr[ci + 2]);
+                    currentVolume += computeTriangleVolume(a, b, c);
+                }
+            }
+            currentVolume = Math.abs(currentVolume);
+            const volumeLoss = Math.max(0, (restVolume - currentVolume) / restVolume);
+
+            // Stress = volume loss * 100 + bonus for many bands
+            return volumeLoss * 100 + bands.length * 2;
+        }
+
+        // ──────────────────────────────────────
+        // Update band visuals
+        // ──────────────────────────────────────
+        function updateBandVisuals() {
+            if (!pineappleMesh) return;
+            const pos = pineappleMesh.geometry.attributes.position;
+
+            for (let b = 0; b < bands.length; b++) {
+                const band = bands[b];
+                const visual = bandMeshes[b];
+                if (!visual) continue;
+
+                // Compute average surface radius at band height
+                let sumR = 0, count = 0;
+                const cy = band.centerY;
+                const searchRange = band.influence * 0.4;
+                for (let i = 0; i < pos.count; i++) {
+                    const y = pos.getY(i);
+                    if (Math.abs(y - cy) < searchRange) {
+                        const x = pos.getX(i), z = pos.getZ(i);
+                        sumR += Math.sqrt(x * x + z * z);
+                        count++;
+                    }
+                }
+
+                if (count > 3) {
+                    const avgR = sumR / count;
+                    visual.position.y = cy;
+                    visual.scale.setScalar(avgR);
+                }
+            }
+        }
+
+        // ──────────────────────────────────────
+        // Explosion
+        // ──────────────────────────────────────
+        function triggerExplosion() {
+            if (exploded) return;
+            exploded = true;
+            explosionTime = 0;
+
+            console.log('💥 爆了！！！！');
+
+            // Create explosion particles from surface vertices
+            const geo = pineappleMesh.geometry;
+            const pos = geo.attributes.position;
+            const norm = geo.attributes.normal;
+
+            const particleCount = Math.min(3000, pos.count);
+            const step = Math.max(1, Math.floor(pos.count / particleCount));
+
+            const particlePositions = [];
+            const particleVelocities = [];
+            const particleColors = [];
+
+            for (let i = 0; i < pos.count; i += step) {
+                const px = pos.getX(i), py = pos.getY(i), pz = pos.getZ(i);
+                const nx = norm.getX(i), ny = norm.getY(i), nz = norm.getZ(i);
+
+                particlePositions.push(px, py, pz);
+
+                // Velocity: along normal + random
+                const speed = 1.5 + Math.random() * 5;
+                const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+                particleVelocities.push(
+                    (nx / nLen + (Math.random() - 0.5) * 1.2) * speed,
+                    (ny / nLen + (Math.random() - 0.5) * 1.2 + 1.5) * speed,
+                    (nz / nLen + (Math.random() - 0.5) * 1.2) * speed,
+                );
+
+                // Color: yellow-orange-red mix
+                const t = Math.random();
+                particleColors.push(
+                    1.0,
+                    0.4 + t * 0.5,
+                    t * 0.2,
+                );
+            }
+
+            const pGeo = new THREE.BufferGeometry();
+            pGeo.setAttribute('position', new THREE.Float32BufferAttribute(particlePositions, 3));
+            pGeo.setAttribute('color', new THREE.Float32BufferAttribute(particleColors, 3));
+
+            const pMat = new THREE.PointsMaterial({
+                size: 0.03,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+            });
+
+            explosionParticles = {
+                points: new THREE.Points(pGeo, pMat),
+                velocities: particleVelocities,
+                lifetimes: new Float32Array(particleVelocities.length / 3).fill(1.5 + Math.random() * 1.5),
+            };
+            scene.add(explosionParticles.points);
+
+            // Hide pineapple
+            pineappleMesh.visible = false;
+
+            // Hide bands
+            for (const visual of bandMeshes) {
+                visual.visible = false;
+            }
+
+            // Flash
+            scene.background = new THREE.Color('#ffffff');
+            setTimeout(() => { scene.background = new THREE.Color('#1a1a2e'); }, 80);
+        }
+
+        function updateExplosion(dt) {
+            if (!exploded || !explosionParticles) return;
+            explosionTime += dt;
+
+            const pos = explosionParticles.points.geometry.attributes.position;
+            const arr = pos.array;
+            const vel = explosionParticles.velocities;
+            const life = explosionParticles.lifetimes;
+            const gravity = -3;
+
+            let allDead = true;
+            for (let i = 0; i < arr.length / 3; i++) {
+                life[i] -= dt;
+                if (life[i] <= 0) {
+                    arr[i * 3 + 1] = -999; // hide below ground
+                    continue;
+                }
+                allDead = false;
+                arr[i * 3] += vel[i * 3] * dt;
+                arr[i * 3 + 1] += vel[i * 3 + 1] * dt;
+                arr[i * 3 + 2] += vel[i * 3 + 2] * dt;
+                vel[i * 3 + 1] += gravity * dt;
+            }
+            pos.needsUpdate = true;
+
+            // Fade particles as they age
+            explosionParticles.points.material.opacity = Math.max(0, 1 - explosionTime / 2.5);
+        }
+
+        // ──────────────────────────────────────
+        // Animation loop
+        // ──────────────────────────────────────
+        const clock = new THREE.Clock();
+        let fpsFrames = 0, fpsTime = 0, currentFPS = 0;
+
+        function animate(timestamp) {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.1);
+            const frameStart = performance.now();
+
+            controls.update();
+
+            if (!exploded && pineappleMesh) {
+                // Run PBD only if there are bands
+                if (bands.length > 0) {
+                    runPBD();
+                }
+
+                // Update band visuals
+                updateBandVisuals();
+
+                // Compute stress
+                stressValue = computeStress();
+                const displayStress = Math.min(100, Math.round(stressValue * 1.2));
+                elStressPct.textContent = displayStress;
+                elStressFill.style.width = displayStress + '%';
+
+                // Check explosion
+                if (displayStress >= STRESS_EXPLODE && bands.length >= 3) {
+                    triggerExplosion();
+                }
+            }
+
+            // Update explosion
+            updateExplosion(dt);
+
+            // Render
+            renderer.render(scene, camera);
+
+            // Frame timing
+            const frameMs = performance.now() - frameStart;
+            frameTimes.push(frameMs);
+            if (frameTimes.length > 60) frameTimes.shift();
+
+            // FPS
+            fpsFrames++;
+            fpsTime += dt;
+            if (fpsTime >= 1.0) {
+                currentFPS = Math.round(fpsFrames / fpsTime);
+                elFPS.textContent = currentFPS;
+                const avgMs = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+                elFrameMs.textContent = avgMs.toFixed(1) + ' ms';
+                fpsFrames = 0;
+                fpsTime = 0;
+            }
+            elPBDIter.textContent = PBD_ITERATIONS;
+        }
+
+        // ──────────────────────────────────────
+        // Keyboard controls
+        // ──────────────────────────────────────
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'r') {
+                removeBand();
+            }
+        });
+
+        // ──────────────────────────────────────
+        // Mouse interaction (click to add band)
+        // ──────────────────────────────────────
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const mouseDownPos = new THREE.Vector2();
+
+        // Preview ring (ghost torus following cursor)
+        let previewRing = null;
+        function ensurePreviewRing() {
+            if (previewRing) return;
+            const geo = new THREE.TorusGeometry(1.0, 0.015, 16, 64);
+            const mat = new THREE.MeshBasicMaterial({
+                color: 0xffff00,
+                transparent: true,
+                opacity: 0.55,
+                depthTest: false,
+                depthWrite: false,
+            });
+            previewRing = new THREE.Mesh(geo, mat);
+            previewRing.rotation.x = -Math.PI / 2;
+            previewRing.visible = false;
+            previewRing.renderOrder = 999;
+            scene.add(previewRing);
+        }
+
+        window.addEventListener('mousemove', (e) => {
+            if (!pineappleMesh || exploded) return;
+            ensurePreviewRing();
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(pineappleMesh, false);
+
+            if (intersects.length > 0 && previewRing) {
+                const point = intersects[0].point;
+                const clampedY = Math.max(meshMinY + 0.1, Math.min(meshMaxY - 0.1, point.y));
+                previewRing.position.y = clampedY;
+                previewRing.visible = true;
+
+                // Estimate surface radius at this height
+                const pos = pineappleMesh.geometry.attributes.position;
+                let sumR = 0, count = 0;
+                for (let i = 0; i < pos.count; i++) {
+                    if (Math.abs(pos.getY(i) - clampedY) < 0.08) {
+                        sumR += Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
+                        count++;
+                    }
+                }
+                if (count > 3) {
+                    previewRing.scale.setScalar(sumR / count);
+                }
+            } else if (previewRing) {
+                previewRing.visible = false;
+            }
+        });
+
+        window.addEventListener('mousedown', (e) => {
+            mouseDownPos.set(e.clientX, e.clientY);
+        });
+
+        window.addEventListener('mouseup', (e) => {
+            if (!pineappleMesh || exploded) return;
+            const dx = e.clientX - mouseDownPos.x;
+            const dy = e.clientY - mouseDownPos.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 3) return; // drag, not click
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(pineappleMesh, false);
+
+            if (intersects.length > 0) {
+                const point = intersects[0].point;
+                addBand(point.y);
+            }
+        });
+
+        // ──────────────────────────────────────
+        // Resize
+        // ──────────────────────────────────────
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // ──────────────────────────────────────
+        // Start
+        // ──────────────────────────────────────
+        console.log('🍍 爆菠萝 - PBD 物理原型');
+        console.log('   Three.js 0.169 + CDN');
+        console.log('   加载 pineapple.glb...');
+
+        loadModel().then(() => {
+            // Start animation
+            requestAnimationFrame(animate);
+        }).catch(err => {
+            elLoadSub.textContent = '❌ 加载失败: ' + err.message;
+            elLoadSub.style.color = '#f44';
+            console.error('加载失败:', err);
+        });
+    </script>
+</body>
+</html>
