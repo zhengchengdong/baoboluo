@@ -352,16 +352,16 @@
 
         const bands = [];           // { centerY, targetRadius, stiffness, influence }
         const bandVisuals = [];     // THREE.Mesh (torus)
-        const BAND_VIS_COUNT = 20;  // pool size
-        for (let i = 0; i < BAND_VIS_COUNT; i++) {
+        function makeBandVisual(centerY, radius) {
             const geo = new THREE.TorusGeometry(1.0, 0.02, 16, 48);
             const mat = new THREE.MeshBasicMaterial({ color: '#ff3333', transparent: true, opacity: 0.7, depthTest: false, depthWrite: false });
             const torus = new THREE.Mesh(geo, mat);
             torus.rotation.x = -Math.PI / 2;
-            torus.visible = false;
+            torus.position.y = centerY;
+            torus.scale.setScalar(radius);
             torus.renderOrder = 1;
             scene.add(torus);
-            bandVisuals.push(torus);
+            return torus;
         }
 
         function initPBDRestState() {
@@ -435,14 +435,7 @@
                 stiffness: BAND_STIFFNESS,
                 influence: BAND_INFLUENCE,
             });
-
-            // Show a visual torus
-            const vi = bands.length - 1;
-            if (vi < bandVisuals.length) {
-                bandVisuals[vi].visible = true;
-                bandVisuals[vi].position.y = centerY;
-                bandVisuals[vi].scale.setScalar(currentR);
-            }
+            bandVisuals.push(makeBandVisual(centerY, currentR));
 
             H.bcount.textContent = bands.length;
             console.log(`皮筋 #${bands.length}  y=${centerY.toFixed(3)}  r=${currentR.toFixed(3)}  target=${(currentR * BAND_INITIAL_TIGHTNESS).toFixed(3)}`);
@@ -450,9 +443,13 @@
 
         function removeBand() {
             if (bands.length === 0) return;
-            const vi = bands.length - 1;
-            if (vi < bandVisuals.length) bandVisuals[vi].visible = false;
             bands.pop();
+            const vis = bandVisuals.pop();
+            if (vis) {
+                vis.geometry.dispose();
+                vis.material.dispose();
+                scene.remove(vis);
+            }
             H.bcount.textContent = bands.length;
         }
 
