@@ -12,7 +12,8 @@ node_modules/
 Thumbs.db
 
 # Large binary files
-
+*.glb
+*.exr
 
 # Build output
 dist/

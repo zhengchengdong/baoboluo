@@ -133,6 +133,7 @@
         // ──────────────────────────────────────
         const pineappleGeo = new THREE.BufferGeometry();
         let pineappleMesh = null;
+        let proxyMesh = null;       // low-poly invisible mesh for fast raycasting
 
         async function loadPineapple() {
             const loader = new GLTFLoader();
@@ -162,6 +163,20 @@
             // Use original material from the model (textures preserved)
             const mat = srcMesh.material;
             pineappleMesh = new THREE.Mesh(pineappleGeo, mat); scene.add(pineappleMesh);
+
+            // Create low-poly proxy for raycasting (avoids 1.94M-triangle raycast)
+            pineappleGeo.computeBoundingBox();
+            const bbox = pineappleGeo.boundingBox;
+            const halfExt = new THREE.Vector3().subVectors(bbox.max, bbox.min).multiplyScalar(0.5);
+            const center = new THREE.Vector3().addVectors(bbox.max, bbox.min).multiplyScalar(0.5);
+            const proxyGeo = new THREE.SphereGeometry(1, 24, 12);
+            const proxyMat = new THREE.MeshBasicMaterial({ visible: false });
+            proxyMesh = new THREE.Mesh(proxyGeo, proxyMat);
+            proxyMesh.scale.set(halfExt.x, halfExt.y, halfExt.z);
+            proxyMesh.position.copy(center);
+            proxyMesh.name = 'raycast-proxy';
+            scene.add(proxyMesh);
+
             initPBDRestState();
             console.log('✅ 菠萝:', pineappleGeo.attributes.position.count.toLocaleString(), '顶点');
         }
@@ -234,6 +249,48 @@
         let restPositions = null;   // Float32Array
         let restVolume = 0;
         let restSurfaceArea = 0;
+        let needsRestore = false;   // true when bands were removed and vertices may be displaced
+
+        // Precomputed radius-by-height lookup for fast preview / band placement
+        const RADIUS_BUCKETS = 64;
+        let radiusProfile = null;   // { minY, maxY, buckets: Float32Array(RADIUS_BUCKETS), counts: Uint32Array(RADIUS_BUCKETS) }
+        let profileDirty = true;
+
+        function buildRadiusProfile() {
+            if (!pineappleMesh) return;
+            const pos = pineappleGeo.attributes.position;
+            const count = pos.count;
+            let minY = Infinity, maxY = -Infinity;
+            for (let i = 0; i < count; i++) {
+                const y = pos.getY(i);
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+            const range = maxY - minY || 0.01;
+            const buckets = new Float32Array(RADIUS_BUCKETS);
+            const cnts = new Uint32Array(RADIUS_BUCKETS);
+            for (let i = 0; i < count; i++) {
+                const y = pos.getY(i);
+                const r = Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
+                const idx = Math.min(RADIUS_BUCKETS - 1, Math.floor((y - minY) / range * RADIUS_BUCKETS));
+                buckets[idx] += r;
+                cnts[idx]++;
+            }
+            radiusProfile = { minY, maxY, buckets, counts: cnts };
+            profileDirty = false;
+        }
+
+        function getRadiusAtY(targetY) {
+            if (!radiusProfile || profileDirty) buildRadiusProfile();
+            const { minY, maxY, buckets, counts } = radiusProfile;
+            const range = maxY - minY || 0.01;
+            const idx = Math.min(RADIUS_BUCKETS - 1, Math.max(0, Math.floor((targetY - minY) / range * RADIUS_BUCKETS)));
+            // Blend with neighbors for smooth interpolation
+            let sumR = buckets[idx], sumC = counts[idx];
+            if (idx > 0) { sumR += buckets[idx - 1]; sumC += counts[idx - 1]; }
+            if (idx < RADIUS_BUCKETS - 1) { sumR += buckets[idx + 1]; sumC += counts[idx + 1]; }
+            return sumC > 0 ? sumR / sumC : 0.5;
+        }
 
         const bands = [];           // { centerY, targetRadius, stiffness, influence }
         const bandVisuals = [];     // THREE.Mesh (torus)
@@ -285,6 +342,8 @@
                 '三角形', Math.round(faceCount),
                 'restVolume', restVolume.toFixed(4),
                 'restSurfaceArea', restSurfaceArea.toFixed(2));
+
+            buildRadiusProfile();
         }
         // initPBDRestState() is called inside loadPineapple() after model loads
 
@@ -301,23 +360,12 @@
         // ──────────────────────────────────────
         function addBand(centerY) {
             if (!pineappleMesh || restVolume <= 0) return;
-            const pos = pineappleGeo.attributes.position;
-            let minY = Infinity, maxY = -Infinity;
-            for (let i = 0; i < pos.count; i++) {
-                const y = pos.getY(i); if (y < minY) minY = y; if (y > maxY) maxY = y;
-            }
+            if (!radiusProfile || profileDirty) buildRadiusProfile();
+            const { minY, maxY } = radiusProfile;
             const margin = BAND_INFLUENCE * 0.3;
             centerY = Math.max(minY + margin, Math.min(maxY - margin, centerY));
 
-            // Current surface radius at this height
-            let sumR = 0, count = 0;
-            for (let i = 0; i < pos.count; i++) {
-                if (Math.abs(pos.getY(i) - centerY) < BAND_INFLUENCE * 0.4) {
-                    sumR += Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
-                    count++;
-                }
-            }
-            const currentR = count > 1 ? sumR / count : 0.5;
+            const currentR = getRadiusAtY(centerY);
 
             bands.push({
                 centerY,
@@ -341,6 +389,7 @@
                 scene.remove(vis);
             }
             H.bcount.textContent = bands.length;
+            needsRestore = true; // vertices were displaced by bands, need to restore
         }
 
         // ──────────────────────────────────────
@@ -485,22 +534,14 @@
             H.beff.textContent = hardenedBandStiff.toFixed(3);
 
 
-            // Update band visuals
+            // Update band visuals (use radius profile, not vertex scan)
+            profileDirty = true; // positions changed, profile needs rebuild next query
             for (let b = 0; b < bands.length; b++) {
                 const vis = bandVisuals[b];
                 if (!vis || !vis.visible) continue;
                 const cy = bands[b].centerY;
-                let sumR = 0, cnt = 0;
-                for (let i = 0; i < pos.count; i++) {
-                    if (Math.abs(pos.getY(i) - cy) < BAND_INFLUENCE * 0.3) {
-                        sumR += Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
-                        cnt++;
-                    }
-                }
-                if (cnt > 1) {
-                    vis.position.y = cy;
-                    vis.scale.setScalar(sumR / cnt);
-                }
+                vis.position.y = cy;
+                vis.scale.setScalar(getRadiusAtY(cy));
             }
             H.pbdtime.textContent=(performance.now()-t0).toFixed(1);
         }
@@ -530,28 +571,26 @@
             scene.add(previewRing);
         }
 
+        let lastMouseTime = 0;
+        const MOUSE_THROTTLE_MS = 50; // max 20 raycasts/sec
+
         window.addEventListener('mousemove', (e) => {
             if (!pineappleMesh) return;
+            const now = performance.now();
+            if (now - lastMouseTime < MOUSE_THROTTLE_MS) return;
+            lastMouseTime = now;
+
             ensurePreviewRing();
             mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
             mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
             raycaster.setFromCamera(mouse, camera);
-            const hits = raycaster.intersectObject(pineappleMesh, false);
+            const hits = proxyMesh ? raycaster.intersectObject(proxyMesh, false) : [];
             if (hits.length > 0) {
                 const y = hits[0].point.y;
                 const clampedY = Math.max(-1.5 + 0.1, Math.min(1.5 - 0.1, y));
                 previewRing.position.y = clampedY;
                 previewRing.visible = true;
-                // Estimate radius
-                const pos = pineappleGeo.attributes.position;
-                let sumR = 0, cnt = 0;
-                for (let i = 0; i < pos.count; i++) {
-                    if (Math.abs(pos.getY(i) - clampedY) < 0.15) {
-                        sumR += Math.sqrt(pos.getX(i) ** 2 + pos.getZ(i) ** 2);
-                        cnt++;
-                    }
-                }
-                if (cnt > 1) previewRing.scale.setScalar(sumR / cnt);
+                previewRing.scale.setScalar(getRadiusAtY(clampedY));
             } else {
                 previewRing.visible = false;
             }
@@ -568,7 +607,7 @@
             mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
             mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
             raycaster.setFromCamera(mouse, camera);
-            const hits = raycaster.intersectObject(pineappleMesh, false);
+            const hits = proxyMesh ? raycaster.intersectObject(proxyMesh, false) : [];
             if (hits.length > 0) {
                 addBand(hits[0].point.y);
             }
@@ -605,14 +644,19 @@
 
             if (bands.length > 0) {
                 runPBD();
-            } else {
-                // No bands — just run shape constraint to restore rest shape
+            } else if (needsRestore) {
+                // Bands were removed — run shape constraint to restore rest shape
                 const posArr = pineappleGeo.attributes.position.array;
                 for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
                     pbdApplyShape(posArr);
                 }
                 pineappleGeo.attributes.position.needsUpdate = true;
                 pineappleGeo.computeVertexNormals();
+
+                // Check if vertices are back to rest — if so, stop restoring
+                if (maxDisplacement < 1e-5) {
+                    needsRestore = false;
+                }
             }
 
             renderer.render(scene, camera);
