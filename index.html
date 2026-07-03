@@ -53,6 +53,7 @@
         <div>当前体积: <span class="val" id="cvol">--</span></div>
         <div>rest体积: <span class="val" id="rvol">--</span></div>
         <div>PBD迭代: <span class="val" id="pbditer">--</span></div>
+        <div>PBD耗时: <span class="val" id="pbdtime">--</span> ms</div>
         <div>最大位移: <span class="val" id="maxdisp">--</span></div>
         <div>形状有效: <span class="val" id="seff">--</span> &nbsp; 皮筋有效: <span class="val" id="beff">--</span></div>
     </div>
@@ -97,6 +98,7 @@
             vcount: $('vcount'), tcount: $('tcount'),
             bcount: $('bcount'), vratio: $('vratio'),
             cvol: $('cvol'), rvol: $('rvol'), pbditer: $('pbditer'),
+            pbdtime: $('pbdtime'),
             maxdisp: $('maxdisp'),
             seff: $('seff'),
             beff: $('beff'),
@@ -127,126 +129,43 @@
         scene.add(new THREE.DirectionalLight('#fff', 1.5).translateY(5));
 
         // ──────────────────────────────────────
-        // Load dual models: proxy (physics) + high-res (render)
+        // Load pineapple model
         // ──────────────────────────────────────
-        const proxyGeo = new THREE.BufferGeometry();
-        let highResMesh = null;
-        let skinMapping = null;
-        let proxyWire = null;
+        const pineappleGeo = new THREE.BufferGeometry();
+        let pineappleMesh = null;
 
-        async function loadGLB(url) {
-            return new Promise((res, rej) => new GLTFLoader().load(url, res, undefined, rej));
-        }
-        function extractGeo(gltf) {
-            let g = null; gltf.scene.traverse(c => { if (c.isMesh && !g) g = c.geometry; }); return g;
-        }
-        function centerScaleGeo(geo, th) {
-            geo.computeBoundingBox();
-            const c = new THREE.Vector3(); geo.boundingBox.getCenter(c);
-            const s = new THREE.Vector3(); geo.boundingBox.getSize(s);
-            const sc = th / s.y;
-            const pa = geo.attributes.position.array;
-            for (let i = 0; i < geo.attributes.position.count; i++) {
-                pa[i*3]=(pa[i*3]-c.x)*sc; pa[i*3+1]=(pa[i*3+1]-c.y)*sc; pa[i*3+2]=(pa[i*3+2]-c.z)*sc;
+        async function loadPineapple() {
+            const loader = new GLTFLoader();
+            const gltf = await new Promise((res, rej) => loader.load('pineapple.glb', res, undefined, rej));
+
+            // Find first mesh with its original material
+            let srcMesh = null;
+            gltf.scene.traverse(c => { if (c.isMesh && !srcMesh) srcMesh = c; });
+            if (!srcMesh) throw new Error('No mesh in GLB');
+
+            const srcGeo = srcMesh.geometry;
+            srcGeo.computeBoundingBox();
+            const cen = new THREE.Vector3(); srcGeo.boundingBox.getCenter(cen);
+            const siz = new THREE.Vector3(); srcGeo.boundingBox.getSize(siz);
+            const sc = 3.0 / siz.y;
+            const pa = srcGeo.attributes.position.array;
+            const np = new Float32Array(pa.length);
+            for (let i = 0; i < srcGeo.attributes.position.count; i++) {
+                np[i*3]=(pa[i*3]-cen.x)*sc; np[i*3+1]=(pa[i*3+1]-cen.y)*sc; np[i*3+2]=(pa[i*3+2]-cen.z)*sc;
             }
-            geo.attributes.position.needsUpdate = true;
-            geo.computeVertexNormals();
-        }
+            pineappleGeo.setAttribute('position', new THREE.Float32BufferAttribute(np, 3));
+            if (srcGeo.index) pineappleGeo.setIndex(Array.from(srcGeo.index.array));
+            if (srcGeo.attributes.normal) pineappleGeo.setAttribute('normal', srcGeo.attributes.normal.clone());
+            if (srcGeo.attributes.uv) pineappleGeo.setAttribute('uv', srcGeo.attributes.uv.clone());
+            pineappleGeo.computeVertexNormals();
 
-        async function loadModels() {
-            // Load proxy (physics)
-            const pg = await loadGLB('pineapple_py.glb');
-            const pGeo = extractGeo(pg).clone();
-            centerScaleGeo(pGeo, 3.0);
-            copyGeo(proxyGeo, pGeo);
-            console.log('代理:', proxyGeo.attributes.position.count, '顶点');
-
-            // Load high-res (same model for testing)
-            const hg = await loadGLB('pineapple.glb');
-            const hGeo = extractGeo(hg).clone();
-            centerScaleGeo(hGeo, 3.0);
-            let hMat = null;
-            hg.scene.traverse(c => { if (c.isMesh && !hMat) hMat = c.material; });
-            const highGeo = new THREE.BufferGeometry();
-            copyGeo(highGeo, hGeo);
-            highResMesh = new THREE.Mesh(highGeo, hMat); scene.add(highResMesh);
-
-            // Debug wireframe for proxy (toggle with W)
-            const wMat = new THREE.MeshBasicMaterial({ color:'#0f0', wireframe:true, transparent:true, opacity:0.5 });
-            proxyWire = new THREE.Mesh(proxyGeo, wMat);
-            proxyWire.visible = false;
-            scene.add(proxyWire);
-
-            // Build skinning (K=1 for same-model test)
-            skinMapping = buildSkinningMapping(highGeo, proxyGeo, 5);
-
+            // Use original material from the model (textures preserved)
+            const mat = srcMesh.material;
+            pineappleMesh = new THREE.Mesh(pineappleGeo, mat); scene.add(pineappleMesh);
             initPBDRestState();
-            console.log('✅ 双模型就绪');
+            console.log('✅ 菠萝:', pineappleGeo.attributes.position.count.toLocaleString(), '顶点');
         }
-        loadModels().catch(e => console.error('加载失败:', e));
-
-        function copyGeo(dst, src) {
-            const pa = src.attributes.position.array;
-            dst.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(pa), 3));
-            if (src.index) dst.setIndex(Array.from(src.index.array));
-            if (src.attributes.normal) dst.setAttribute('normal', src.attributes.normal.clone());
-            if (src.attributes.uv) dst.setAttribute('uv', src.attributes.uv.clone());
-            dst.computeVertexNormals();
-        }
-
-        // ── Vertex skinning (K nearest proxy vertices with inverse-square weights) ──
-        function buildSkinningMapping(highGeo, proxyGeo, K) {
-            const hPos = highGeo.attributes.position, pPos = proxyGeo.attributes.position;
-            console.log(`蒙皮: ${hPos.count} → ${pPos.count}, K=${K}`);
-            const gs = 15;
-            const pBox = new THREE.Box3().setFromBufferAttribute(pPos);
-            const cs = new THREE.Vector3((pBox.max.x-pBox.min.x)/gs, (pBox.max.y-pBox.min.y)/gs, (pBox.max.z-pBox.min.z)/gs);
-            const grid = new Array(gs*gs*gs); for (let i=0;i<grid.length;i++) grid[i]=[];
-            for (let i=0;i<pPos.count;i++) {
-                const ci=Math.max(0,Math.min(gs-1,~~((pPos.getX(i)-pBox.min.x)/cs.x)));
-                const cj=Math.max(0,Math.min(gs-1,~~((pPos.getY(i)-pBox.min.y)/cs.y)));
-                const ck=Math.max(0,Math.min(gs-1,~~((pPos.getZ(i)-pBox.min.z)/cs.z)));
-                grid[ci+cj*gs+ck*gs*gs].push(i);
-            }
-            const map = [];
-            for (let vi=0;vi<hPos.count;vi++) {
-                const x=hPos.getX(vi),y=hPos.getY(vi),z=hPos.getZ(vi);
-                const ci=Math.max(0,Math.min(gs-1,~~((x-pBox.min.x)/cs.x)));
-                const cj=Math.max(0,Math.min(gs-1,~~((y-pBox.min.y)/cs.y)));
-                const ck=Math.max(0,Math.min(gs-1,~~((z-pBox.min.z)/cs.z)));
-                // Collect K nearest
-                const best = [];
-                for (const idx of grid[ci+cj*gs+ck*gs*gs]) {
-                    const d=(x-pPos.getX(idx))**2+(y-pPos.getY(idx))**2+(z-pPos.getZ(idx))**2;
-                    if (best.length < K || d < best[best.length-1].d) {
-                        best.push({idx,d}); best.sort((a,b)=>a.d-b.d); if (best.length>K) best.length=K;
-                    }
-                }
-                // Gaussian RBF: w = exp(-d²/σ²)
-                // sigma ≈ average proxy vertex spacing (surface area / vertex count)
-                const sigma2 = 0.0003; // hand-tuned: ~0.017²
-                let tw=0;
-                const indices=[], weights=[];
-                for (const b of best) { const w=Math.exp(-b.d/sigma2); indices.push(b.idx); weights.push(w); tw+=w; }
-                for (let j=0;j<weights.length;j++) weights[j]/=tw;
-                map.push({indices, weights});
-                if (vi%20000===0) console.log(`  蒙皮 ${(vi/hPos.count*100).toFixed(0)}%`);
-            }
-            console.log('蒙皮完成');
-            return map;
-        }
-        function applySkinningMapping(proxyPos, highPos) {
-            const p=proxyPos.array, h=highPos.array;
-            for (let i=0;i<skinMapping.length;i++) {
-                const m=skinMapping[i]; let sx=0,sy=0,sz=0;
-                for (let j=0;j<m.indices.length;j++) {
-                    const pi=m.indices[j]*3, w=m.weights[j];
-                    sx+=p[pi]*w; sy+=p[pi+1]*w; sz+=p[pi+2]*w;
-                }
-                const i3=i*3; h[i3]=sx; h[i3+1]=sy; h[i3+2]=sz;
-            }
-            highPos.needsUpdate = true;
-        }
+        loadPineapple().catch(e => console.error('加载失败:', e));
 
         // ──────────────────────────────────────
         // PBD params (adjustable via sliders)
@@ -331,13 +250,13 @@
         }
 
         function initPBDRestState() {
-            const pos = proxyGeo.attributes.position;
+            const pos = pineappleGeo.attributes.position;
             restPositions = new Float32Array(pos.array);
 
             // Compute rest volume & surface area (handle indexed & non-indexed)
             const p = pos.array;
-            const hasIdx = proxyGeo.index !== null;
-            const idx = hasIdx ? proxyGeo.index.array : null;
+            const hasIdx = pineappleGeo.index !== null;
+            const idx = hasIdx ? pineappleGeo.index.array : null;
             const faceCount = hasIdx ? idx.length / 3 : pos.count / 3;
             let vol = 0, area = 0;
             const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
@@ -381,8 +300,8 @@
         // Band management
         // ──────────────────────────────────────
         function addBand(centerY) {
-            if (!highResMesh || restVolume <= 0) return;
-            const pos = proxyGeo.attributes.position;
+            if (!pineappleMesh || restVolume <= 0) return;
+            const pos = pineappleGeo.attributes.position;
             let minY = Infinity, maxY = -Infinity;
             for (let i = 0; i < pos.count; i++) {
                 const y = pos.getY(i); if (y < minY) minY = y; if (y > maxY) maxY = y;
@@ -433,7 +352,7 @@
             const stiffness = band.stiffness;
             const influence = band.influence;
 
-            const count = proxyGeo.attributes.position.count;
+            const count = pineappleGeo.attributes.position.count;
             for (let i = 0; i < count; i++) {
                 const i3 = i * 3;
                 const y = posArr[i3 + 1];
@@ -490,7 +409,7 @@
             // Band area: 体积往外推 vs 皮筋往里推 → 刚度比决定深度
             // Free area: 只有体积往外推 → 自然鼓出
             const basePush = VOLUME_STIFFNESS * deficit / restSurfaceArea;
-            const count = proxyGeo.attributes.position.count;
+            const count = pineappleGeo.attributes.position.count;
 
             for (let i = 0; i < count; i++) {
                 const i3 = i * 3;
@@ -511,7 +430,7 @@
         // effectiveStiffness = base × (1 + hardening × displacement²)
         // 钳位到 0.99 保证 PBD 收敛
         function pbdApplyShape(posArr) {
-            const count = proxyGeo.attributes.position.count;
+            const count = pineappleGeo.attributes.position.count;
             let maxDisp = 0;
             for (let i = 0; i < count; i++) {
                 const i3 = i * 3;
@@ -533,9 +452,10 @@
 
         // ── PBD 主循环 ──
         function runPBD() {
-            const pos = proxyGeo.attributes.position;
+            const t0=performance.now();
+            const pos = pineappleGeo.attributes.position;
             const posArr = pos.array;
-            const idxArr = proxyGeo.index.array;
+            const idxArr = pineappleGeo.index.array;
             let finalVolume = restVolume;
 
             for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
@@ -551,13 +471,7 @@
             }
 
             pos.needsUpdate = true;
-            proxyGeo.computeVertexNormals();
-
-            // Apply skinning: proxy → high-res
-            if (skinMapping && highResMesh) {
-                applySkinningMapping(proxyGeo.attributes.position, highResMesh.geometry.attributes.position);
-                highResMesh.geometry.computeVertexNormals();
-            }
+            pineappleGeo.computeVertexNormals();
 
             H.cvol.textContent = finalVolume.toFixed(4);
             H.vratio.textContent = (finalVolume / restVolume * 100).toFixed(1);
@@ -588,6 +502,7 @@
                     vis.scale.setScalar(sumR / cnt);
                 }
             }
+            H.pbdtime.textContent=(performance.now()-t0).toFixed(1);
         }
 
         // ──────────────────────────────────────
@@ -616,19 +531,19 @@
         }
 
         window.addEventListener('mousemove', (e) => {
-            if (!highResMesh) return;
+            if (!pineappleMesh) return;
             ensurePreviewRing();
             mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
             mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
             raycaster.setFromCamera(mouse, camera);
-            const hits = raycaster.intersectObject(highResMesh, false);
+            const hits = raycaster.intersectObject(pineappleMesh, false);
             if (hits.length > 0) {
                 const y = hits[0].point.y;
                 const clampedY = Math.max(-1.5 + 0.1, Math.min(1.5 - 0.1, y));
                 previewRing.position.y = clampedY;
                 previewRing.visible = true;
                 // Estimate radius
-                const pos = proxyGeo.attributes.position;
+                const pos = pineappleGeo.attributes.position;
                 let sumR = 0, cnt = 0;
                 for (let i = 0; i < pos.count; i++) {
                     if (Math.abs(pos.getY(i) - clampedY) < 0.15) {
@@ -645,7 +560,7 @@
         window.addEventListener('mousedown', (e) => { mouseDown.set(e.clientX, e.clientY); });
 
         window.addEventListener('mouseup', (e) => {
-            if (!highResMesh) return;
+            if (!pineappleMesh) return;
             const dx = e.clientX - mouseDown.x;
             const dy = e.clientY - mouseDown.y;
             if (Math.sqrt(dx * dx + dy * dy) > 3) return; // drag
@@ -653,16 +568,14 @@
             mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
             mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
             raycaster.setFromCamera(mouse, camera);
-            const hits = raycaster.intersectObject(highResMesh, false);
+            const hits = raycaster.intersectObject(pineappleMesh, false);
             if (hits.length > 0) {
                 addBand(hits[0].point.y);
             }
         });
 
         window.addEventListener('keydown', (e) => {
-            const k = e.key.toLowerCase();
-            if (k === 'r') removeBand();
-            if (k === 'w' && proxyWire) proxyWire.visible = !proxyWire.visible;
+            if (e.key.toLowerCase() === 'r') removeBand();
         });
 
         // ──────────────────────────────────────
@@ -688,18 +601,18 @@
 
             controls.update();
 
-            if (!highResMesh) { renderer.render(scene, camera); return; } // model not loaded yet
+            if (!pineappleMesh) { renderer.render(scene, camera); return; } // model not loaded yet
 
             if (bands.length > 0) {
                 runPBD();
             } else {
                 // No bands — just run shape constraint to restore rest shape
-                const posArr = proxyGeo.attributes.position.array;
+                const posArr = pineappleGeo.attributes.position.array;
                 for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
                     pbdApplyShape(posArr);
                 }
-                proxyGeo.attributes.position.needsUpdate = true;
-                proxyGeo.computeVertexNormals();
+                pineappleGeo.attributes.position.needsUpdate = true;
+                pineappleGeo.computeVertexNormals();
             }
 
             renderer.render(scene, camera);

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>法向位移调试</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{background:#111;overflow:hidden;font-family:monospace}
+        canvas{display:block;cursor:crosshair}
+        #hud{position:fixed;top:12px;left:12px;z-index:10;color:#ccc;font-size:13px;line-height:1.7;pointer-events:none}
+        #hud .val{color:#0f0}
+        #info{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);color:#888;font-size:12px;z-index:10;pointer-events:none}
+        #panel{position:fixed;top:12px;right:12px;z-index:20;background:rgba(0,0,0,0.8);border:1px solid #444;border-radius:8px;padding:14px 18px;color:#ccc;font-size:13px;min-width:220px;pointer-events:all;user-select:none}
+        #panel label{display:block;margin:8px 0 2px;color:#aaa}
+        #panel input[type=range]{width:100%;margin:0;accent-color:#ff4444}
+        #panel .val{color:#ff4444;float:right}
+        #panel h3{margin:0 0 6px;color:#fff;font-size:14px}
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <div>FPS: <span class="val" id="fps">--</span></div>
+        <div>代理顶点: <span class="val" id="pv">--</span></div>
+        <div>高模顶点: <span class="val" id="hv">--</span></div>
+        <div>皮筋: <span class="val" id="bcount">0</span></div>
+        <div>体积: <span class="val" id="vratio">--</span>%</div>
+        <div>最大位移: <span class="val" id="maxdisp">--</span></div>
+        <div>代理法向δ均值: <span class="val" id="avgd">--</span></div>
+        <div>代理法向δ极值: <span class="val" id="extd">--</span></div>
+    </div>
+    <div id="info">🖱️ 点击绑皮筋 &nbsp; R 割 &nbsp; W 代理线框 &nbsp; H 高模线框 &nbsp; N 法向位移可视化</div>
+
+    <div id="panel">
+        <h3>🔧 PBD</h3>
+        <label>形状基础 <span class="val" id="sv_ss">0.30</span></label>
+        <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
+        <label>皮筋基础 <span class="val" id="sv_bs">0.50</span></label>
+        <input type="range" id="sl_bs" min="0.01" max="1.0" step="0.01" value="0.50">
+        <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
+        <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
+        <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
+        <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
+        <label>硬化系数 <span class="val" id="sv_ha">0.00</span></label>
+        <input type="range" id="sl_ha" min="0" max="3" step="0.05" value="0">
+        <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
+        <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
+        <h3>📐 法向位移</h3>
+        <label>代理面偏移 <span class="val" id="sv_of">0.00</span></label>
+        <input type="range" id="sl_of" min="0" max="0.15" step="0.005" value="0.00">
+        <label>平滑迭代 <span class="val" id="sv_si">2</span></label>
+        <input type="range" id="sl_si" min="0" max="8" step="1" value="2">
+        <label>平滑权重 <span class="val" id="sv_sw">0.60</span></label>
+        <input type="range" id="sl_sw" min="0.1" max="0.95" step="0.05" value="0.60">
+    </div>
+
+    <script type="importmap">
+    {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"}}
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const $=id=>document.getElementById(id);
+        const H={fps:$('fps'),pv:$('pv'),hv:$('hv'),bcount:$('bcount'),vratio:$('vratio'),maxdisp:$('maxdisp'),avgd:$('avgd'),extd:$('extd')};
+
+        // Scene
+        const renderer=new THREE.WebGLRenderer({antialias:true});
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+        renderer.setSize(window.innerWidth,window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+        const scene=new THREE.Scene(); scene.background=new THREE.Color('#111122');
+        const camera=new THREE.PerspectiveCamera(45,window.innerWidth/window.innerHeight,0.1,50);
+        camera.position.set(2,2,4); camera.lookAt(0,0,0);
+        const controls=new OrbitControls(camera,renderer.domElement); controls.target.set(0,0,0); controls.enableDamping=true; controls.update();
+        scene.add(new THREE.AmbientLight('#fff',0.5));
+        scene.add(new THREE.DirectionalLight('#fff',1.5).translateY(5));
+
+        // Build ellipsoids
+        function buildEllipsoid(rx,ry,rz,rings,segs){
+            const pos=[],idx=[];
+            pos.push(0,ry,0);
+            for(let r=0;r<rings;r++){const phi=Math.PI*(r+1)/(rings+1),sp=Math.sin(phi),cp=Math.cos(phi);for(let s=0;s<segs;s++){const th=2*Math.PI*s/segs;pos.push(rx*sp*Math.cos(th),ry*cp,rz*sp*Math.sin(th));}}
+            pos.push(0,-ry,0);
+            const bp=1+rings*segs;
+            for(let s=0;s<segs;s++)idx.push(0,1+s,1+(s+1)%segs);
+            for(let r=0;r<rings-1;r++){const rs=1+r*segs,ns=1+(r+1)*segs;for(let s=0;s<segs;s++){const a=rs+s,b=rs+(s+1)%segs,c=ns+s,d=ns+(s+1)%segs;idx.push(a,c,b);idx.push(b,c,d);}}
+            const ls=1+(rings-1)*segs;
+            for(let s=0;s<segs;s++){const a=ls+s,b=ls+(s+1)%segs;idx.push(a,bp,b);}
+            const g=new THREE.BufferGeometry();
+            g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+            g.setIndex(idx); g.computeVertexNormals();
+            return g;
+        }
+
+        const PROXY_R=16, PROXY_S=16, HIGH_R=24, HIGH_S=24;
+        const proxyGeo=buildEllipsoid(0.5,1.5,0.5,PROXY_R,PROXY_S);
+        const highGeo=buildEllipsoid(0.5,1.5,0.5,HIGH_R,HIGH_S);
+
+        // Store rest data
+        const proxyRestPos=new Float32Array(proxyGeo.attributes.position.array);
+        const proxyRestNrm=new Float32Array(proxyGeo.attributes.normal.array);
+        const highRestPos=new Float32Array(highGeo.attributes.position.array);
+        const highRestNrm=new Float32Array(highGeo.attributes.normal.array);
+
+        // Build proxy vertex neighbors (for Laplacian smooth of scalar field)
+        function buildNeighbors(geo){
+            const idx=geo.index.array, vc=geo.attributes.position.count;
+            const nbrs=new Array(vc);for(let i=0;i<vc;i++)nbrs[i]=[];
+            for(let i=0;i<idx.length;i+=3){
+                const a=idx[i],b=idx[i+1],c=idx[i+2];
+                nbrs[a].push(b,c);nbrs[b].push(a,c);nbrs[c].push(a,b);
+            }
+            for(let i=0;i<vc;i++)nbrs[i]=[...new Set(nbrs[i])];
+            return nbrs;
+        }
+        const proxyNeighbors=buildNeighbors(proxyGeo);
+
+        // Surface offset
+        let SURFACE_OFFSET=0;
+        function applyOffset(amount){
+            const p=proxyGeo.attributes.position, n=proxyGeo.attributes.normal;
+            for(let i=0;i<p.count;i++){p.setXYZ(i,proxyRestPos[i*3]+n.getX(i)*amount,proxyRestPos[i*3+1]+n.getY(i)*amount,proxyRestPos[i*3+2]+n.getZ(i)*amount);}
+            p.needsUpdate=true;proxyGeo.computeVertexNormals();
+            // Update rest normals snapshot for offset state
+            const nn=proxyGeo.attributes.normal.array;
+            for(let i=0;i<nn.length;i++)proxyRestNrm[i]=nn[i];
+        }
+
+        // Materials
+        const proxyMat=new THREE.MeshBasicMaterial({color:'#0f0',wireframe:true,transparent:true,opacity:0.8});
+        const proxyWire=new THREE.Mesh(proxyGeo,proxyMat); scene.add(proxyWire);
+        const highMat=new THREE.MeshPhongMaterial({color:'#ffaa00',transparent:true,opacity:0.5,side:THREE.DoubleSide,depthWrite:false});
+        const highMesh=new THREE.Mesh(highGeo,highMat); scene.add(highMesh);
+        const highWireMat=new THREE.MeshBasicMaterial({color:'#f80',wireframe:true,transparent:true,opacity:0.5});
+        const highWire=new THREE.Mesh(highGeo,highWireMat); highWire.visible=false; scene.add(highWire);
+
+        // Map: high-res vertex → nearest proxy vertex
+        let vertMap=null;
+        function buildVertMap(){
+            const hPos=highGeo.attributes.position, pPos=proxyGeo.attributes.position;
+            const pvc=pPos.count;
+            const gs=12, pBox=new THREE.Box3().setFromBufferAttribute(pPos);
+            const cs=new THREE.Vector3((pBox.max.x-pBox.min.x)/gs,(pBox.max.y-pBox.min.y)/gs,(pBox.max.z-pBox.min.z)/gs);
+            const grid=new Array(gs*gs*gs);for(let i=0;i<grid.length;i++)grid[i]=[];
+            for(let pi=0;pi<pvc;pi++){
+                const ci=Math.max(0,Math.min(gs-1,~~((pPos.getX(pi)-pBox.min.x)/cs.x)));
+                const cj=Math.max(0,Math.min(gs-1,~~((pPos.getY(pi)-pBox.min.y)/cs.y)));
+                const ck=Math.max(0,Math.min(gs-1,~~((pPos.getZ(pi)-pBox.min.z)/cs.z)));
+                grid[ci+cj*gs+ck*gs*gs].push(pi);
+            }
+            const offs=[];for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++)for(let dk=-1;dk<=1;dk++)offs.push([di,dj,dk]);
+            const map=[];
+            for(let vi=0;vi<hPos.count;vi++){
+                const vx=hPos.getX(vi),vy=hPos.getY(vi),vz=hPos.getZ(vi);
+                const ci=Math.max(0,Math.min(gs-1,~~((vx-pBox.min.x)/cs.x))),cj=Math.max(0,Math.min(gs-1,~~((vy-pBox.min.y)/cs.y))),ck=Math.max(0,Math.min(gs-1,~~((vz-pBox.min.z)/cs.z)));
+                const cand=new Set();
+                for(const[di,dj,dk]of offs){const ni=Math.max(0,Math.min(gs-1,ci+di)),nj=Math.max(0,Math.min(gs-1,cj+dj)),nk=Math.max(0,Math.min(gs-1,ck+dk));for(const idx of grid[ni+nj*gs+nk*gs*gs])cand.add(idx);}
+                if(cand.size===0){let md=1e9,mi=0;for(let pi=0;pi<pvc;pi++){const d=(vx-pPos.getX(pi))**2+(vy-pPos.getY(pi))**2+(vz-pPos.getZ(pi))**2;if(d<md){md=d;mi=pi;}}cand.add(mi);}
+                let bd=1e9, bestPi=0;
+                for(const pi of cand){const d=(vx-pPos.getX(pi))**2+(vy-pPos.getY(pi))**2+(vz-pPos.getZ(pi))**2;if(d<bd){bd=d;bestPi=pi;}}
+                map.push(bestPi);
+            }
+            console.log(`顶点映射: ${map.length} 高模→${pvc} 代理`);
+            return map;
+        }
+        vertMap=buildVertMap();
+
+        // PBD state
+        let restVolume=0, restSurfaceArea=0, maxDisplacement=0;
+        let SHAPE_STIFFNESS=0.30, BAND_STIFFNESS=0.50, VOLUME_STIFFNESS=0.40, BAND_INFLUENCE=0.6, HARDENING=0, PBD_ITERATIONS=10;
+        const BAND_INITIAL_TIGHTNESS=0.80;
+        const bands=[], bandVisuals=[];
+
+        function initPBD(){
+            const p=proxyGeo.attributes.position, idx=proxyGeo.index.array, pa=p.array;
+            let vol=0, area=0;
+            const a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();
+            for(let i=0;i<idx.length;i+=3){
+                const ai=idx[i]*3,bi=idx[i+1]*3,ci=idx[i+2]*3;
+                a.set(pa[ai],pa[ai+1],pa[ai+2]);b.set(pa[bi],pa[bi+1],pa[bi+2]);c.set(pa[ci],pa[ci+1],pa[ci+2]);
+                vol+=(a.x*(b.y*c.z-b.z*c.y)+a.y*(b.z*c.x-b.x*c.z)+a.z*(b.x*c.y-b.y*c.x))/6;
+                const ab=new THREE.Vector3().subVectors(b,a),ac=new THREE.Vector3().subVectors(c,a);
+                area+=0.5*new THREE.Vector3().crossVectors(ab,ac).length();
+            }
+            restVolume=Math.abs(vol);restSurfaceArea=area;
+            H.pv.textContent=p.count;H.hv.textContent=highGeo.attributes.position.count;
+        }
+        initPBD();
+
+        function smoothstep(e0,e1,x){const t=Math.max(0,Math.min(1,(x-e0)/(e1-e0)));return t*t*(3-2*t);}
+
+        // PBD constraints
+        function pbdApplyShape(pa){const n=proxyGeo.attributes.position.count;let md=0;for(let i=0;i<n;i++){const i3=i*3;const dx=proxyRestPos[i3]-pa[i3],dy=proxyRestPos[i3+1]-pa[i3+1],dz=proxyRestPos[i3+2]-pa[i3+2];const disp=Math.sqrt(dx*dx+dy*dy+dz*dz);if(disp>md)md=disp;pa[i3]+=dx*SHAPE_STIFFNESS;pa[i3+1]+=dy*SHAPE_STIFFNESS;pa[i3+2]+=dz*SHAPE_STIFFNESS;}maxDisplacement=md;}
+        function pbdApplyBand(band,pa){const cy=band.centerY,tr=band.targetRadius,st=band.stiffness,inf=band.influence;const n=proxyGeo.attributes.position.count;for(let i=0;i<n;i++){const i3=i*3,y=pa[i3+1],dy=Math.abs(y-cy);if(dy>=inf)continue;const x=pa[i3],z=pa[i3+2],r=Math.sqrt(x*x+z*z);if(r<1e-6)continue;const t=dy/inf,stp=smoothstep(0,1,t),et=tr+(r-tr)*stp;if(r>et){const d=st*(r-et),sc=Math.max(0.01,(r-d)/r);pa[i3]*=sc;pa[i3+2]*=sc;}}}
+        function pbdApplyVolume(pa,ia){let cv=0;const a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();for(let i=0;i<ia.length;i+=3){const ai=ia[i]*3,bi=ia[i+1]*3,ci=ia[i+2]*3;a.set(pa[ai],pa[ai+1],pa[ai+2]);b.set(pa[bi],pa[bi+1],pa[bi+2]);c.set(pa[ci],pa[ci+1],pa[ci+2]);cv+=(a.x*(b.y*c.z-b.z*c.y)+a.y*(b.z*c.x-b.x*c.z)+a.z*(b.x*c.y-b.y*c.x))/6;}cv=Math.abs(cv);const deficit=restVolume-cv;if(Math.abs(deficit)<1e-9)return cv;const bp=VOLUME_STIFFNESS*deficit/restSurfaceArea;const n=proxyGeo.attributes.position.count;for(let i=0;i<n;i++){const i3=i*3,x=pa[i3],z=pa[i3+2],r=Math.sqrt(x*x+z*z);if(r<1e-6)continue;const sc=Math.max(0.7,Math.min(1.3,(r+bp)/r));pa[i3]*=sc;pa[i3+2]*=sc;}return cv;}
+
+        // ── Normal-displacement transfer ──
+        let SMOOTH_ITERS=2, SMOOTH_WEIGHT=0.6;
+        let showNormalVis=false;
+        const normalVisGeo=new THREE.BufferGeometry();
+        const normalVisMat=new THREE.PointsMaterial({color:'#0ff',size:0.03,depthTest:false,depthWrite:false});
+        const normalVisPts=new THREE.Points(normalVisGeo,normalVisMat);normalVisPts.visible=false;scene.add(normalVisPts);
+
+        function transferNormalDisplacement(){
+            const pArr=proxyGeo.attributes.position.array;
+            const pCount=proxyGeo.attributes.position.count;
+            // 1. Compute proxy 3D displacement vectors
+            const pDisp3D=new Float32Array(pCount*3);
+            for(let i=0;i<pCount;i++){
+                const i3=i*3;
+                pDisp3D[i3]  =pArr[i3]  -proxyRestPos[i3];
+                pDisp3D[i3+1]=pArr[i3+1]-proxyRestPos[i3+1];
+                pDisp3D[i3+2]=pArr[i3+2]-proxyRestPos[i3+2];
+            }
+            // 2. Laplacian smooth the 3D displacement vectors on proxy surface
+            for(let iter=0;iter<SMOOTH_ITERS;iter++){
+                const prev=new Float32Array(pDisp3D);
+                for(let i=0;i<pCount;i++){
+                    const nbrs=proxyNeighbors[i];
+                    if(!nbrs||nbrs.length===0)continue;
+                    let sx=0,sy=0,sz=0;const invN=1/nbrs.length;
+                    for(const ni of nbrs){const ni3=ni*3;sx+=prev[ni3];sy+=prev[ni3+1];sz+=prev[ni3+2];}
+                    const i3=i*3;
+                    pDisp3D[i3]  =prev[i3]  *(1-SMOOTH_WEIGHT)+sx*invN*SMOOTH_WEIGHT;
+                    pDisp3D[i3+1]=prev[i3+1]*(1-SMOOTH_WEIGHT)+sy*invN*SMOOTH_WEIGHT;
+                    pDisp3D[i3+2]=prev[i3+2]*(1-SMOOTH_WEIGHT)+sz*invN*SMOOTH_WEIGHT;
+                }
+            }
+            // Stats from smoothed 3D displacement
+            let sum=0, vmin=1e9, vmax=-1e9;
+            for(let i=0;i<pCount;i++){
+                const i3=i*3;
+                const d=Math.sqrt(pDisp3D[i3]**2+pDisp3D[i3+1]**2+pDisp3D[i3+2]**2);
+                sum+=d;if(d<vmin)vmin=d;if(d>vmax)vmax=d;
+            }
+            H.avgd.textContent=(sum/pCount).toFixed(4);
+            H.extd.textContent=`${vmin.toFixed(3)}~${vmax.toFixed(3)}`;
+            // 3. Displace high-res: project smoothed proxy 3D displacement onto HIGH-RES normal
+            const hArr=highGeo.attributes.position.array;
+            for(let i=0;i<vertMap.length;i++){
+                const pi=vertMap[i];
+                const i3=i*3, pi3=pi*3;
+                const d=pDisp3D[pi3]*highRestNrm[i3]+pDisp3D[pi3+1]*highRestNrm[i3+1]+pDisp3D[pi3+2]*highRestNrm[i3+2];
+                hArr[i3]  =highRestPos[i3]  +d*highRestNrm[i3];
+                hArr[i3+1]=highRestPos[i3+1]+d*highRestNrm[i3+1];
+                hArr[i3+2]=highRestPos[i3+2]+d*highRestNrm[i3+2];
+            }
+            highGeo.attributes.position.needsUpdate=true;
+            highGeo.computeVertexNormals();
+            // Update visualization if enabled
+            if(showNormalVis)updateNormalVis_internal();
+        }
+
+        function updateNormalVis_internal(){
+            const pArr=proxyGeo.attributes.position.array;
+            const pCount=proxyGeo.attributes.position.count;
+            // Recompute displacement for visualization
+            const pDisp=new Float32Array(pCount);
+            for(let i=0;i<pCount;i++){
+                const i3=i*3;
+                const dx=pArr[i3]-proxyRestPos[i3];
+                const dy=pArr[i3+1]-proxyRestPos[i3+1];
+                const dz=pArr[i3+2]-proxyRestPos[i3+2];
+                pDisp[i]=dx*proxyRestNrm[i3]+dy*proxyRestNrm[i3+1]+dz*proxyRestNrm[i3+2];
+            }
+            const visPos=[], visCol=[];
+            for(let i=0;i<pCount;i++){
+                const i3=i*3;
+                const d=pDisp[i];
+                visPos.push(pArr[i3]+proxyRestNrm[i3]*d*10, pArr[i3+1]+proxyRestNrm[i3+1]*d*10, pArr[i3+2]+proxyRestNrm[i3+2]*d*10);
+                const r=d>0?Math.min(1,d/0.05):0, b=d<0?Math.min(1,-d/0.05):0;
+                visCol.push(r,0.5,b);
+            }
+            normalVisGeo.setAttribute('position',new THREE.Float32BufferAttribute(visPos,3));
+            normalVisGeo.setAttribute('color',new THREE.Float32BufferAttribute(visCol,3));
+            normalVisMat.vertexColors=true;
+        }
+
+        // Bands
+        function makeBandVis(cy,r){const g=new THREE.TorusGeometry(1,0.02,16,48),m=new THREE.MeshBasicMaterial({color:'#f33',transparent:true,opacity:0.7,depthTest:false,depthWrite:false}),t=new THREE.Mesh(g,m);t.rotation.x=-Math.PI/2;t.position.y=cy;t.scale.setScalar(r);t.renderOrder=1;scene.add(t);return t;}
+        function addBand(cy){const p=proxyGeo.attributes.position;let sr=0,cnt=0;for(let i=0;i<p.count;i++){if(Math.abs(p.getY(i)-cy)<BAND_INFLUENCE*0.4){sr+=Math.sqrt(p.getX(i)**2+p.getZ(i)**2);cnt++;}}const cr=cnt>1?sr/cnt:0.5;bands.push({centerY:cy,targetRadius:cr*BAND_INITIAL_TIGHTNESS,stiffness:BAND_STIFFNESS,influence:BAND_INFLUENCE});bandVisuals.push(makeBandVis(cy,cr));H.bcount.textContent=bands.length;}
+        function removeBand(){if(bands.length===0)return;bands.pop();const v=bandVisuals.pop();if(v){v.geometry.dispose();v.material.dispose();scene.remove(v);}H.bcount.textContent=bands.length;}
+
+        function runPBD(){
+            const pa=proxyGeo.attributes.position.array,ia=proxyGeo.index.array;let fv=restVolume;
+            for(let iter=0;iter<PBD_ITERATIONS;iter++){pbdApplyShape(pa);for(const b of bands)pbdApplyBand(b,pa);fv=pbdApplyVolume(pa,ia);}
+            proxyGeo.attributes.position.needsUpdate=true;proxyGeo.computeVertexNormals();
+            // Update band visuals
+            const p=proxyGeo.attributes.position;
+            for(let b=0;b<bands.length;b++){const v=bandVisuals[b],cy=bands[b].centerY;let sr=0,cnt=0;for(let i=0;i<p.count;i++){if(Math.abs(p.getY(i)-cy)<BAND_INFLUENCE*0.3){sr+=Math.sqrt(p.getX(i)**2+p.getZ(i)**2);cnt++;}}if(cnt>1){v.position.y=cy;v.scale.setScalar(sr/cnt);}}
+            H.vratio.textContent=(fv/restVolume*100).toFixed(1);H.maxdisp.textContent=maxDisplacement.toFixed(3);
+            // Transfer via normal displacement
+            transferNormalDisplacement();
+        }
+
+        // Mouse
+        const raycaster=new THREE.Raycaster(),mouse=new THREE.Vector2(),mouseDown=new THREE.Vector2();
+        let previewRing=null;
+        function ensurePR(){if(previewRing)return;const g=new THREE.TorusGeometry(1,0.025,16,48),m=new THREE.MeshBasicMaterial({color:'#ff0',transparent:true,opacity:0.5,depthTest:false,depthWrite:false});previewRing=new THREE.Mesh(g,m);previewRing.rotation.x=-Math.PI/2;previewRing.visible=false;previewRing.renderOrder=2;scene.add(previewRing);}
+        window.addEventListener('mousemove',e=>{ensurePR();mouse.x=(e.clientX/window.innerWidth)*2-1;mouse.y=-(e.clientY/window.innerHeight)*2+1;raycaster.setFromCamera(mouse,camera);const h=raycaster.intersectObject(highMesh,false);if(h.length>0){const y=Math.max(-1.4,Math.min(1.4,h[0].point.y));previewRing.position.y=y;previewRing.visible=true;const p=proxyGeo.attributes.position;let sr=0,cnt=0;for(let i=0;i<p.count;i++){if(Math.abs(p.getY(i)-y)<0.15){sr+=Math.sqrt(p.getX(i)**2+p.getZ(i)**2);cnt++;}}if(cnt>1)previewRing.scale.setScalar(sr/cnt);}else{previewRing.visible=false;}});
+        window.addEventListener('mousedown',e=>{mouseDown.set(e.clientX,e.clientY);});
+        window.addEventListener('mouseup',e=>{const dx=e.clientX-mouseDown.x,dy=e.clientY-mouseDown.y;if(Math.sqrt(dx*dx+dy*dy)>3)return;mouse.x=(e.clientX/window.innerWidth)*2-1;mouse.y=-(e.clientY/window.innerHeight)*2+1;raycaster.setFromCamera(mouse,camera);const h=raycaster.intersectObject(highMesh,false);if(h.length>0)addBand(h[0].point.y);});
+        window.addEventListener('keydown',e=>{const k=e.key.toLowerCase();if(k==='r')removeBand();if(k==='w')proxyWire.visible=!proxyWire.visible;if(k==='h')highWire.visible=!highWire.visible;if(k==='n'){showNormalVis=!showNormalVis;normalVisPts.visible=showNormalVis;}});
+
+        // Sliders
+        const slSS=$('sl_ss'),slBS=$('sl_bs'),slVS=$('sl_vs'),slBI=$('sl_bi'),slHA=$('sl_ha'),slPI=$('sl_pi'),slOF=$('sl_of'),slSI=$('sl_si'),slSW=$('sl_sw');
+        const svSS=$('sv_ss'),svBS=$('sv_bs'),svVS=$('sv_vs'),svBI=$('sv_bi'),svHA=$('sv_ha'),svPI=$('sv_pi'),svOF=$('sv_of'),svSI=$('sv_si'),svSW=$('sv_sw');
+        slSS.oninput=()=>{SHAPE_STIFFNESS=+slSS.value;svSS.textContent=SHAPE_STIFFNESS.toFixed(2);};
+        slBS.oninput=()=>{BAND_STIFFNESS=+slBS.value;svBS.textContent=BAND_STIFFNESS.toFixed(2);for(const b of bands)b.stiffness=BAND_STIFFNESS;};
+        slVS.oninput=()=>{VOLUME_STIFFNESS=+slVS.value;svVS.textContent=VOLUME_STIFFNESS.toFixed(2);};
+        slBI.oninput=()=>{BAND_INFLUENCE=+slBI.value;svBI.textContent=BAND_INFLUENCE.toFixed(2);for(const b of bands)b.influence=BAND_INFLUENCE;};
+        slHA.oninput=()=>{HARDENING=+slHA.value;svHA.textContent=HARDENING.toFixed(2);};
+        slPI.oninput=()=>{PBD_ITERATIONS=+slPI.value;svPI.textContent=PBD_ITERATIONS;};
+        slSI.oninput=()=>{SMOOTH_ITERS=+slSI.value;svSI.textContent=SMOOTH_ITERS;};
+        slSW.oninput=()=>{SMOOTH_WEIGHT=+slSW.value;svSW.textContent=SMOOTH_WEIGHT.toFixed(2);};
+        slOF.oninput=()=>{
+            SURFACE_OFFSET=+slOF.value;svOF.textContent=SURFACE_OFFSET.toFixed(2);
+            applyOffset(SURFACE_OFFSET);
+            initPBD();
+            vertMap=buildVertMap();
+        };
+
+        window.addEventListener('resize',()=>{camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);});
+
+        const clock=new THREE.Clock();let fpsFrames=0,fpsTime=0;
+        function animate(){
+            requestAnimationFrame(animate);
+            const dt=Math.min(clock.getDelta(),0.1);
+            controls.update();
+            if(bands.length>0)runPBD();
+            renderer.render(scene,camera);
+            fpsFrames++;fpsTime+=dt;
+            if(fpsTime>=1.0){H.fps.textContent=Math.round(fpsFrames/fpsTime);fpsFrames=0;fpsTime=0;}
+        }
+        console.log('📐 法向位移调试: proxy',proxyGeo.attributes.position.count,'verts | high',highGeo.attributes.position.count,'verts');
+        console.log('   代理 = 绿线框  高模 = 橙色面  青色点 = 法向位移(N键)');
+        console.log('   拖动"代理面偏移"模拟 Remesh 表面偏差');
+        console.log('   调整"平滑迭代/权重"观察标量场平滑效果');
+        animate();
+    </script>
+</body>
+</html>

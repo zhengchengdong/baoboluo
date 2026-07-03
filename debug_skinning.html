@@ -109,6 +109,36 @@
         const proxyGeo=buildEllipsoid(0.5,1.5,0.5,PROXY_R,PROXY_S);
         const highGeo=buildEllipsoid(0.5,1.5,0.5,HIGH_R,HIGH_S);
 
+        // ── Bumps: Gaussian protrusions on the surface ──
+        // { y: height on body, theta: angle around Y, h: height, w: width }
+        const BUMPS = [
+            { y: 0.8, theta: 0.5, h: 0.15, w: 0.25 },
+            { y: -0.3, theta: 2.8, h: 0.12, w: 0.20 },
+        ];
+        function applyBumps(geo) {
+            const p = geo.attributes.position;
+            for (let i = 0; i < p.count; i++) {
+                const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+                const r = Math.sqrt(x * x + z * z);
+                const theta = Math.atan2(z, x);
+                let dr = 0;
+                for (const b of BUMPS) {
+                    const dy = y - b.y;
+                    const dt = Math.atan2(Math.sin(theta - b.theta), Math.cos(theta - b.theta)); // angular diff
+                    const d2 = (dy * dy) / (b.w * b.w) + (dt * dt) / (b.w * b.w);
+                    dr += b.h * Math.exp(-d2);
+                }
+                if (r > 0.001 && dr > 0.001) {
+                    const s = (r + dr) / r;
+                    p.setXYZ(i, x * s, y, z * s);
+                }
+            }
+        }
+        applyBumps(proxyGeo);
+        applyBumps(highGeo);
+        proxyGeo.computeVertexNormals();
+        highGeo.computeVertexNormals();
+
         const proxyMat=new THREE.MeshBasicMaterial({color:'#0f0',wireframe:true,transparent:true,opacity:0.8});
         const proxyWire=new THREE.Mesh(proxyGeo,proxyMat); scene.add(proxyWire);
         const highMat=new THREE.MeshPhongMaterial({color:'#ffaa00',transparent:true,opacity:0.5,side:THREE.DoubleSide,depthWrite:false});
