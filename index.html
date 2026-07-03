@@ -218,29 +218,35 @@
         slSS.addEventListener('input', () => {
             SHAPE_STIFFNESS = parseFloat(slSS.value);
             svSS.textContent = SHAPE_STIFFNESS.toFixed(2);
+            markPbdDirty();
         });
         slBS.addEventListener('input', () => {
             BAND_STIFFNESS = parseFloat(slBS.value);
             svBS.textContent = BAND_STIFFNESS.toFixed(2);
             for (const b of bands) b.stiffness = BAND_STIFFNESS;
+            markPbdDirty();
         });
         slVS.addEventListener('input', () => {
             VOLUME_STIFFNESS = parseFloat(slVS.value);
             svVS.textContent = VOLUME_STIFFNESS.toFixed(2);
+            markPbdDirty();
         });
         slBI.addEventListener('input', () => {
             BAND_INFLUENCE = parseFloat(slBI.value);
             svBI.textContent = BAND_INFLUENCE.toFixed(2);
             for (const b of bands) b.influence = BAND_INFLUENCE;
+            markPbdDirty();
         });
         slHA.addEventListener('input', () => {
             HARDENING = parseFloat(slHA.value);
             svHA.textContent = HARDENING.toFixed(2);
+            markPbdDirty();
         });
         slPI.addEventListener('input', () => {
             PBD_ITERATIONS = parseInt(slPI.value);
             svPI.textContent = PBD_ITERATIONS;
             H.pbditer.textContent = PBD_ITERATIONS;
+            markPbdDirty();
         });
 
         // ──────────────────────────────────────
@@ -250,6 +256,16 @@
         let restVolume = 0;
         let restSurfaceArea = 0;
         let needsRestore = false;   // true when bands were removed and vertices may be displaced
+        let pbdConverged = false;   // true when PBD equilibrium reached, skip computation
+        let lastMaxDisp = -1;
+        let convergeFrames = 0;
+        const CONVERGE_THRESHOLD = 3; // consecutive stable frames to declare convergence
+
+        function markPbdDirty() {
+            pbdConverged = false;
+            convergeFrames = 0;
+            lastMaxDisp = -1;
+        }
 
         // Precomputed radius-by-height lookup for fast preview / band placement
         const RADIUS_BUCKETS = 64;
@@ -376,6 +392,7 @@
             bandVisuals.push(makeBandVisual(centerY, currentR));
 
             H.bcount.textContent = bands.length;
+            markPbdDirty(); // new band — need to re-solve
             console.log(`皮筋 #${bands.length}  y=${centerY.toFixed(3)}  r=${currentR.toFixed(3)}  target=${(currentR * BAND_INITIAL_TIGHTNESS).toFixed(3)}`);
         }
 
@@ -390,6 +407,7 @@
             }
             H.bcount.textContent = bands.length;
             needsRestore = true; // vertices were displaced by bands, need to restore
+            markPbdDirty();
         }
 
         // ──────────────────────────────────────
@@ -642,8 +660,23 @@
 
             if (!pineappleMesh) { renderer.render(scene, camera); return; } // model not loaded yet
 
-            if (bands.length > 0) {
+            if (bands.length > 0 && !pbdConverged) {
                 runPBD();
+
+                // Convergence check: if max displacement stabilized across frames
+                if (Math.abs(maxDisplacement - lastMaxDisp) < 1e-6) {
+                    convergeFrames++;
+                    if (convergeFrames >= CONVERGE_THRESHOLD) {
+                        pbdConverged = true;
+                        H.pbdtime.textContent = '收敛 ✓';
+                    }
+                } else {
+                    convergeFrames = 0;
+                }
+                lastMaxDisp = maxDisplacement;
+            } else if (bands.length > 0 && pbdConverged) {
+                // PBD converged — skip computation, just update visuals
+                H.pbdtime.textContent = '收敛 ✓';
             } else if (needsRestore) {
                 // Bands were removed — run shape constraint to restore rest shape
                 const posArr = pineappleGeo.attributes.position.array;
