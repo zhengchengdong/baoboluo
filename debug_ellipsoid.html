@@ -58,14 +58,16 @@
 
     <div id="panel">
         <h3>🔧 PBD 参数</h3>
+        <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
+        <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
         <label>皮筋刚度 <span class="val" id="sv_bs">0.50</span></label>
-        <input type="range" id="sl_bs" min="0.05" max="1.0" step="0.05" value="0.50">
+        <input type="range" id="sl_bs" min="0.01" max="1.0" step="0.01" value="0.50">
         <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
-        <input type="range" id="sl_vs" min="0.05" max="1.0" step="0.05" value="0.40">
+        <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
         <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
         <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
         <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
-        <input type="range" id="sl_pi" min="1" max="20" step="1" value="10">
+        <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
     </div>
 
     <script type="importmap">
@@ -130,22 +132,37 @@
         // ──────────────────────────────────────
         // PBD params (adjustable via sliders)
         // ──────────────────────────────────────
-        let BAND_STIFFNESS = 0.5;
-        let VOLUME_STIFFNESS = 0.4;
+        // 形状刚度: 对抗皮筋的"材料弹性"。顶点多想回原位。
+        //   高 → 硬菠萝，勒不进去
+        //   低 → 软菠萝，一勒就深
+        let SHAPE_STIFFNESS = 0.30;
+        // 皮筋刚度: 进攻方，皮筋多想把截面勒小
+        let BAND_STIFFNESS = 0.50;
+        // 体积刚度: 全局体积保持
+        let VOLUME_STIFFNESS = 0.40;
+        // 皮筋影响范围 (核函数宽度)
         let BAND_INFLUENCE = 0.6;
+        // 每帧迭代轮数
         let PBD_ITERATIONS = 10;
+        // 皮筋绑上去时的初始紧度 (目标半径 = 当前 × 此值)
         const BAND_INITIAL_TIGHTNESS = 0.80;
 
-        // Slider wiring
+        // ── Slider wiring ──
+        const slSS = document.getElementById('sl_ss');
         const slBS = document.getElementById('sl_bs');
         const slVS = document.getElementById('sl_vs');
         const slBI = document.getElementById('sl_bi');
         const slPI = document.getElementById('sl_pi');
+        const svSS = document.getElementById('sv_ss');
         const svBS = document.getElementById('sv_bs');
         const svVS = document.getElementById('sv_vs');
         const svBI = document.getElementById('sv_bi');
         const svPI = document.getElementById('sv_pi');
 
+        slSS.addEventListener('input', () => {
+            SHAPE_STIFFNESS = parseFloat(slSS.value);
+            svSS.textContent = SHAPE_STIFFNESS.toFixed(2);
+        });
         slBS.addEventListener('input', () => {
             BAND_STIFFNESS = parseFloat(slBS.value);
             svBS.textContent = BAND_STIFFNESS.toFixed(2);
@@ -474,8 +491,8 @@
             }
         }
 
+        // ── 体积约束: 总体积守恒，均匀推所有顶点 ──
         function pbdApplyVolume(posArr, idxArr) {
-            // Compute current volume
             let currentVolume = 0;
             const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
             for (let i = 0; i < idxArr.length; i += 3) {
@@ -492,29 +509,19 @@
             const deficit = restVolume - currentVolume;
             if (Math.abs(deficit) < 1e-9) return currentVolume;
 
+            // Uniform radial push — no freedom weighting
+            // Band area: 体积往外推 vs 皮筋往里推 → 刚度比决定深度
+            // Free area: 只有体积往外推 → 自然鼓出
             const basePush = VOLUME_STIFFNESS * deficit / restSurfaceArea;
-            const bandFreeRadius = BAND_INFLUENCE * 1.0;
             const count = ellipsoidGeo.attributes.position.count;
 
             for (let i = 0; i < count; i++) {
                 const i3 = i * 3;
-                const y = posArr[i3 + 1];
-
-                // Distance to nearest band
-                let minDist = bandFreeRadius + 999;
-                for (const band of bands) {
-                    const d = Math.abs(y - band.centerY);
-                    if (d < minDist) minDist = d;
-                }
-                const freedom = smoothstep(0, bandFreeRadius, minDist);
-
                 const x = posArr[i3];
                 const z = posArr[i3 + 2];
                 const r = Math.sqrt(x * x + z * z);
                 if (r < 1e-6) continue;
-
-                const push = basePush * freedom;
-                const scale = (r + push) / r;
+                const scale = (r + basePush) / r;
                 const safeScale = Math.max(0.7, Math.min(1.3, scale));
                 posArr[i3] *= safeScale;
                 posArr[i3 + 2] *= safeScale;
@@ -522,6 +529,19 @@
             return currentVolume;
         }
 
+        // ── 形状约束: 每个顶点想回到 rest 位置 ──
+        // 这是对抗皮筋的"材料弹性"。刚度越高，菠萝越硬。
+        function pbdApplyShape(posArr) {
+            const count = ellipsoidGeo.attributes.position.count;
+            for (let i = 0; i < count; i++) {
+                const i3 = i * 3;
+                posArr[i3]     += (restPositions[i3]     - posArr[i3])     * SHAPE_STIFFNESS;
+                posArr[i3 + 1] += (restPositions[i3 + 1] - posArr[i3 + 1]) * SHAPE_STIFFNESS;
+                posArr[i3 + 2] += (restPositions[i3 + 2] - posArr[i3 + 2]) * SHAPE_STIFFNESS;
+            }
+        }
+
+        // ── PBD 主循环 ──
         function runPBD() {
             const pos = ellipsoidGeo.attributes.position;
             const posArr = pos.array;
@@ -529,6 +549,12 @@
             let finalVolume = restVolume;
 
             for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
+                // 约束执行顺序:
+                //  1. 形状: 所有顶点拉回原位 (对抗皮筋的力)
+                //  2. 皮筋: 局部往 targetRadius 推 (进攻)
+                //  3. 体积: 全局补体积 (收拾残局)
+                //  形状 ↔ 皮筋 在皮筋区正面交锋 → 刚度比决定勒多深
+                pbdApplyShape(posArr);
                 for (const band of bands) {
                     pbdApplyBand(band, posArr);
                 }
@@ -663,6 +689,23 @@
 
             if (bands.length > 0) {
                 runPBD();
+            } else {
+                // No bands — just run shape constraint to restore rest shape
+                const posArr = ellipsoidGeo.attributes.position.array;
+                for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
+                    pbdApplyShape(posArr);
+                }
+                ellipsoidGeo.attributes.position.needsUpdate = true;
+                ellipsoidGeo.computeVertexNormals();
+                // Update sprites
+                const pos = ellipsoidGeo.attributes.position;
+                for (let i = 0; i < spriteGroup.children.length; i++) {
+                    const s = spriteGroup.children[i];
+                    const vi = s.userData.vertexIndex;
+                    if (vi !== undefined && vi < pos.count) {
+                        s.position.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi));
+                    }
+                }
             }
 
             renderer.render(scene, camera);
