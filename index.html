@@ -130,14 +130,18 @@
         // Load pineapple model
         // ──────────────────────────────────────
         const pineappleGeo = new THREE.BufferGeometry();
-        let pineappleMesh = null, wireframe = null;
+        let pineappleMesh = null;
 
         async function loadPineapple() {
             const loader = new GLTFLoader();
             const gltf = await new Promise((res, rej) => loader.load('pineapple.glb', res, undefined, rej));
-            let srcGeo = null;
-            gltf.scene.traverse(c => { if (c.isMesh && !srcGeo) srcGeo = c.geometry.clone(); });
-            if (!srcGeo) throw new Error('No mesh');
+
+            // Find first mesh with its original material
+            let srcMesh = null;
+            gltf.scene.traverse(c => { if (c.isMesh && !srcMesh) srcMesh = c; });
+            if (!srcMesh) throw new Error('No mesh in GLB');
+
+            const srcGeo = srcMesh.geometry;
             srcGeo.computeBoundingBox();
             const cen = new THREE.Vector3(); srcGeo.boundingBox.getCenter(cen);
             const siz = new THREE.Vector3(); srcGeo.boundingBox.getSize(siz);
@@ -149,8 +153,12 @@
             }
             pineappleGeo.setAttribute('position', new THREE.Float32BufferAttribute(np, 3));
             if (srcGeo.index) pineappleGeo.setIndex(Array.from(srcGeo.index.array));
+            if (srcGeo.attributes.normal) pineappleGeo.setAttribute('normal', srcGeo.attributes.normal.clone());
+            if (srcGeo.attributes.uv) pineappleGeo.setAttribute('uv', srcGeo.attributes.uv.clone());
             pineappleGeo.computeVertexNormals();
-            const mat = new THREE.MeshPhongMaterial({ color:'#ffaa00', transparent:true, opacity:0.6, side:THREE.DoubleSide, depthWrite:false });
+
+            // Use original material from the model (textures preserved)
+            const mat = srcMesh.material;
             pineappleMesh = new THREE.Mesh(pineappleGeo, mat); scene.add(pineappleMesh);
             initPBDRestState();
             console.log('✅ 菠萝:', pineappleGeo.attributes.position.count.toLocaleString(), '顶点');
