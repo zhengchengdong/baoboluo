@@ -53,19 +53,23 @@
         <div>当前体积: <span class="val" id="cvol">--</span></div>
         <div>rest体积: <span class="val" id="rvol">--</span></div>
         <div>PBD迭代: <span class="val" id="pbditer">--</span></div>
+        <div>最大位移: <span class="val" id="maxdisp">--</span></div>
+        <div>形状有效: <span class="val" id="seff">--</span> &nbsp; 皮筋有效: <span class="val" id="beff">--</span></div>
     </div>
     <div id="info">🖱️ 点击椭球表面绑皮筋 &nbsp; R 键割一根</div>
 
     <div id="panel">
         <h3>🔧 PBD 参数</h3>
-        <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
+        <label>形状基础刚度 <span class="val" id="sv_ss">0.30</span></label>
         <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
-        <label>皮筋刚度 <span class="val" id="sv_bs">0.50</span></label>
+        <label>皮筋基础刚度 <span class="val" id="sv_bs">0.50</span></label>
         <input type="range" id="sl_bs" min="0.01" max="1.0" step="0.01" value="0.50">
         <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
         <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
         <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
         <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
+        <label>硬化系数 <span class="val" id="sv_ha">0.00</span></label>
+        <input type="range" id="sl_ha" min="0" max="3" step="0.05" value="0">
         <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
         <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
     </div>
@@ -92,6 +96,9 @@
             vcount: $('vcount'), tcount: $('tcount'),
             bcount: $('bcount'), vratio: $('vratio'),
             cvol: $('cvol'), rvol: $('rvol'), pbditer: $('pbditer'),
+            maxdisp: $('maxdisp'),
+            seff: $('seff'),
+            beff: $('beff'),
         };
 
         // ──────────────────────────────────────
@@ -124,19 +131,17 @@
         const ELLI_RX = 0.5;   // X radius
         const ELLI_RY = 1.5;   // Y radius (taller → pineapple shape)
         const ELLI_RZ = 0.5;   // Z radius
-        const RINGS = 5;       // latitude rings (not counting poles)
-        const SEGS = 8;        // longitude segments per ring
+        const RINGS = 60;      // latitude rings (not counting poles)
+        const SEGS = 66;       // longitude segments per ring
         // Total vertices = 1 (top pole) + RINGS * SEGS + 1 (bottom pole)
         const TOTAL_V = 1 + RINGS * SEGS + 1;
 
         // ──────────────────────────────────────
         // PBD params (adjustable via sliders)
         // ──────────────────────────────────────
-        // 形状刚度: 对抗皮筋的"材料弹性"。顶点多想回原位。
-        //   高 → 硬菠萝，勒不进去
-        //   低 → 软菠萝，一勒就深
+        // 形状基础刚度: 菠萝皮的材料属性
         let SHAPE_STIFFNESS = 0.30;
-        // 皮筋刚度: 进攻方，皮筋多想把截面勒小
+        // 皮筋基础刚度: 皮筋的材料属性
         let BAND_STIFFNESS = 0.50;
         // 体积刚度: 全局体积保持
         let VOLUME_STIFFNESS = 0.40;
@@ -146,17 +151,22 @@
         let PBD_ITERATIONS = 10;
         // 皮筋绑上去时的初始紧度 (目标半径 = 当前 × 此值)
         const BAND_INITIAL_TIGHTNESS = 0.80;
+        // 硬化系数: 位移越大，形状约束刚度越大 (0=线性, 越大越非线性)
+        let HARDENING = 0;
+        let maxDisplacement = 0;
 
         // ── Slider wiring ──
         const slSS = document.getElementById('sl_ss');
         const slBS = document.getElementById('sl_bs');
         const slVS = document.getElementById('sl_vs');
         const slBI = document.getElementById('sl_bi');
+        const slHA = document.getElementById('sl_ha');
         const slPI = document.getElementById('sl_pi');
         const svSS = document.getElementById('sv_ss');
         const svBS = document.getElementById('sv_bs');
         const svVS = document.getElementById('sv_vs');
         const svBI = document.getElementById('sv_bi');
+        const svHA = document.getElementById('sv_ha');
         const svPI = document.getElementById('sv_pi');
 
         slSS.addEventListener('input', () => {
@@ -176,6 +186,10 @@
             BAND_INFLUENCE = parseFloat(slBI.value);
             svBI.textContent = BAND_INFLUENCE.toFixed(2);
             for (const b of bands) b.influence = BAND_INFLUENCE;
+        });
+        slHA.addEventListener('input', () => {
+            HARDENING = parseFloat(slHA.value);
+            svHA.textContent = HARDENING.toFixed(2);
         });
         slPI.addEventListener('input', () => {
             PBD_ITERATIONS = parseInt(slPI.value);
@@ -293,55 +307,6 @@
         });
         const wireframe = new THREE.Mesh(ellipsoidGeo, wireframeMat);
         scene.add(wireframe);
-
-        // ──────────────────────────────────────
-        // Vertex number sprites
-        // ──────────────────────────────────────
-        const spriteGroup = new THREE.Group();
-        scene.add(spriteGroup);
-
-        function makeNumberSprite(n) {
-            const canvas = document.createElement('canvas');
-            canvas.width = 64;
-            canvas.height = 32;
-            const ctx = canvas.getContext('2d');
-            ctx.fillStyle = '#00ff88';
-            ctx.font = 'bold 18px monospace';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(String(n), 32, 16);
-
-            const tex = new THREE.CanvasTexture(canvas);
-            tex.minFilter = THREE.LinearFilter;
-            const mat = new THREE.SpriteMaterial({
-                map: tex,
-                depthTest: false,
-                depthWrite: false,
-                transparent: true,
-            });
-            const sprite = new THREE.Sprite(mat);
-            sprite.scale.set(0.25, 0.125, 1);
-            return sprite;
-        }
-
-        function rebuildSprites() {
-            // Clear old sprites
-            while (spriteGroup.children.length > 0) {
-                const s = spriteGroup.children[0];
-                s.material.map?.dispose();
-                s.material.dispose();
-                spriteGroup.remove(s);
-            }
-
-            const pos = ellipsoidGeo.attributes.position;
-            for (let i = 0; i < pos.count; i++) {
-                const sprite = makeNumberSprite(i);
-                sprite.position.set(pos.getX(i), pos.getY(i), pos.getZ(i));
-                sprite.userData.vertexIndex = i;
-                spriteGroup.add(sprite);
-            }
-        }
-        rebuildSprites();
 
         // ──────────────────────────────────────
         // PBD State
@@ -480,7 +445,16 @@
                 const effectiveTarget = tightR + (r - tightR) * st;
 
                 if (r > effectiveTarget) {
-                    const displacement = stiffness * (r - effectiveTarget);
+                    // 硬化作用在皮筋侧: 位移越大，皮筋有效刚度越低
+                    // 等效于形状/皮筋刚度比值变大 → 越来越勒不动
+                    const rx = restPositions[i3], ry = restPositions[i3 + 1], rz = restPositions[i3 + 2];
+                    const dxr = rx - x, dyr = ry - y, dzr = rz - z;
+                    const disp = Math.sqrt(dxr * dxr + dyr * dyr + dzr * dzr);
+                    const hardenedStiff = HARDENING > 0
+                        ? stiffness / Math.exp(HARDENING * disp * 50)
+                        : stiffness;
+
+                    const displacement = hardenedStiff * (r - effectiveTarget);
                     const scale = Math.max(0.01, (r - displacement) / r);
                     posArr[i3] *= scale;
                     posArr[i3 + 2] *= scale;
@@ -527,15 +501,28 @@
         }
 
         // ── 形状约束: 每个顶点想回到 rest 位置 ──
-        // 这是对抗皮筋的"材料弹性"。刚度越高，菠萝越硬。
+        // 非线性弹性: 位移越大，有效刚度越高 (硬化)
+        // effectiveStiffness = base × (1 + hardening × displacement²)
+        // 钳位到 0.99 保证 PBD 收敛
         function pbdApplyShape(posArr) {
             const count = ellipsoidGeo.attributes.position.count;
+            let maxDisp = 0;
             for (let i = 0; i < count; i++) {
                 const i3 = i * 3;
-                posArr[i3]     += (restPositions[i3]     - posArr[i3])     * SHAPE_STIFFNESS;
-                posArr[i3 + 1] += (restPositions[i3 + 1] - posArr[i3 + 1]) * SHAPE_STIFFNESS;
-                posArr[i3 + 2] += (restPositions[i3 + 2] - posArr[i3 + 2]) * SHAPE_STIFFNESS;
+                const dx = restPositions[i3]     - posArr[i3];
+                const dy = restPositions[i3 + 1] - posArr[i3 + 1];
+                const dz = restPositions[i3 + 2] - posArr[i3 + 2];
+                const disp = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (disp > maxDisp) maxDisp = disp;
+
+                // 形状约束: 线性拉回原位 (硬化已移至皮筋侧)
+                const effStiff = SHAPE_STIFFNESS;
+
+                posArr[i3]     += dx * effStiff;
+                posArr[i3 + 1] += dy * effStiff;
+                posArr[i3 + 2] += dz * effStiff;
             }
+            maxDisplacement = maxDisp;
         }
 
         // ── PBD 主循环 ──
@@ -547,10 +534,9 @@
 
             for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
                 // 约束执行顺序:
-                //  1. 形状: 所有顶点拉回原位 (对抗皮筋的力)
-                //  2. 皮筋: 局部往 targetRadius 推 (进攻)
-                //  3. 体积: 全局补体积 (收拾残局)
-                //  形状 ↔ 皮筋 在皮筋区正面交锋 → 刚度比决定勒多深
+                // ① 形状: 全部顶点拉回原位 (菠萝皮的弹性)
+                // ② 每条皮筋: 局部往 targetRadius 推
+                // ③ 体积: 全局补体积
                 pbdApplyShape(posArr);
                 for (const band of bands) {
                     pbdApplyBand(band, posArr);
@@ -563,15 +549,17 @@
 
             H.cvol.textContent = finalVolume.toFixed(4);
             H.vratio.textContent = (finalVolume / restVolume * 100).toFixed(1);
+            H.maxdisp.textContent = maxDisplacement.toFixed(3);
 
-            // Update sprites & band visuals
-            for (let i = 0; i < spriteGroup.children.length; i++) {
-                const s = spriteGroup.children[i];
-                const vi = s.userData.vertexIndex;
-                if (vi !== undefined && vi < pos.count) {
-                    s.position.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi));
-                }
-            }
+            // Show effective values at max displacement
+            H.seff.textContent = SHAPE_STIFFNESS.toFixed(3);
+            const hardenedBandStiff = HARDENING > 0
+                ? BAND_STIFFNESS / Math.exp(HARDENING * maxDisplacement * 50)
+                : BAND_STIFFNESS;
+            H.beff.textContent = hardenedBandStiff.toFixed(3);
+
+
+            // Update band visuals
             for (let b = 0; b < bands.length; b++) {
                 const vis = bandVisuals[b];
                 if (!vis || !vis.visible) continue;
@@ -694,15 +682,6 @@
                 }
                 ellipsoidGeo.attributes.position.needsUpdate = true;
                 ellipsoidGeo.computeVertexNormals();
-                // Update sprites
-                const pos = ellipsoidGeo.attributes.position;
-                for (let i = 0; i < spriteGroup.children.length; i++) {
-                    const s = spriteGroup.children[i];
-                    const vi = s.userData.vertexIndex;
-                    if (vi !== undefined && vi < pos.count) {
-                        s.position.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi));
-                    }
-                }
             }
 
             renderer.render(scene, camera);
@@ -719,9 +698,7 @@
         }
 
         console.log('🔧 PBD 椭球调试环境就绪');
-        console.log(`   顶点: ${TOTAL_V}  (编号 0~${TOTAL_V - 1})`);
-        console.log('   顶点 0 = 顶部极点, 顶点', TOTAL_V - 1, '= 底部极点');
-        console.log('   环 0-4 各', SEGS, '个顶点 (编号 1~40)');
+        console.log(`   顶点: ${TOTAL_V},  三角形: ${TOTAL_V > 0 ? '(见HUD)' : ''}`);
         console.log('   🖱️ 点击椭球表面 = 绑皮筋,  R = 割皮筋');
 
         animate();
