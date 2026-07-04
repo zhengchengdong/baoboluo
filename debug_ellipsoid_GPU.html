@@ -230,15 +230,21 @@
             }
         }
         const restTex = new THREE.DataTexture(restTexData, TEX_SIZE, TEX_SIZE,
-            THREE.RGBAFormat, THREE.FloatType, undefined,
-            THREE.NearestFilter, THREE.NearestFilter);
+            THREE.RGBAFormat, THREE.FloatType);
+        restTex.wrapS = THREE.ClampToEdgeWrapping;
+        restTex.wrapT = THREE.ClampToEdgeWrapping;
+        restTex.minFilter = THREE.NearestFilter;
+        restTex.magFilter = THREE.NearestFilter;
         restTex.needsUpdate = true;
 
         // Initialize rtA (current positions = rest positions)
         const initTexData = new Float32Array(restTexData);
         const initTex = new THREE.DataTexture(initTexData, TEX_SIZE, TEX_SIZE,
-            THREE.RGBAFormat, THREE.FloatType, undefined,
-            THREE.NearestFilter, THREE.NearestFilter);
+            THREE.RGBAFormat, THREE.FloatType);
+        initTex.wrapS = THREE.ClampToEdgeWrapping;
+        initTex.wrapT = THREE.ClampToEdgeWrapping;
+        initTex.minFilter = THREE.NearestFilter;
+        initTex.magFilter = THREE.NearestFilter;
         initTex.needsUpdate = true;
 
         // ═══════════════════════════════════════
@@ -431,10 +437,135 @@
         }
 
         // ═══════════════════════════════════════
+        // GPU Volume Computation — Points + additive blending
+        //   One point per triangle; fragment shader computes that
+        //   triangle's signed volume; hardware blend (ONE+ONE) sums
+        //   all 7920 contributions into a single 1×1 pixel.
+        // ═══════════════════════════════════════
+        const TRI_COUNT = idxArr.length / 3;
+        const IDX_TEX_W = 128, IDX_TEX_H = 64; // 128*64=8192 ≥ 7920
+
+        // Triangle index texture (one-time upload)
+        const idxTexData = new Float32Array(IDX_TEX_W * IDX_TEX_H * 4);
+        for (let t = 0; t < TRI_COUNT; t++) {
+            const i4 = t * 4;
+            idxTexData[i4]     = idxArr[t * 3];
+            idxTexData[i4 + 1] = idxArr[t * 3 + 1];
+            idxTexData[i4 + 2] = idxArr[t * 3 + 2];
+        }
+        const idxTex = new THREE.DataTexture(idxTexData, IDX_TEX_W, IDX_TEX_H,
+            THREE.RGBAFormat, THREE.FloatType);
+        idxTex.wrapS = THREE.ClampToEdgeWrapping;
+        idxTex.wrapT = THREE.ClampToEdgeWrapping;
+        idxTex.minFilter = THREE.NearestFilter;
+        idxTex.magFilter = THREE.NearestFilter;
+        idxTex.needsUpdate = true;
+
+        // 1×1 render target — hardware blending accumulates all triangle volumes
+        const volRT = new THREE.WebGLRenderTarget(1, 1, {
+            format: THREE.RGBAFormat,
+            type: THREE.FloatType,
+            depthBuffer: false,
+            stencilBuffer: false,
+        });
+
+        // Point geometry: one point per triangle
+        const triIdxAttr = new Float32Array(TRI_COUNT);
+        for (let t = 0; t < TRI_COUNT; t++) triIdxAttr[t] = t;
+        const pointGeo = new THREE.BufferGeometry();
+        pointGeo.setAttribute('position',
+            new THREE.Float32BufferAttribute(new Float32Array(TRI_COUNT * 3), 3));
+        pointGeo.setAttribute('triIndex',
+            new THREE.Float32BufferAttribute(triIdxAttr, 1));
+
+        const volCompUniforms = {
+            u_posTex: { value: null },
+            u_indexTex: { value: idxTex },
+            u_posTexSize: { value: 64.0 },
+            u_idxTexW: { value: 128.0 },
+            u_idxTexH: { value: 64.0 },
+        };
+        const volCompMaterial = new THREE.ShaderMaterial({
+            uniforms: volCompUniforms,
+            vertexShader: /*glsl*/`
+                attribute float triIndex;
+                varying float v_triIdx;
+                void main() {
+                    v_triIdx = triIndex;
+                    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+                    gl_PointSize = 1.0;
+                }
+            `,
+            fragmentShader: /*glsl*/`
+                precision highp float;
+                uniform sampler2D u_posTex;
+                uniform sampler2D u_indexTex;
+                uniform float u_posTexSize;
+                uniform float u_idxTexW;
+                uniform float u_idxTexH;
+                varying float v_triIdx;
+
+                vec2 vertUV(float idx) {
+                    float c = mod(idx, u_posTexSize);
+                    float r = floor(idx / u_posTexSize);
+                    return vec2((c + 0.5) / u_posTexSize, (r + 0.5) / u_posTexSize);
+                }
+
+                void main() {
+                    float t = v_triIdx;
+                    float col = mod(t, u_idxTexW);
+                    float row = floor(t / u_idxTexW);
+                    vec2 idxUV = vec2((col + 0.5) / u_idxTexW,
+                                       (row + 0.5) / u_idxTexH);
+                    vec4 id = texture2D(u_indexTex, idxUV);
+
+                    vec3 p0 = texture2D(u_posTex, vertUV(id.r)).xyz;
+                    vec3 p1 = texture2D(u_posTex, vertUV(id.g)).xyz;
+                    vec3 p2 = texture2D(u_posTex, vertUV(id.b)).xyz;
+
+                    float vol = (p0.x*(p1.y*p2.z - p1.z*p2.y)
+                               + p0.y*(p1.z*p2.x - p1.x*p2.z)
+                               + p0.z*(p1.x*p2.y - p1.y*p2.x)) / 6.0;
+
+                    gl_FragColor = vec4(vol, 0.0, 0.0, 0.0);
+                }
+            `,
+            blending: THREE.CustomBlending,
+            blendEquation: THREE.AddEquation,
+            blendSrc: THREE.OneFactor,
+            blendDst: THREE.OneFactor,
+            depthTest: false,
+            depthWrite: false,
+        });
+
+        const volPointMesh = new THREE.Points(pointGeo, volCompMaterial);
+        const volCompScene = new THREE.Scene();
+        volCompScene.add(volPointMesh);
+        const volCompCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+        const volReadback = new Float32Array(4);
+
+        function gpuComputeVolume() {
+            volCompUniforms.u_posTex.value = readTarget.texture;
+
+            const oldRT = renderer.getRenderTarget();
+            renderer.setRenderTarget(volRT);
+            renderer.setClearColor(0x000000, 0);
+            renderer.clear(true, true, true);
+            renderer.render(volCompScene, volCompCamera);
+            renderer.setRenderTarget(oldRT);
+
+            // Read the single accumulated pixel (16 bytes)
+            renderer.readRenderTargetPixels(volRT, 0, 0, 1, 1, volReadback);
+            return Math.abs(volReadback[0]);
+        }
+
+        // ═══════════════════════════════════════
         // PBD State (CPU side — minimal)
         // ═══════════════════════════════════════
         let restVolume = 0;
         let restSurfaceArea = 0;
+        let lastGpuVolume = 0;   // cached from GPU, used for HUD
 
         function calcRestVolumeAndArea() {
             const p = ellipsoidGeo.attributes.position.array;
@@ -458,6 +589,7 @@
             console.log('Rest volume:', restVolume.toFixed(4), 'area:', restSurfaceArea.toFixed(2));
         }
         calcRestVolumeAndArea();
+        lastGpuVolume = restVolume;
 
         // Compute current volume from GPU-readback positions
         function calcVolumeFromReadback() {
@@ -645,7 +777,6 @@
             uniforms: renderUniforms,
             vertexShader: /*glsl*/`
                 attribute float vertexIndex;
-                attribute vec3 normal;
                 uniform sampler2D u_posTex;
                 uniform float u_texSize;
                 varying vec3 v_worldPos;
@@ -824,10 +955,8 @@
                     dispatchCompute(bandAllMaterial, bandAllUniforms);
                 }
 
-                // Read back current positions to get ACCURATE volume deficit
-                // after shape+band have modified positions this iteration
-                readPositionsFromGPU();
-                const currentVolume = calcVolumeFromReadback();
+                // Compute volume deficit on GPU (point blend → 1×1 pixel readback)
+                const currentVolume = gpuComputeVolume();
                 const deficit = restVolume - currentVolume;
                 volumeUniforms.u_basePush.value = Math.abs(deficit) > 1e-9
                     ? VOLUME_STIFFNESS * deficit / restSurfaceArea
@@ -835,6 +964,7 @@
 
                 // ③ Volume constraint (with fresh deficit)
                 dispatchCompute(volumeMaterial, volumeUniforms);
+                lastGpuVolume = currentVolume; // cache latest for HUD
             }
 
             // Update rendering uniforms to point to final position texture
@@ -850,6 +980,7 @@
             }
             renderUniforms.u_posTex.value = readTarget.texture;
             wireUniforms.u_posTex.value = readTarget.texture;
+            lastGpuVolume = restVolume;
         }
 
         // ═══════════════════════════════════════
@@ -875,13 +1006,12 @@
             }
             const pbdMs = performance.now() - pbdT0;
 
-            // Sync CPU mesh for raycasting + HUD display (once per frame)
+            // Sync CPU mesh for raycasting (once per frame)
             readPositionsFromGPU();
             syncCPUFromGPU();
 
-            // Update HUD
-            const curVol = calcVolumeFromReadback();
-            H.vratio.textContent = (curVol / restVolume * 100).toFixed(1);
+            // Update HUD — volume from GPU, displacement from readback
+            H.vratio.textContent = (lastGpuVolume / restVolume * 100).toFixed(1);
             const maxD = calcMaxDispFromReadback();
             H.maxdisp.textContent = maxD.toFixed(3);
             H.seff.textContent = SHAPE_STIFFNESS.toFixed(3);
