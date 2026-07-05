@@ -30,21 +30,21 @@ canvas { display:block; cursor:crosshair; }
  <div>体积: <span class="val" id="vratio">100</span>%</div>
  <div>迭代: <span class="val" id="pbditer">--</span></div>
 </div>
-<div id="info">Click: band | R: cut | Drag: rotate | Wheel: zoom | WebGPU</div>
+<div id="info">🖱️ 点击椭球表面绑皮筋 &nbsp; R 键割一根 &nbsp; 拖拽旋转 &nbsp; 滚轮缩放 &nbsp; <span style="color:#cc44ff">⚡ WebGPU</span></div>
 
 <div id="panel">
- <h3>PBD <span class="badge">WebGPU</span></h3>
- <label>Shape stiffness <span class="val" id="sv_ss">0.30</span></label>
+ <h3>🔧 GPU PBD 参数 <span class="badge">GPU</span></h3>
+ <label>形状基础刚度 <span class="val" id="sv_ss">0.30</span></label>
  <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
- <label>Band stiffness <span class="val" id="sv_bs">0.50</span></label>
+ <label>皮筋基础刚度 <span class="val" id="sv_bs">0.50</span></label>
  <input type="range" id="sl_bs" min="0.01" max="1.0" step="0.01" value="0.50">
- <label>Volume stiffness <span class="val" id="sv_vs">0.40</span></label>
+ <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
  <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
- <label>Influence <span class="val" id="sv_bi">0.60</span></label>
+ <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
  <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
- <label>Hardening <span class="val" id="sv_ha">0.00</span></label>
+ <label>硬化系数 <span class="val" id="sv_ha">0.00</span></label>
  <input type="range" id="sl_ha" min="0" max="3" step="0.05" value="0">
- <label>Iterations <span class="val" id="sv_pi">10</span></label>
+ <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
  <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
 </div>
 <canvas id="canvas"></canvas>
@@ -111,7 +111,7 @@ const volB=mkBuf(TRI_COUNT*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUB
 const VOL_PART_COUNT=Math.ceil(TRI_COUNT/256);
 const volPartB=mkBuf(VOL_PART_COUNT*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volPart');
 const volTotalB=mkBuf(4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volTotal');
-const staging=mkBuf(Math.max(VERT_BYTE,TRI_COUNT*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+const staging=mkBuf(4+Math.max(VERT_BYTE,TRI_COUNT*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
 
 // Upload initial data
 {const d=new Float32Array(vertexCount*4);for(let i=0;i<vertexCount;i++){d[i*4]=geo.positions[i*3];d[i*4+1]=geo.positions[i*3+1];d[i*4+2]=geo.positions[i*3+2];d[i*4+3]=1;}queue.writeBuffer(posA,0,d);queue.writeBuffer(posB,0,d);queue.writeBuffer(restB,0,d);}
@@ -423,17 +423,14 @@ async function runPBD(){
     // ONE submit: shape → band → volAcc → volReduce L1 → L2 → volAp
     const cmd=device.createCommandEncoder();
     const cp=cmd.beginComputePass();
-    // shape: src→dst, then band: dst→src (result in src)
     cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,isA?shapeBG.AB:shapeBG.BA);cp.dispatchWorkgroups(WG,1,1);
     if(bands.length>0){cp.setPipeline(bandPipe.pipe);cp.setBindGroup(0,isA?bandBG.BA:bandBG.AB);cp.dispatchWorkgroups(WG,1,1);}
-    // volume reads from srcPos (band result)
     cp.setPipeline(volAccPipe.pipe);cp.setBindGroup(0,isA?volAccBG_A:volAccBG_B);cp.dispatchWorkgroups(VWG,1,1);
     cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,volRedBG1);cp.dispatchWorkgroups(VOL_PART_COUNT,1,1);
     cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,volRedBG2);cp.dispatchWorkgroups(1,1,1);
-    // volAp: src→dst, result in dstPos
     cp.setPipeline(volApPipe.pipe);cp.setBindGroup(0,isA?volApBG.AB:volApBG.BA);cp.dispatchWorkgroups(WG,1,1);
     cp.end();device.queue.submit([cmd.finish()]);
-    swap(); // result now in srcPos for next iteration
+    swap(); // result now in srcPos
   }
 }
 
@@ -457,14 +454,11 @@ window.onmouseup=e=>{if(!dragging)return;dragging=false;const dx=e.clientX-mdx,d
   const rect=canvas.getBoundingClientRect();
   const ndcX=((mdx-rect.left)/rect.width)*2-1;
   const ndcY=-((mdy-rect.top)/rect.height)*2+1;
-  // Camera eye position
   const ex=camDist*Math.sin(camYaw)*Math.cos(camPitch);
   const ey=camDist*Math.sin(camPitch);
   const ez=camDist*Math.cos(camYaw)*Math.cos(camPitch);
-  // Ray direction (from eye through NDC point). Use inverse projection simplified.
   const f=1/Math.tan(Math.PI/8);
-  const dirX=ndcX/f, dirY=ndcY/f, dirZ=-1; // in view space
-  // Rotate dir from view space to world space (inverse of view rotation)
+  const dirX=ndcX/f, dirY=ndcY/f, dirZ=-1;
   const fx=0-ex, fy=0-ey, fz=0-ez; const fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
   const fdx=fx/fl, fdy=fy/fl, fdz=fz/fl;
   const rtx=1*fdz, rty=0, rtz=-1*fdx; const rl=Math.sqrt(rtx*rtx+rtz*rtz);
@@ -475,7 +469,6 @@ window.onmouseup=e=>{if(!dragging)return;dragging=false;const dx=e.clientX-mdx,d
   const wz=dirX*rnz+dirY*uz+dirZ*(-fdz);
   const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
   const Dx=wx/wl, Dy=wy/wl, Dz=wz/wl;
-  // Ray-ellipsoid intersection: (Ex+t*Dx)²/a² + (Ey+t*Dy)²/b² + (Ez+t*Dz)²/c² = 1
   const a=ELLI_RX, b=ELLI_RY, c=ELLI_RZ;
   const A=(Dx/a)**2+(Dy/b)**2+(Dz/c)**2;
   const B=2*(ex*Dx/(a*a)+ey*Dy/(b*b)+ez*Dz/(c*c));
@@ -518,22 +511,19 @@ window.onresize=()=>{canvas.width=window.innerWidth;canvas.height=window.innerHe
 async function updateBandVisuals(){
   if(bands.length===0)return;
   const bc=bands.length;
-  // Write band data
   const bd2=new Float32Array(MAX_BANDS*4);
   for(let b=0;b<bc;b++){bd2[b*4]=bands[b].cy;bd2[b*4+1]=bands[b].targetRadius;bd2[b*4+2]=bands[b].stiff;bd2[b*4+3]=bands[b].inf;}
   queue.writeBuffer(bandB,0,bd2);
   const u=new Uint32Array(2);u[0]=vertexCount;u[1]=bc;
   queue.writeBuffer(bandRadUB,0,u);
-  // Dispatch GPU scan: writes avg radius directly into bandInstBuf[].scale
   const enc=device.createCommandEncoder();
   const cp=enc.beginComputePass();
   cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,srcPos===posA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bc,1,1);
   cp.end();
   enc.copyBufferToBuffer(volTotalB,0,staging,0,4);
   device.queue.submit([enc.finish()]);
-  // Only read back volume for HUD (radii stay on GPU in bandInstBuf)
   await staging.mapAsync(GPUMapMode.READ);
-  lastVol=Math.abs(new Float32Array(staging.getMappedRange().slice(0,4))[0]);
+  lastVol=Math.abs(new Float32Array(staging.getMappedRange(0,4))[0]);
   staging.unmap();
 }
 const clock={last:performance.now()};
@@ -572,7 +562,7 @@ async function animate(){
   requestAnimationFrame(animate);
 }
 
-console.log('WebGPU PBD ready. Verts:',vertexCount,'Tris:',TRI_COUNT);
+console.log('WebGPU PBD ready. Verts:',vertexCount,'Tris:',TRI_COUNT,'restVol:',restVolume.toFixed(4));
 animate();
 </script>
 </body>
