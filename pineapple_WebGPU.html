@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PBD 菠萝 — WebGPU 版</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#111; overflow:hidden; font-family:monospace; }
+canvas { display:block; cursor:crosshair; }
+#hud { position:fixed; top:12px; left:12px; z-index:10; color:#ccc; font-size:13px; line-height:1.7; pointer-events:none; }
+#hud .val { color:#0f0; }
+#info { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); color:#888; font-size:12px; z-index:10; pointer-events:none; }
+#panel { position:fixed; top:12px; right:12px; z-index:20; background:rgba(0,0,0,0.8); border:1px solid #444; border-radius:8px; padding:14px 18px; color:#ccc; font-size:13px; min-width:220px; pointer-events:all; user-select:none; }
+#panel label { display:block; margin:8px 0 2px; color:#aaa; }
+#panel input[type=range] { width:100%; accent-color:#cc44ff; }
+#panel .val { color:#cc44ff; float:right; }
+#panel h3 { margin:0 0 6px; color:#fff; font-size:14px; }
+#panel .badge { display:inline-block; background:#cc44ff; color:#000; font-size:10px; padding:1px 6px; border-radius:3px; margin-left:4px; font-weight:bold; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+ <div>FPS: <span class="val" id="fps">--</span></div>
+ <div>帧耗时: <span class="val" id="framems">--</span> ms</div>
+ <div>顶点: <span class="val" id="vcount">--</span></div>
+ <div>三角形: <span class="val" id="tcount">--</span></div>
+ <div>皮筋: <span class="val" id="bcount">0</span></div>
+ <div>体积: <span class="val" id="vratio">100</span>%</div>
+ <div>PBD迭代: <span class="val" id="pbditer">10</span></div>
+ <div>PBD耗时: <span class="val" id="pbdtime">--</span> ms</div>
+</div>
+<div id="info">🖱️ 点击菠萝表面绑皮筋 &nbsp; R 键割一根 &nbsp; 拖拽旋转/滚轮缩放 &nbsp; <span style="color:#cc44ff">⚡ 纯GPU</span></div>
+
+<div id="panel">
+ <h3>🔧 GPU PBD 参数 <span class="badge">GPU</span></h3>
+ <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
+ <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
+ <label>皮筋刚度 <span class="val" id="sv_bs">0.50</span></label>
+ <input type="range" id="sl_bs" min="0.001" max="1.0" step="0.001" value="0.50">
+ <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
+ <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
+ <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
+ <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
+ <label>皮筋目标半径 <span class="val" id="sv_tr">0.40</span></label>
+ <input type="range" id="sl_tr" min="0.05" max="0.80" step="0.01" value="0.40">
+ <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
+ <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
+ <label>收敛帧数 <span class="val" id="sv_cf">5</span></label>
+<input type="range" id="sl_cf" min="1" max="20" step="1" value="5">
+</div>
+<canvas id="canvas"></canvas>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ═══════ DOM ═══════
+const $=id=>document.getElementById(id);
+const H={fps:$('fps'),framems:$('framems'),vcount:$('vcount'),tcount:$('tcount'),bcount:$('bcount'),vratio:$('vratio'),pbditer:$('pbditer'),pbdtime:$('pbdtime')};
+const canvas=$('canvas');
+
+// ═══════ WebGPU init ═══════
+if(!navigator.gpu){alert('需要WebGPU！Chrome 113+');throw new Error('No WebGPU');}
+let adapter=null;for(let i=0;i<3&&!adapter;i++){adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!adapter&&i<2)await new Promise(r=>setTimeout(r,500));}
+if(!adapter){alert('无法获取GPU适配器');throw new Error('No adapter');}
+const device=await adapter.requestDevice();
+device.addEventListener('uncapturederror',ev=>console.error('GPU error:',ev.error));
+const queue=device.queue;
+
+const context=canvas.getContext('webgpu');
+canvas.width=window.innerWidth;canvas.height=window.innerHeight;
+canvas.style.width=canvas.width+'px';canvas.style.height=canvas.height+'px';
+const canvasFormat=navigator.gpu.getPreferredCanvasFormat();
+context.configure({device,format:canvasFormat,alphaMode:'premultiplied'});
+
+// ═══════ State ═══════
+let vertexCount=0,triCount=0,restVolume=0,restSurfaceArea=0;
+let bboxRx=0.8,bboxRy=1.5,bboxRz=0.8,modelMinY=-1.5,modelMaxY=1.5; // updated after model loads
+let posA,posB,restB,idxB,uvB,normB,bandB,volB,volTotalB,staging;
+let volRedLevels=[];
+let srcPos,dstPos;
+let WG,VWG;
+function swap(){[srcPos,dstPos]=[dstPos,srcPos];}
+
+// PBD params
+let SHAPE_STIFF=0.30,BAND_STIFF=0.50,VOL_STIFF=0.40,BAND_INF=0.60,BAND_TARGET=0.40,PBD_ITER=10;
+let lastVol=0,pbdConverged=false,convergeFrames=0,needsRestore=false;
+let pbdAccumTime=0;
+let CONVERGE_FRAMES=5; // run PBD this many frames, then force converge
+function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
+
+// Slider wiring
+$('sl_ss').oninput=e=>{SHAPE_STIFF=+e.target.value;$('sv_ss').textContent=SHAPE_STIFF.toFixed(2);markPbdDirty();};
+$('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(3);for(const b of bands)b.stiff=BAND_STIFF;markPbdDirty();};
+$('sl_vs').oninput=e=>{VOL_STIFF=+e.target.value;$('sv_vs').textContent=VOL_STIFF.toFixed(2);markPbdDirty();};
+$('sl_bi').oninput=e=>{BAND_INF=+e.target.value;$('sv_bi').textContent=BAND_INF.toFixed(2);for(const b of bands)b.inf=BAND_INF;markPbdDirty();};
+$('sl_tr').oninput=e=>{BAND_TARGET=+e.target.value;$('sv_tr').textContent=BAND_TARGET.toFixed(2);for(const b of bands)b.targetRadius=BAND_TARGET;markPbdDirty();};
+$('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
+$('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
+
+// ═══════ Bands ═══════
+const MAX_BANDS=256;
+const bands=[];
+const RADIUS_BUCKETS=64;
+let radiusProfile=null;
+
+function buildRadiusProfile(positions){
+  let minY=Infinity,maxY=-Infinity;const count=vertexCount;
+  for(let i=0;i<count;i++){const y=positions[i*3+1];if(y<minY)minY=y;if(y>maxY)maxY=y;}
+  modelMinY=minY;modelMaxY=maxY;
+  const range=maxY-minY||0.01;
+  const buckets=new Float32Array(RADIUS_BUCKETS),cnts=new Uint32Array(RADIUS_BUCKETS);
+  for(let i=0;i<count;i++){
+    const y=positions[i*3+1],r=Math.sqrt(positions[i*3]**2+positions[i*3+2]**2);
+    const idx=Math.min(RADIUS_BUCKETS-1,Math.floor((y-minY)/range*RADIUS_BUCKETS));
+    buckets[idx]+=r;cnts[idx]++;
+  }
+  radiusProfile={minY,maxY,buckets,counts:cnts};
+  // Bounding box half-extents from actual positions (same as index.html proxy sphere)
+  let maxAbsX=0,maxAbsY=0,maxAbsZ=0;
+  for(let i=0;i<count;i++){
+    const x=Math.abs(positions[i*3]),y=Math.abs(positions[i*3+1]),z=Math.abs(positions[i*3+2]);
+    if(x>maxAbsX)maxAbsX=x;if(y>maxAbsY)maxAbsY=y;if(z>maxAbsZ)maxAbsZ=z;
+  }
+  bboxRx=maxAbsX;bboxRy=maxAbsY;bboxRz=maxAbsZ;
+}
+
+function getRadiusAtY(targetY){
+  if(!radiusProfile)return 0.5;
+  const{minY,maxY,buckets,counts}=radiusProfile;
+  const range=maxY-minY||0.01;
+  const idx=Math.min(RADIUS_BUCKETS-1,Math.max(0,Math.floor((targetY-minY)/range*RADIUS_BUCKETS)));
+  let sumR=buckets[idx],sumC=counts[idx];
+  if(idx>0){sumR+=buckets[idx-1];sumC+=counts[idx-1];}
+  if(idx<RADIUS_BUCKETS-1){sumR+=buckets[idx+1];sumC+=counts[idx+1];}
+  return sumC>0?sumR/sumC:0.5;
+}
+
+function addBand(centerY){
+  if(!restVolume)return;
+  if(bands.length>=MAX_BANDS){console.warn('达到最大皮筋数:',MAX_BANDS);return;}
+  const margin=BAND_INF*0.3;
+  centerY=Math.max(modelMinY+margin,Math.min(modelMaxY-margin,centerY));
+  bands.push({centerY,targetRadius:BAND_TARGET,stiff:BAND_STIFF,inf:BAND_INF});
+  H.bcount.textContent=bands.length;
+  markPbdDirty();
+  console.log('皮筋 #'+bands.length,'y='+centerY.toFixed(3),'target='+BAND_TARGET.toFixed(3));
+}
+
+function removeBand(){if(bands.length>0){bands.pop();H.bcount.textContent=bands.length;needsRestore=true;markPbdDirty();}}
+
+// ═══════ Camera ═══════
+let camYaw=0.3,camPitch=0.4,camDist=3.5;
+function getMVP(){
+  const ex=camDist*Math.sin(camYaw)*Math.cos(camPitch),ey=camDist*Math.sin(camPitch),ez=camDist*Math.cos(camYaw)*Math.cos(camPitch);
+  const fx=-ex,fy=-ey,fz=-ez,fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const fdx=fx/fl,fdy=fy/fl,fdz=fz/fl;
+  const rx=1*fdz-0*fdy,ry=0*fdx-0*fdz,rz=0*fdy-1*fdx,rl=Math.sqrt(rx*rx+ry*ry+rz*rz);
+  const rtx=rx/rl,rty=ry/rl,rtz=rz/rl;
+  const ux=fdy*rtz-fdz*rty,uy=fdz*rtx-fdx*rtz,uz=fdx*rty-fdy*rtx;
+  const v=new Float32Array([rtx,ux,-fdx,0,rty,uy,-fdy,0,rtz,uz,-fdz,0,-(rtx*ex+rty*ey+rtz*ez),-(ux*ex+uy*ey+uz*ez),(fdx*ex+fdy*ey+fdz*ez),1]);
+  const asp=canvas.width/canvas.height,f=1/Math.tan(Math.PI/8),n=0.1,far=50;
+  const p=new Float32Array([f/asp,0,0,0,0,f,0,0,0,0,far/(n-far),-1,0,0,n*far/(n-far),0]);
+  const m=new Float32Array(16);
+  for(let j=0;j<4;j++)for(let i=0;i<4;i++){let s=0;for(let k=0;k<4;k++)s+=p[k*4+i]*v[j*4+k];m[j*4+i]=s;}
+  return m;
+}
+
+// ═══════ Utility ═══════
+function mkBuf(size,usage,label){return device.createBuffer({size,usage,label});}
+
+// ═══════ WGSL shaders ═══════
+const shapeCS=device.createShaderModule({label:'shape',code:`
+struct P{stiffness:f32,vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let cur=src[i];let r=rest[i];let d=r.xyz-cur.xyz;
+  dst[i]=vec4(cur.xyz+d*p.stiffness,1.0);
+}
+`});
+
+const bandCS=device.createShaderModule({label:'band',code:`
+struct Band{cy:f32,tr:f32,stiff:f32,inf:f32}
+struct P{bc:u32,vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(3)var<storage,read>bands:array<Band>;
+@group(0)@binding(4)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  var cur=src[i];
+  for(var b=0u;b<256u;b++){if(b>=p.bc){break;}
+    let bd=bands[b];let dy=abs(cur.y-bd.cy);if(dy>=bd.inf){continue;}
+    let r=length(cur.xz);if(r<1e-6){continue;}
+    let t=dy/bd.inf;let st=t*t*(3.0-2.0*t);let eff=bd.tr+(r-bd.tr)*st;
+    if(r>eff){let push=bd.stiff*(r-eff);let s=max(0.01,(r-push)/r);cur.x*=s;cur.z*=s;}
+  }
+  dst[i]=cur;
+}
+`});
+
+const volAccCS=device.createShaderModule({label:'volAcc',code:`
+struct P{tc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>indices:array<u32>;
+@group(0)@binding(2)var<storage,read_write>volOut:array<f32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let t=gid.x;if(t>=p.tc){return;}
+  let i0=indices[t*3u];let i1=indices[t*3u+1u];let i2=indices[t*3u+2u];
+  let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
+  volOut[t]=(p0.x*(p1.y*p2.z-p1.z*p2.y)+p0.y*(p1.z*p2.x-p1.x*p2.z)+p0.z*(p1.x*p2.y-p1.y*p2.x))/6.0;
+}
+`});
+
+const volReduceCS=device.createShaderModule({label:'volReduce',code:`
+struct P{count:u32}
+@group(0)@binding(0)var<storage,read>src:array<f32>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+var<workgroup>sdata:array<f32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  sdata[lid.x]=select(0.0,src[gid.x],gid.x<p.count);workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sdata[lid.x]+=sdata[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){dst[wg.x]=sdata[0];}
+}
+`});
+
+const volApCS=device.createShaderModule({label:'volAp',code:`
+struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>volTotal:array<f32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let cur=src[i];let r=length(cur.xz);
+  if(r<1e-6){dst[i]=cur;return;}
+  let curVol=abs(volTotal[0]);let deficit=p.rest-curVol;
+  let push=select(p.stiff*deficit/p.surface,0.0,abs(deficit)<1e-9);
+  let s=clamp((r+push)/r,0.7,1.3);
+  dst[i]=vec4(cur.x*s,cur.y,cur.z*s,1.0);
+}
+`});
+
+// Render shaders
+const surfShader=device.createShaderModule({label:'surf',code:`
+struct U{mvp:mat4x4<f32>}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>norms:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>uvs:array<vec2<f32>>;
+@group(0)@binding(3)var<uniform>u:U;
+@group(0)@binding(4)var t: texture_2d<f32>;
+@group(0)@binding(5)var s: sampler;
+struct VOut{@builtin(position)pos:vec4<f32>,@location(0)uv:vec2<f32>,@location(1)normal:vec3<f32>}
+@vertex fn vs(@builtin(vertex_index)vi:u32)->VOut{
+  var o:VOut;
+  o.pos=u.mvp*pos[vi];
+  o.uv=uvs[vi];
+  o.normal=norms[vi].xyz;
+  return o;
+}
+@fragment fn fs(in:VOut)->@location(0)vec4<f32>{
+  let n=normalize(in.normal);
+  let l=normalize(vec3(1.0,2.0,1.0));
+  let diff=max(dot(n,l),0.15);
+  let texColor=textureSample(t,s,in.uv);
+  return vec4(texColor.rgb*diff,0.95);
+}
+`});
+
+const wireShader=device.createShaderModule({label:'wire',code:`
+struct U{mvp:mat4x4<f32>}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<uniform>u:U;
+@vertex fn vs(@builtin(vertex_index)vi:u32)->@builtin(position)vec4<f32>{return u.mvp*pos[vi];}
+@fragment fn fs()->@location(0)vec4<f32>{return vec4(1.0,1.0,1.0,0.3);}
+`});
+
+// Torus for band rings (instanced)
+function buildTorus(majorR,minorR,tubeSegs,radSegs){
+  const p=[],idx=[];
+  for(let i=0;i<=tubeSegs;i++){const u=i/tubeSegs*Math.PI*2,cu=Math.cos(u),su=Math.sin(u);for(let j=0;j<=radSegs;j++){const v=j/radSegs*Math.PI*2,cv=Math.cos(v),sv=Math.sin(v);p.push((majorR+minorR*cv)*cu,minorR*sv,(majorR+minorR*cv)*su);}}
+  const rv=radSegs+1;
+  for(let i=0;i<tubeSegs;i++)for(let j=0;j<radSegs;j++){const a=i*rv+j,b=a+rv,c=a+1,d=b+1;idx.push(a,c,b,b,c,d);}
+  return{positions:new Float32Array(p),indices:new Uint32Array(idx)};
+}
+const torus=buildTorus(1.0,0.03,48,16);
+const TORUS_V_COUNT=torus.positions.length/3,TORUS_I_COUNT=torus.indices.length;
+let torusVBuf,torusIBuf,torusUB,torusBG,torusPipe;
+
+const torusInstShader=device.createShaderModule({label:'torusInst',code:`
+struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct U{mvp:mat4x4<f32>}
+struct VOut{@builtin(position)pos:vec4<f32>,@location(0)col:vec4<f32>}
+@group(0)@binding(0)var<storage,read>instances:array<Inst>;
+@group(0)@binding(1)var<uniform>u:U;
+@vertex fn vs(@location(0)p:vec3<f32>,@builtin(instance_index)ii:u32)->VOut{
+  let inst=instances[ii];
+  var o:VOut;
+  o.pos=u.mvp*vec4(p.x*inst.scale,inst.offset+p.y,p.z*inst.scale,1.0);
+  o.col=vec4(inst.r,inst.g,inst.b,inst.a);
+  return o;
+}
+@fragment fn fs(in:VOut)->@location(0)vec4<f32>{return in.col;}
+`});
+
+// GPU band radius scanner: compute actual avg radius at each band's Y
+const bandRadCS=device.createShaderModule({label:'bandRad',code:`
+struct Band{cy:f32,tr:f32,stiff:f32,inf:f32}
+struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct P{vc:u32,bc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>bands:array<Band>;
+@group(0)@binding(2)var<storage,read_write>inst:array<Inst>;
+@group(0)@binding(3)var<uniform>p:P;
+var<workgroup>sSum:array<f32,256>;
+var<workgroup>sCnt:array<u32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
+  let bandY=bands[b].cy;let thresh=bands[b].inf*0.3;
+  var sumR=f32(0);var cnt=u32(0);var vi=lid.x;
+  while(vi<p.vc){
+    let y=pos[vi].y;
+    if(abs(y-bandY)<thresh){sumR+=length(pos[vi].xz);cnt++;}
+    vi+=256u;
+  }
+  sSum[lid.x]=sumR;sCnt[lid.x]=cnt;workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sSum[lid.x]+=sSum[lid.x+s];sCnt[lid.x]+=sCnt[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){inst[b].scale=select(0.0,sSum[0]/f32(sCnt[0]),sCnt[0]>1u);}
+}
+`});
+
+const torusSingleShader=device.createShaderModule({label:'torusSingle',code:`
+struct U{mvp:mat4x4<f32>,offset:f32,scale:f32,color:vec4<f32>}
+@group(0)@binding(0)var<uniform>u:U;
+@vertex fn vs(@location(0)p:vec4<f32>)->@builtin(position)vec4<f32>{
+  return u.mvp*vec4(p.x*u.scale,u.offset+p.y,p.z*u.scale,1.0);
+}
+@fragment fn fs()->@location(0)vec4<f32>{return u.color;}
+`});
+
+// ── Pipelines ──
+function cpPipe(shader,entry,bgEntries,label){
+  const bgl=device.createBindGroupLayout({entries:bgEntries});
+  const layout=device.createPipelineLayout({bindGroupLayouts:[bgl]});
+  return{pipe:device.createComputePipeline({layout,compute:{module:shader,entryPoint:entry}}),bgl,layout};
+}
+const S_R=(b,v)=>({binding:b,visibility:v,buffer:{type:'storage'}});
+const S_RO=(b,v)=>({binding:b,visibility:v,buffer:{type:'read-only-storage'}});
+const U_B=(b,v)=>({binding:b,visibility:v,buffer:{type:'uniform'}});
+const CS=GPUShaderStage.COMPUTE;
+
+const shapePipe=cpPipe(shapeCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'shape');
+const bandPipe=cpPipe(bandCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'band');
+const volAccPipe=cpPipe(volAccCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'volAcc');
+const volReducePipe=cpPipe(volReduceCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'volReduce');
+const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'volAp');
+const bandRadPipe=cpPipe(bandRadCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'bandRad');
+
+const shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
+const bandUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandU');
+
+const bandRadUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandRadU');
+
+const volAccUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volAccU');
+const volApUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volApU');
+
+// Render pipelines
+const R_BGL_surf=device.createBindGroupLayout({entries:[
+  {binding:0,visibility:GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}},
+  {binding:1,visibility:GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}},
+  {binding:2,visibility:GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}},
+  {binding:3,visibility:GPUShaderStage.VERTEX,buffer:{type:'uniform'}},
+  {binding:4,visibility:GPUShaderStage.FRAGMENT,texture:{sampleType:'float',viewDimension:'2d',multisampled:false}},
+  {binding:5,visibility:GPUShaderStage.FRAGMENT,sampler:{type:'filtering'}},
+]});
+const R_BGL_wire=device.createBindGroupLayout({entries:[
+  {binding:0,visibility:GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}},
+  {binding:1,visibility:GPUShaderStage.VERTEX,buffer:{type:'uniform'}},
+]});
+
+let surfPipe,wirePipe,mvpUB,renderBG_A,renderBG_B,lineIdxB;
+
+// ── PBD dispatch ──
+async function runPBD_GPU(){
+  const t0=performance.now();
+  const sp=new Float32Array([SHAPE_STIFF,vertexCount]);
+  const bp=new Float32Array([bands.length,vertexCount]);
+  const bd=new Float32Array(bands.length*4);
+  for(let b=0;b<bands.length;b++){bd[b*4]=bands[b].centerY;bd[b*4+1]=bands[b].targetRadius;bd[b*4+2]=bands[b].stiff;bd[b*4+3]=bands[b].inf;}
+  const vacU=new Uint32Array([triCount]);
+  const vapU=new Float32Array([vertexCount,restVolume,VOL_STIFF,restSurfaceArea]);
+  const zeroB=new Float32Array(triCount),zero1=new Float32Array(1);
+
+  srcPos=posA;dstPos=posB;
+  for(let iter=0;iter<PBD_ITER;iter++){
+    const isA=srcPos===posA;
+    queue.writeBuffer(shapeUB,0,sp);
+    if(bands.length>0){queue.writeBuffer(bandB,0,bd);queue.writeBuffer(bandUB,0,bp);}
+    queue.writeBuffer(volAccUB,0,vacU);
+    queue.writeBuffer(volTotalB,0,zero1);queue.writeBuffer(volB,0,zeroB);
+    for(const lv of volRedLevels){if(lv.dstBuf!==volTotalB)queue.writeBuffer(lv.dstBuf,0,new Float32Array(lv.wgCount));}
+    queue.writeBuffer(volApUB,0,vapU);
+
+    const cmd=device.createCommandEncoder();
+    const cp=cmd.beginComputePass();
+    cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,isA?shapeBG_AB:shapeBG_BA);cp.dispatchWorkgroups(WG,1,1);
+    if(bands.length>0){cp.setPipeline(bandPipe.pipe);cp.setBindGroup(0,isA?bandBG_BA:bandBG_AB);cp.dispatchWorkgroups(WG,1,1);}
+    cp.setPipeline(volAccPipe.pipe);cp.setBindGroup(0,isA?volAccBG_A:volAccBG_B);cp.dispatchWorkgroups(VWG,1,1);
+    for(const lv of volRedLevels){cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,lv.bg);cp.dispatchWorkgroups(lv.wgCount,1,1);}
+    cp.setPipeline(volApPipe.pipe);cp.setBindGroup(0,isA?volApBG_AB:volApBG_BA);cp.dispatchWorkgroups(WG,1,1);
+    cp.end();device.queue.submit([cmd.finish()]);
+    swap();
+  }
+
+  // Read back ONLY volume (4 bytes)
+  {const cmd=device.createCommandEncoder();cmd.copyBufferToBuffer(volTotalB,0,staging,0,4);device.queue.submit([cmd.finish()]);}
+  await staging.mapAsync(GPUMapMode.READ);
+  lastVol=Math.abs(new Float32Array(staging.getMappedRange(0,4))[0]);staging.unmap();
+
+  H.vratio.textContent=(lastVol/restVolume*100).toFixed(1);
+
+  // GPU band radius scan: compute actual radii into bandInstBuf
+  if(bands.length>0){
+    const radU=new Uint32Array([vertexCount,bands.length]);
+    queue.writeBuffer(bandRadUB,0,radU);
+    const cmd=device.createCommandEncoder();
+    const cp=cmd.beginComputePass();
+    cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,srcPos===posA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bands.length,1,1);
+    cp.end();device.queue.submit([cmd.finish()]);
+  }
+  return performance.now()-t0;
+}
+
+async function runRestore_GPU(){
+  const sp=new Float32Array([SHAPE_STIFF,vertexCount]);
+  srcPos=posA;dstPos=posB;
+  const RESTORE_ITER=30; // fixed high count, not affected by PBD_ITER slider
+  for(let iter=0;iter<RESTORE_ITER;iter++){
+    queue.writeBuffer(shapeUB,0,sp);
+    const cmd=device.createCommandEncoder();
+    const cp=cmd.beginComputePass();
+    cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,srcPos===posA?shapeBG_AB:shapeBG_BA);cp.dispatchWorkgroups(WG,1,1);
+    cp.end();device.queue.submit([cmd.finish()]);swap();
+  }
+  lastVol=restVolume;needsRestore=false;H.vratio.textContent='100.0';
+}
+
+// ═══════ Model loading ═══════
+async function loadModel(){
+  const loader=new GLTFLoader();
+  const gltf=await new Promise((res,rej)=>loader.load('pineapple.glb',res,undefined,rej));
+  let srcMesh=null;gltf.scene.traverse(c=>{if(c.isMesh&&!srcMesh)srcMesh=c;});
+  if(!srcMesh)throw new Error('No mesh');
+
+  const srcGeo=srcMesh.geometry;
+  srcGeo.computeBoundingBox();
+  const cen = new THREE.Vector3(); srcGeo.boundingBox.getCenter(cen);
+  const siz = new THREE.Vector3(); srcGeo.boundingBox.getSize(siz);
+  const sc=3.0/siz.y;
+  const pa=srcGeo.attributes.position.array;vertexCount=srcGeo.attributes.position.count;
+  const pos=new Float32Array(vertexCount*3);
+  for(let i=0;i<vertexCount;i++){pos[i*3]=(pa[i*3]-cen.x)*sc;pos[i*3+1]=(pa[i*3+1]-cen.y)*sc;pos[i*3+2]=(pa[i*3+2]-cen.z)*sc;}
+
+  // Normals
+  const na=srcGeo.attributes.normal?srcGeo.attributes.normal.array:null;
+  const norms=new Float32Array(vertexCount*4);
+  if(na){for(let i=0;i<vertexCount;i++){norms[i*4]=na[i*3];norms[i*4+1]=na[i*3+1];norms[i*4+2]=na[i*3+2];norms[i*4+3]=0;}}
+  else{for(let i=0;i<vertexCount;i++){norms[i*4]=0;norms[i*4+1]=1;norms[i*4+2]=0;norms[i*4+3]=0;}}
+
+  // UVs
+  const ua=srcGeo.attributes.uv?srcGeo.attributes.uv.array:null;
+  const uvs=new Float32Array(vertexCount*2);
+  if(ua){for(let i=0;i<vertexCount;i++){uvs[i*2]=ua[i*2];uvs[i*2+1]=ua[i*2+1];}}
+  else{for(let i=0;i<vertexCount;i++){uvs[i*2]=0;uvs[i*2+1]=0;}}
+
+  // Indices
+  const idxArr=srcGeo.index?new Uint32Array(srcGeo.index.array):(()=>{const a=new Uint32Array(vertexCount);for(let i=0;i<vertexCount;i++)a[i]=i;return a;})();
+  triCount=idxArr.length/3;
+
+  // Rest volume & surface area
+  let vol=0,area=0;
+  for(let t=0;t<idxArr.length;t+=3){
+    const ai=idxArr[t]*3,bi=idxArr[t+1]*3,ci=idxArr[t+2]*3;
+    const ax=pos[ai],ay=pos[ai+1],az=pos[ai+2],bx=pos[bi],by=pos[bi+1],bz=pos[bi+2],cx=pos[ci],cy=pos[ci+1],cz=pos[ci+2];
+    vol+=(ax*(by*cz-bz*cy)+ay*(bz*cx-bx*cz)+az*(bx*cy-by*cx))/6;
+    const abx=bx-ax,aby=by-ay,abz=bz-az,acx=cx-ax,acy=cy-ay,acz=cz-az;
+    area+=0.5*Math.sqrt((aby*acz-abz*acy)**2+(abz*acx-abx*acz)**2+(abx*acy-aby*acx)**2);
+  }
+  restVolume=Math.abs(vol);restSurfaceArea=area;
+
+  H.vcount.textContent=vertexCount.toLocaleString();H.tcount.textContent=Math.round(triCount).toLocaleString();
+  H.pbditer.textContent=PBD_ITER;
+  console.log('✅ 菠萝:',vertexCount.toLocaleString(),'顶点,',Math.round(triCount).toLocaleString(),'三角形');
+  console.log('   restVolume:',restVolume.toFixed(4),'restSurfaceArea:',restSurfaceArea.toFixed(2));
+
+  // Extract base color texture from model material
+  let gpuTex=null,gpuSampler=null;
+  if(srcMesh.material&&srcMesh.material.map&&srcMesh.material.map.image){
+    const img=srcMesh.material.map.image;
+    const bitmap=await createImageBitmap(img);
+    gpuTex=device.createTexture({
+      size:[bitmap.width,bitmap.height],
+      format:'rgba8unorm',
+      usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    queue.copyExternalImageToTexture({source:bitmap},{texture:gpuTex,colorSpace:'srgb'},[bitmap.width,bitmap.height]);
+    gpuSampler=device.createSampler({magFilter:'linear',minFilter:'linear',addressModeU:'repeat',addressModeV:'repeat'});
+    console.log('   ✅ 贴图:',bitmap.width,'x',bitmap.height);
+  }else{console.log('   ⚠️ 无贴图，用纯色');}
+
+  buildRadiusProfile(pos);
+  initGPU(pos,norms,uvs,idxArr,gpuTex,gpuSampler);
+
+  // Wireframe index buffer
+  const lineIdx=[];
+  for(let t=0;t<idxArr.length;t+=3){const a=idxArr[t],b=idxArr[t+1],c=idxArr[t+2];lineIdx.push(a,b,b,c,c,a);}
+  const lineCount=lineIdx.length;
+  lineIdxB=mkBuf(lineCount*4,GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST,'lineIdx');
+  queue.writeBuffer(lineIdxB,0,new Uint32Array(lineIdx));
+  window._lineCount=lineCount;
+}
+loadModel().catch(e=>console.error('加载失败:',e));
+
+// ═══════ GPU init ═══════
+let shapeBG_AB,shapeBG_BA,bandBG_AB,bandBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B,bandRadBG_A,bandRadBG_B;
+let volRedBGs=[];
+
+function initGPU(posArr,normArr,uvArr,idxArr,gpuTex,gpuSampler){
+  WG=Math.ceil(vertexCount/256);VWG=Math.ceil(triCount/256);
+  const VB=vertexCount*4*4;
+  posA=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posA');
+  posB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posB');
+  restB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'rest');
+  idxB=mkBuf(idxArr.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'idx');
+  bandB=mkBuf(MAX_BANDS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'band');
+  normB=mkBuf(vertexCount*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'norm');
+  uvB=mkBuf(vertexCount*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'uv');
+
+  const pos4=new Float32Array(vertexCount*4);
+  for(let i=0;i<vertexCount;i++){pos4[i*4]=posArr[i*3];pos4[i*4+1]=posArr[i*3+1];pos4[i*4+2]=posArr[i*3+2];pos4[i*4+3]=1;}
+  queue.writeBuffer(posA,0,pos4);queue.writeBuffer(posB,0,pos4);queue.writeBuffer(restB,0,pos4);
+  queue.writeBuffer(idxB,0,idxArr);
+  queue.writeBuffer(normB,0,normArr);
+  queue.writeBuffer(uvB,0,uvArr);
+
+  // Volume reduction chain
+  volTotalB=mkBuf(4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volTotal');
+  volB=mkBuf(triCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'vol');
+  volRedLevels=[];
+  {let srcCount=triCount,srcBuf=volB;
+    while(true){const dc=Math.ceil(srcCount/256);const lv={srcBuf,srcCount,dstBuf:null,wgCount:dc,ub:null,bg:null};
+      if(dc===1){lv.dstBuf=volTotalB;lv.ub=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volRedU_f');queue.writeBuffer(lv.ub,0,new Uint32Array([srcCount]));lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:volTotalB}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);break;}
+      const db=mkBuf(dc*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volRedL'+volRedLevels.length);
+      lv.dstBuf=db;lv.ub=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volRedU_L'+volRedLevels.length);queue.writeBuffer(lv.ub,0,new Uint32Array([srcCount]));
+      lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:db}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);srcCount=dc;srcBuf=db;}
+  }
+
+  staging=mkBuf(Math.max(VB,4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+
+  // Compute bind groups
+  const mkBG2=(bgl,fAB,fBA)=>({AB:device.createBindGroup({layout:bgl,entries:fAB(posA,posB)}),BA:device.createBindGroup({layout:bgl,entries:fBA(posA,posB)})});
+  const sh=mkBG2(shapePipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:shapeUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:shapeUB}}]);
+  shapeBG_AB=sh.AB;shapeBG_BA=sh.BA;
+  const bd=mkBG2(bandPipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:bandB}},{binding:4,resource:{buffer:bandUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:bandB}},{binding:4,resource:{buffer:bandUB}}]);
+  bandBG_AB=bd.AB;bandBG_BA=bd.BA;
+  const vap=mkBG2(volApPipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}]);
+  volApBG_AB=vap.AB;volApBG_BA=vap.BA;
+  volAccBG_A=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+  volAccBG_B=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+
+  // Band instance buffers (must exist before bandRad bind groups)
+  const INST_BYTE=MAX_BANDS*24;
+  const bandInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bandInst');
+  const targetInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'targetInst');
+
+  // Band radius scan bind groups (GPU computes actual radius, writes to bandInstBuf)
+  bandRadBG_A=device.createBindGroup({layout:bandRadPipe.bgl,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
+  bandRadBG_B=device.createBindGroup({layout:bandRadPipe.bgl,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
+
+  // Render pipelines
+  mvpUB=mkBuf(64,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'mvp');
+  const texView=gpuTex?gpuTex.createView():null;
+  const sampler=gpuSampler||device.createSampler({magFilter:'linear',minFilter:'linear'});
+  // Fallback texture: 1x1 white
+  const fallbackTex=!gpuTex?(()=>{
+    const t=device.createTexture({size:[1,1],format:'rgba8unorm',usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+    queue.writeTexture({texture:t},new Uint8Array([255,200,120,255]),{bytesPerRow:4},{width:1,height:1});
+    return t;
+  })():null;
+  const finalTexView=texView||fallbackTex.createView();
+  const finalSampler=sampler;
+
+  renderBG_A=device.createBindGroup({layout:R_BGL_surf,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:normB}},{binding:2,resource:{buffer:uvB}},
+    {binding:3,resource:{buffer:mvpUB}},{binding:4,resource:finalTexView},{binding:5,resource:finalSampler}]});
+  renderBG_B=device.createBindGroup({layout:R_BGL_surf,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:normB}},{binding:2,resource:{buffer:uvB}},
+    {binding:3,resource:{buffer:mvpUB}},{binding:4,resource:finalTexView},{binding:5,resource:finalSampler}]});
+  surfPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL_surf]}),vertex:{module:surfShader,entryPoint:'vs',buffers:[]},fragment:{module:surfShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'back',frontFace:'cw'},depthStencil:{format:'depth24plus',depthWriteEnabled:true,depthCompare:'less'}});
+
+  const wireBG_A=device.createBindGroup({layout:R_BGL_wire,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:mvpUB}}]});
+  const wireBG_B=device.createBindGroup({layout:R_BGL_wire,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:mvpUB}}]});
+  wirePipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL_wire]}),vertex:{module:wireShader,entryPoint:'vs',buffers:[]},fragment:{module:wireShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'line-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
+
+  // Torus pipelines
+  torusVBuf=mkBuf(torus.positions.length*4,GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST,'torusV');
+  torusIBuf=mkBuf(torus.indices.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST,'torusI');
+  queue.writeBuffer(torusVBuf,0,torus.positions);queue.writeBuffer(torusIBuf,0,torus.indices);
+  torusUB=mkBuf(96,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'torusU');
+  const torusBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'uniform'}}]});
+  torusBG=device.createBindGroup({layout:torusBGL,entries:[{binding:0,resource:{buffer:torusUB}}]});
+  torusPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusBGL]}),vertex:{module:torusSingleShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}]}]},fragment:{module:torusSingleShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'always'}});
+
+  // Instanced torus bind groups for band rings
+  const torusInstBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'read-only-storage'}},{binding:1,visibility:GPUShaderStage.VERTEX,buffer:{type:'uniform'}}]});
+  const torusInstBG=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:bandInstBuf}},{binding:1,resource:{buffer:mvpUB}}]});
+  const targetInstBG=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:targetInstBuf}},{binding:1,resource:{buffer:mvpUB}}]});
+  const torusInstPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusInstBGL]}),vertex:{module:torusInstShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}],stepMode:'vertex'}]},fragment:{module:torusInstShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'always'}});
+
+  srcPos=posA;dstPos=posB;lastVol=restVolume;
+  console.log('⚡ 纯GPU PBD 就绪. Verts:',vertexCount.toLocaleString(),'Tris:',Math.round(triCount).toLocaleString(),'WG:',WG,'VWG:',VWG,'VolRed:',volRedLevels.length);
+
+  // Keep render references accessible from animation loop
+  window._gpu={bandInstBuf,targetInstBuf,torusInstBG,targetInstBG,torusInstPipe};
+  window._wire={wireBG_A,wireBG_B};
+}
+
+// ═══════ Ray-march against radius profile ═══════
+function rayMarchPineapple(ex,ey,ez,Dx,Dy,Dz){
+  // Clip ray against Y bounds
+  let tMin=0,tMax=Infinity;
+  if(Math.abs(Dy)>1e-9){
+    const t0=(modelMinY-ey)/Dy,t1=(modelMaxY-ey)/Dy;
+    tMin=Math.max(0,Math.min(t0,t1));
+    tMax=Math.min(tMax,Math.max(t0,t1));
+  }
+  if(tMin>=tMax)return null;
+  // March along ray
+  const steps=200;
+  const dt=(tMax-tMin)/steps;
+  for(let i=0;i<=steps;i++){
+    const t=tMin+i*dt;
+    const y=ey+t*Dy;
+    const rx=ex+t*Dx,rz=ez+t*Dz;
+    const hr=Math.sqrt(rx*rx+rz*rz);
+    const sr=getRadiusAtY(y);
+    if(hr<=sr)return y;
+  }
+  return null;
+}
+
+// ═══════ Mouse interaction ═══════
+let mdx=0,mdy=0,dragging=false,ringVisible=false,ringY=0,ringR=0.4;
+canvas.onmousedown=e=>{mdx=e.clientX;mdy=e.clientY;dragging=true;};
+window.onmouseup=e=>{
+  if(!dragging)return;dragging=false;
+  const dx=e.clientX-mdx,dy=e.clientY-mdy;
+  if(Math.sqrt(dx*dx+dy*dy)>3)return; // was a drag, not a click
+  const rect=canvas.getBoundingClientRect();
+  const ndcX=((mdx-rect.left)/rect.width)*2-1,ndcY=-((mdy-rect.top)/rect.height)*2+1;
+  const ex=camDist*Math.sin(camYaw)*Math.cos(camPitch),ey=camDist*Math.sin(camPitch),ez=camDist*Math.cos(camYaw)*Math.cos(camPitch);
+  const asp=canvas.width/canvas.height,f=1/Math.tan(Math.PI/8);
+  const dirX=ndcX*asp/f,dirY=ndcY/f,dirZ=-1;
+  const fx=0-ex,fy=0-ey,fz=0-ez;const fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const fdx=fx/fl,fdy=fy/fl,fdz=fz/fl;
+  const rtx=1*fdz,rtz=-1*fdx;const rl=Math.sqrt(rtx*rtx+rtz*rtz);
+  const rnx=rtx/rl,rny=0,rnz=rtz/rl;
+  const ux=fdy*rnz-fdz*rny,uy=fdz*rnx-fdx*rnz,uz=fdx*rny-fdy*rnx;
+  const wx=dirX*rnx+dirY*ux+dirZ*(-fdx),wy=dirX*rny+dirY*uy+dirZ*(-fdy),wz=dirX*rnz+dirY*uz+dirZ*(-fdz);
+  const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
+  const Dx=wx/wl,Dy=wy/wl,Dz=wz/wl;
+  const hitY=rayMarchPineapple(ex,ey,ez,Dx,Dy,Dz);
+  if(hitY!==null)addBand(hitY);
+};
+canvas.onmousemove=e=>{
+  if(dragging){camYaw+=(e.clientX-mdx)*0.005;camPitch=Math.max(-1.4,Math.min(1.4,camPitch-(e.clientY-mdy)*0.005));mdx=e.clientX;mdy=e.clientY;return;}
+  if(!restVolume)return;
+  const rect=canvas.getBoundingClientRect();
+  const ndcX=((e.clientX-rect.left)/rect.width)*2-1,ndcY=-((e.clientY-rect.top)/rect.height)*2+1;
+  const ex=camDist*Math.sin(camYaw)*Math.cos(camPitch),ey=camDist*Math.sin(camPitch),ez=camDist*Math.cos(camYaw)*Math.cos(camPitch);
+  const asp=canvas.width/canvas.height,f=1/Math.tan(Math.PI/8);
+  const dirX=ndcX*asp/f,dirY=ndcY/f,dirZ=-1;
+  const fx=0-ex,fy=0-ey,fz=0-ez;const fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const fdx=fx/fl,fdy=fy/fl,fdz=fz/fl;
+  const rtx=1*fdz,rtz=-1*fdx;const rl=Math.sqrt(rtx*rtx+rtz*rtz);
+  const rnx=rtx/rl,rny=0,rnz=rtz/rl;
+  const ux=fdy*rnz-fdz*rny,uy=fdz*rnx-fdx*rnz,uz=fdx*rny-fdy*rnx;
+  const wx=dirX*rnx+dirY*ux+dirZ*(-fdx),wy=dirX*rny+dirY*uy+dirZ*(-fdy),wz=dirX*rnz+dirY*uz+dirZ*(-fdz);
+  const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
+  const Dx=wx/wl,Dy=wy/wl,Dz=wz/wl;
+  const hitY=rayMarchPineapple(ex,ey,ez,Dx,Dy,Dz);
+  if(hitY!==null){ringVisible=true;ringY=hitY;ringR=getRadiusAtY(Math.max(modelMinY+0.1,Math.min(modelMaxY-0.1,hitY)));return;}
+  ringVisible=false;
+};
+canvas.onwheel=e=>{e.preventDefault();let d=e.deltaY;if(e.deltaMode===1)d*=40;if(e.deltaMode===2)d*=800;camDist=Math.max(1.5,Math.min(15,camDist*(1+d*0.001)));},{passive:false};
+window.onkeydown=e=>{if(e.key.toLowerCase()==='r')removeBand();};
+window.onresize=()=>{canvas.width=window.innerWidth;canvas.height=window.innerHeight;canvas.style.width=canvas.width+'px';canvas.style.height=canvas.height+'px';depthTex=device.createTexture({size:[canvas.width,canvas.height],format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT});};
+
+// ═══════ Depth texture ═══════
+let depthTex=device.createTexture({size:[canvas.width,canvas.height],format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT});
+
+// ═══════ Band visual writer ═══════
+function writeBandInstances(){
+  if(!window._gpu)return;
+  const{bandInstBuf,targetInstBuf}=window._gpu;
+  for(let b=0;b<bands.length;b++){
+    // Red ring: scale computed by GPU, write offset & color only
+    const d=new Float32Array([bands[b].centerY,0,1,0.2,0.2,0.7]);
+    queue.writeBuffer(bandInstBuf,b*24,d);
+    // Green target ring: fixed target radius
+    const td=new Float32Array([bands[b].centerY,bands[b].targetRadius,0,1,0,0.5]);
+    queue.writeBuffer(targetInstBuf,b*24,td);
+  }
+}
+
+// ═══════ Animation loop ═══════
+const clock={last:performance.now()};
+let depthTexValid=true;
+
+async function animate(){
+  const now=performance.now(),dt=Math.min((now-clock.last)/1000,0.1);clock.last=now;
+
+  if(!restVolume){requestAnimationFrame(animate);return;}
+
+  if(bands.length>0&&!pbdConverged){
+    writeBandInstances(); // write offset+color BEFORE GPU compute overwrites scale
+    const ms=await runPBD_GPU();   // GPU bandRad scan updates scale in bandInstBuf
+    pbdAccumTime+=ms;
+    H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms';
+    convergeFrames++;
+    if(convergeFrames>=CONVERGE_FRAMES){pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';}
+  }else if(bands.length>0&&pbdConverged){
+    writeBandInstances();
+    // Still need GPU radius scan even when converged
+    const radU=new Uint32Array([vertexCount,bands.length]);
+    queue.writeBuffer(bandRadUB,0,radU);
+    {const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();
+    cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,srcPos===posA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bands.length,1,1);
+    cp.end();device.queue.submit([cmd.finish()]);}
+    H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';
+  }else if(needsRestore){
+    await runRestore_GPU();
+    H.pbdtime.textContent='已恢复 ✓';
+  }else{
+    H.pbdtime.textContent='空闲';
+  }
+
+  // Render
+  const mvp=getMVP();queue.writeBuffer(mvpUB,0,mvp);
+  const tv=context.getCurrentTexture().createView();
+  const dv=depthTex.createView();
+  const cmd=device.createCommandEncoder();
+  const rp=cmd.beginRenderPass({colorAttachments:[{view:tv,clearValue:[0.07,0.07,0.13,1],loadOp:'clear',storeOp:'store'}],depthStencilAttachment:{view:dv,depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'store'}});
+
+  // Surface
+  const rbg=srcPos===posA?renderBG_A:renderBG_B;
+  rp.setPipeline(surfPipe);rp.setBindGroup(0,rbg);rp.setIndexBuffer(idxB,'uint32');rp.drawIndexed(triCount*3);
+
+  // Wireframe (skip for high-poly: too dense)
+  // rp.setPipeline(wirePipe);rp.setBindGroup(0,wbg);rp.setIndexBuffer(lineIdxB,'uint32');rp.drawIndexed(window._lineCount);
+
+  // Preview ring
+  if(ringVisible){
+    const ru=new Float32Array(24);ru.set(mvp,0);ru[16]=ringY;ru[17]=ringR;ru[18]=0;ru[19]=0;ru[20]=1;ru[21]=1;ru[22]=0;ru[23]=0.6;
+    queue.writeBuffer(torusUB,0,ru);
+    rp.setPipeline(torusPipe);rp.setBindGroup(0,torusBG);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT);
+  }
+
+  // Band rings (instanced)
+  if(bands.length>0&&window._gpu){
+    const gpu=window._gpu;
+    rp.setPipeline(gpu.torusInstPipe);rp.setBindGroup(0,gpu.torusInstBG);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT,bands.length);
+    rp.setPipeline(gpu.torusInstPipe);rp.setBindGroup(0,gpu.targetInstBG);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT,bands.length);
+  }
+
+  rp.end();device.queue.submit([cmd.finish()]);
+
+  H.fps.textContent=Math.round(1/dt);
+  H.framems.textContent=(performance.now()-now).toFixed(1);
+  requestAnimationFrame(animate);
+}
+
+console.log('🔧 PBD 菠萝 纯WebGPU 版 — 加载模型中...');
+console.log('   🖱️ 点击菠萝表面 = 绑皮筋,  R = 割皮筋');
+animate();
+</script>
+</body>
+</html>
