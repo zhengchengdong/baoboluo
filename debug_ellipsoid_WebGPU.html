@@ -24,6 +24,7 @@ canvas { display:block; cursor:crosshair; }
 <div id="hud">
  <div>FPS: <span class="val" id="fps">--</span></div>
  <div>帧耗时: <span class="val" id="framems">--</span> ms</div>
+ <div>GPU PBD耗时: <span class="val" id="pbdtime">--</span> ms</div>
  <div>顶点: <span class="val" id="vcount">--</span></div>
  <div>三角形: <span class="val" id="tcount">--</span></div>
  <div>皮筋: <span class="val" id="bcount">0</span></div>
@@ -51,7 +52,7 @@ canvas { display:block; cursor:crosshair; }
 
 <script type="module">
 const $=id=>document.getElementById(id);
-const H={fps:$('fps'),framems:$('framems'),vcount:$('vcount'),tcount:$('tcount'),bcount:$('bcount'),vratio:$('vratio'),pbditer:$('pbditer')};
+const H={fps:$('fps'),framems:$('framems'),pbdtime:$('pbdtime'),vcount:$('vcount'),tcount:$('tcount'),bcount:$('bcount'),vratio:$('vratio'),pbditer:$('pbditer')};
 const canvas=$('canvas');
 
 if(!navigator.gpu){alert('WebGPU not supported');throw new Error('No WebGPU');}
@@ -548,10 +549,13 @@ async function updateBandVisuals(){
   staging.unmap();
 }
 const clock={last:performance.now()};
+let pbdTimeEma=0;
 async function animate(){
   const now=performance.now(),dt=Math.min((now-clock.last)/1000,0.1);clock.last=now;
 
-  if(bands.length>0)await runPBD();else await runRestore();
+  const pbdT0=performance.now();
+  if(bands.length>0){await runPBD();const rawMs=performance.now()-pbdT0;pbdTimeEma=0.85*pbdTimeEma+0.15*rawMs;H.pbdtime.textContent=pbdTimeEma.toFixed(1);}
+  else {await runRestore();H.pbdtime.textContent='--';}
   await updateBandVisuals();
 
   const mvp=getMVP();queue.writeBuffer(mvpUB,0,mvp);
