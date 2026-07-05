@@ -42,8 +42,8 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
  <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
  <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
- <label>硬化系数 <span class="val" id="sv_ha">0.00</span></label>
- <input type="range" id="sl_ha" min="0" max="3" step="0.05" value="0">
+ <label>皮筋目标半径 <span class="val" id="sv_tr">0.40</span></label>
+ <input type="range" id="sl_tr" min="0.05" max="0.50" step="0.01" value="0.40">
  <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
  <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
 </div>
@@ -130,13 +130,13 @@ struct P{stiffness:f32,vc:u32}
 
 const bandCS=device.createShaderModule({label:'band',code:`
 struct Band{cy:f32,tr:f32,stiff:f32,inf:f32}
-struct P{bc:u32,vc:u32,hard:f32}
+struct P{bc:u32,vc:u32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
 @group(0)@binding(3)var<storage,read>bands:array<Band>;
 @group(0)@binding(4)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){let i=gid.x;if(i>=p.vc){return;}var cur=src[i];let rst=rest[i];for(var b=0u;b<256u;b++){if(b>=p.bc){break;}let bd=bands[b];let dy=abs(cur.y-bd.cy);if(dy>=bd.inf){continue;}let r=length(cur.xz);if(r<1e-6){continue;}let t=dy/bd.inf;let st=t*t*(3.0-2.0*t);let eff=bd.tr+(r-bd.tr)*st;if(r>eff){let disp=length(rst.xyz-cur.xyz);var stiff=bd.stiff;if(p.hard>0.0){stiff=bd.stiff/exp(p.hard*disp*50.0);}let push=stiff*(r-eff);let s=max(0.01,(r-push)/r);cur.x*=s;cur.z*=s;}}dst[i]=cur;}
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){let i=gid.x;if(i>=p.vc){return;}var cur=src[i];for(var b=0u;b<256u;b++){if(b>=p.bc){break;}let bd=bands[b];let dy=abs(cur.y-bd.cy);if(dy>=bd.inf){continue;}let r=length(cur.xz);if(r<1e-6){continue;}let t=dy/bd.inf;let st=t*t*(3.0-2.0*t);let eff=bd.tr+(r-bd.tr)*st;if(r>eff){let push=bd.stiff*(r-eff);let s=max(0.01,(r-push)/r);cur.x*=s;cur.z*=s;}}dst[i]=cur;}
 `});
 
 const volAccCS=device.createShaderModule({label:'volAcc',code:`
@@ -236,7 +236,7 @@ const bandRadPipe=cpPipe(bandRadCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3
 
 // Uniform buffers
 const shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
-const bandUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+const bandUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
 const volAccUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
 const volReduceUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
 const volReduce2UB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
@@ -348,32 +348,53 @@ const torusInstPipe=device.createRenderPipeline({layout:device.createPipelineLay
 let depthTex=device.createTexture({size:[canvas.width,canvas.height],format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT});
 
 // PBD params
-let SHAPE_STIFF=0.30,BAND_STIFF=0.50,VOL_STIFF=0.40,BAND_INF=0.60,HARD=0,PBD_ITER=10;
-const BAND_TIGHT=0.80;
+let SHAPE_STIFF=0.30,BAND_STIFF=0.50,VOL_STIFF=0.40,BAND_INF=0.60,BAND_TARGET=0.40,PBD_ITER=10;
 let lastVol=restVolume;
 document.getElementById('sl_ss').oninput=e=>{SHAPE_STIFF=+e.target.value;document.getElementById('sv_ss').textContent=SHAPE_STIFF.toFixed(2);};
 document.getElementById('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;document.getElementById('sv_bs').textContent=BAND_STIFF.toFixed(2);for(const b of bands)b.stiff=BAND_STIFF;};
 document.getElementById('sl_vs').oninput=e=>{VOL_STIFF=+e.target.value;document.getElementById('sv_vs').textContent=VOL_STIFF.toFixed(2);};
 document.getElementById('sl_bi').oninput=e=>{BAND_INF=+e.target.value;document.getElementById('sv_bi').textContent=BAND_INF.toFixed(2);for(const b of bands)b.inf=BAND_INF;};
-document.getElementById('sl_ha').oninput=e=>{HARD=+e.target.value;document.getElementById('sv_ha').textContent=HARD.toFixed(2);};
+document.getElementById('sl_tr').oninput=e=>{BAND_TARGET=+e.target.value;document.getElementById('sv_tr').textContent=BAND_TARGET.toFixed(2);
+  const p=geo.positions;
+  for(let b=0;b<bands.length;b++){
+    bands[b].targetRadius=BAND_TARGET;
+    let sr=0,c=0;const cy=bands[b].cy;
+    for(let i=0;i<vertexCount;i++){if(Math.abs(p[i*3+1]-cy)<BAND_INF*0.3){sr+=Math.sqrt(p[i*3]**2+p[i*3+2]**2);c++;}}
+    const restR=c>1?sr/c:ELLI_RX;
+    bands[b].loose=restR<BAND_TARGET;
+    bands[b].inf=bands[b].loose?0:BAND_INF;
+    updateTargetRing(b);
+  }};
 document.getElementById('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;document.getElementById('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;};
 
 // Bands
 const bands=[];
+const targetInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'targetInst');
+const targetInstBG=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:targetInstBuf}},{binding:1,resource:{buffer:mvpUB}}]});
 function writeBandInst(b){
   const o=b*6;const d=new Float32Array(6);
-  d[0]=bands[b].cy;d[1]=0;d[2]=1;d[3]=0.2;d[4]=0.2;d[5]=0.7;
+  d[0]=bands[b].cy;d[1]=0;d[2]=1;d[3]=0.2;d[4]=0.2;d[5]=0.7; // red actual ring
   queue.writeBuffer(bandInstBuf,b*24,d);
+  d[1]=bands[b].targetRadius;d[2]=0;d[3]=1;d[4]=0;d[5]=0.5; // green target ring
+  queue.writeBuffer(targetInstBuf,b*24,d);
+}
+function updateTargetRing(b){
+  const o=b*6;const d=new Float32Array(6);
+  d[0]=bands[b].cy;d[1]=BAND_TARGET;d[2]=0;d[3]=1;d[4]=0;d[5]=0.5;
+  queue.writeBuffer(targetInstBuf,b*24,d);
 }
 function addBand(cy){
   const m=BAND_INF*0.3;cy=Math.max(-ELLI_RY+m,Math.min(ELLI_RY-m,cy));
+  // Compute rest radius at this Y: if smaller than target, band is loose
   const p=geo.positions;let sr=0,c=0;
   for(let i=0;i<vertexCount;i++){if(Math.abs(p[i*3+1]-cy)<BAND_INF*0.3){sr+=Math.sqrt(p[i*3]**2+p[i*3+2]**2);c++;}}
-  const cr=c>1?sr/c:ELLI_RX;
-  bands.push({cy,targetRadius:cr*BAND_TIGHT,stiff:BAND_STIFF,inf:BAND_INF});
+  const restR=c>1?sr/c:ELLI_RX;
+  const loose=restR<BAND_TARGET;
+  bands.push({cy,targetRadius:BAND_TARGET,stiff:BAND_STIFF,inf:loose?0:BAND_INF,loose});
   writeBandInst(bands.length-1);
+  updateTargetRing(bands.length-1);
   H.bcount.textContent=bands.length;
-  console.log('Band added! count:',bands.length,'Y:',cy.toFixed(3),'R:',(cr*BAND_TIGHT).toFixed(3));
+  console.log('Band added! count:',bands.length,'Y:',cy.toFixed(3),loose?'LOOSE':'tight','restR:',restR.toFixed(2));
 }
 function removeBand(){if(bands.length>0){bands.pop();H.bcount.textContent=bands.length;}}
 
@@ -399,7 +420,7 @@ const WG=Math.ceil(vertexCount/256),VWG=Math.ceil(TRI_COUNT/256);
 
 async function runPBD(){
   const sp=new Float32Array(2);sp[0]=SHAPE_STIFF;sp[1]=vertexCount;
-  const bp=new Float32Array(4);bp[0]=bands.length;bp[1]=vertexCount;bp[2]=HARD;bp[3]=0;
+  const bp=new Float32Array(2);bp[0]=bands.length;bp[1]=vertexCount;
   const bd=new Float32Array(MAX_BANDS*4);
   for(let b=0;b<bands.length;b++){bd[b*4]=bands[b].cy;bd[b*4+1]=bands[b].targetRadius;bd[b*4+2]=bands[b].stiff;bd[b*4+3]=bands[b].inf;}
   const vacU=new Float32Array(1);vacU[0]=TRI_COUNT;
@@ -547,6 +568,12 @@ async function animate(){
     const ru=new Float32Array(24);ru.set(mvp,0);ru[16]=ringY;ru[17]=ringR;ru[18]=0;ru[19]=0;ru[20]=1;ru[21]=1;ru[22]=0;ru[23]=0.6;
     queue.writeBuffer(torusUB,0,ru);
     rp.setPipeline(torusPipe);rp.setBindGroup(0,torusBG);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_IDX_COUNT);
+  }
+  // Target rings (green) — show where bands aim to pull
+  if(bands.length>0){
+    rp.setPipeline(torusInstPipe);rp.setBindGroup(0,targetInstBG);
+    rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');
+    rp.drawIndexed(TORUS_IDX_COUNT,bands.length);
   }
   // All band toruses — ONE instanced draw, radii from GPU bandInstBuf
   if(bands.length>0){
