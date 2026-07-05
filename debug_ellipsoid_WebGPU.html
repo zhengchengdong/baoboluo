@@ -420,14 +420,20 @@ function getMVP(){
 const WG=Math.ceil(vertexCount/256),VWG=Math.ceil(TRI_COUNT/256);
 
 async function runPBD(){
-  const sp=new Float32Array(2);sp[0]=SHAPE_STIFF;sp[1]=vertexCount;
-  const bp=new Float32Array(2);bp[0]=bands.length;bp[1]=vertexCount;
+  const sp=new ArrayBuffer(8);
+  new Float32Array(sp)[0]=SHAPE_STIFF;
+  new Uint32Array(sp)[1]=vertexCount;
+  const bp=new Uint32Array([bands.length,vertexCount]);
   const bd=new Float32Array(MAX_BANDS*4);
   for(let b=0;b<bands.length;b++){bd[b*4]=bands[b].cy;bd[b*4+1]=bands[b].targetRadius;bd[b*4+2]=bands[b].stiff;bd[b*4+3]=bands[b].inf;}
-  const vacU=new Float32Array(1);vacU[0]=TRI_COUNT;
-  const vredU=new Float32Array(1);vredU[0]=TRI_COUNT;
-  const vapU=new Float32Array(4);vapU[0]=vertexCount;vapU[1]=restVolume;vapU[2]=VOL_STIFF;vapU[3]=restSurfaceArea;
-  const vredU2=new Float32Array(1);vredU2[0]=VOL_PART_COUNT;
+  const vacU=new Uint32Array([TRI_COUNT]);
+  const vredU=new Uint32Array([TRI_COUNT]);
+  const vapU=new ArrayBuffer(16);
+  new Uint32Array(vapU)[0]=vertexCount;
+  new Float32Array(vapU)[1]=restVolume;
+  new Float32Array(vapU)[2]=VOL_STIFF;
+  new Float32Array(vapU)[3]=restSurfaceArea;
+  const vredU2=new Uint32Array([VOL_PART_COUNT]);
 
   srcPos=posA;dstPos=posB;
 
@@ -457,7 +463,9 @@ async function runPBD(){
 }
 
 async function runRestore(){
-  const sp=new Float32Array(2);sp[0]=SHAPE_STIFF;sp[1]=vertexCount;
+  const sp=new ArrayBuffer(8);
+  new Float32Array(sp)[0]=SHAPE_STIFF;
+  new Uint32Array(sp)[1]=vertexCount;
   srcPos=posA;dstPos=posB;
   for(let iter=0;iter<PBD_ITER;iter++){
     queue.writeBuffer(shapeUB,0,sp);

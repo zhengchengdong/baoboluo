@@ -396,12 +396,18 @@ let surfPipe,wirePipe,mvpUB,renderBG_A,renderBG_B,lineIdxB;
 // ── PBD dispatch ──
 async function runPBD_GPU(){
   const t0=performance.now();
-  const sp=new Float32Array([SHAPE_STIFF,vertexCount]);
-  const bp=new Float32Array([bands.length,vertexCount]);
+  const sp=new ArrayBuffer(8);
+  new Float32Array(sp)[0]=SHAPE_STIFF;
+  new Uint32Array(sp)[1]=vertexCount;
+  const bp=new Uint32Array([bands.length,vertexCount]);
   const bd=new Float32Array(bands.length*4);
   for(let b=0;b<bands.length;b++){bd[b*4]=bands[b].centerY;bd[b*4+1]=bands[b].targetRadius;bd[b*4+2]=bands[b].stiff;bd[b*4+3]=bands[b].inf;}
   const vacU=new Uint32Array([triCount]);
-  const vapU=new Float32Array([vertexCount,restVolume,VOL_STIFF,restSurfaceArea]);
+  const vapU=new ArrayBuffer(16);
+  new Uint32Array(vapU)[0]=vertexCount;
+  new Float32Array(vapU)[1]=restVolume;
+  new Float32Array(vapU)[2]=VOL_STIFF;
+  new Float32Array(vapU)[3]=restSurfaceArea;
   const zeroB=new Float32Array(triCount),zero1=new Float32Array(1);
 
   srcPos=posA;dstPos=posB;
@@ -445,7 +451,9 @@ async function runPBD_GPU(){
 }
 
 async function runRestore_GPU(){
-  const sp=new Float32Array([SHAPE_STIFF,vertexCount]);
+  const sp=new ArrayBuffer(8);
+  new Float32Array(sp)[0]=SHAPE_STIFF;
+  new Uint32Array(sp)[1]=vertexCount;
   srcPos=posA;dstPos=posB;
   const RESTORE_ITER=30; // fixed high count, not affected by PBD_ITER slider
   for(let iter=0;iter<RESTORE_ITER;iter++){
