@@ -108,6 +108,9 @@ const lineIdxB=mkBuf(lineIndices.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.CO
 const MAX_BANDS=256;
 const bandB=mkBuf(MAX_BANDS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'band');
 const volB=mkBuf(TRI_COUNT*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'vol');
+const VOL_PART_COUNT=Math.ceil(TRI_COUNT/256);
+const volPartB=mkBuf(VOL_PART_COUNT*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volPart');
+const volTotalB=mkBuf(4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volTotal');
 const staging=mkBuf(Math.max(VERT_BYTE,TRI_COUNT*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
 
 // Upload initial data
@@ -145,12 +148,27 @@ struct P{tc:u32}
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){let t=gid.x;if(t>=p.tc){return;}let i0=indices[t*3u];let i1=indices[t*3u+1u];let i2=indices[t*3u+2u];let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;volOut[t]=(p0.x*(p1.y*p2.z-p1.z*p2.y)+p0.y*(p1.z*p2.x-p1.x*p2.z)+p0.z*(p1.x*p2.y-p1.y*p2.x))/6.0;}
 `});
 
+const volReduceCS=device.createShaderModule({label:'volReduce',code:`
+struct P{count:u32}
+@group(0)@binding(0)var<storage,read>src:array<f32>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+var<workgroup>sdata:array<f32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  sdata[lid.x]=select(0.0,src[gid.x],gid.x<p.count);
+  workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sdata[lid.x]+=sdata[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){dst[wg.x]=sdata[0];}
+}
+`});
+
 const volApCS=device.createShaderModule({label:'volAp',code:`
-struct P{vc:u32,push:f32}
+struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
-@group(0)@binding(2)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){let i=gid.x;if(i>=p.vc){return;}let cur=src[i];let r=length(cur.xz);if(r<1e-6){dst[i]=cur;return;}let s=clamp((r+p.push)/r,0.7,1.3);dst[i]=vec4(cur.x*s,cur.y,cur.z*s,1);}
+@group(0)@binding(2)var<storage,read>volTotal:array<f32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){let i=gid.x;if(i>=p.vc){return;}let cur=src[i];let r=length(cur.xz);if(r<1e-6){dst[i]=cur;return;}let curVol=abs(volTotal[0]);let deficit=p.rest-curVol;let push=select(p.stiff*deficit/p.surface,0.0,abs(deficit)<1e-9);let s=clamp((r+push)/r,0.7,1.3);dst[i]=vec4(cur.x*s,cur.y,cur.z*s,1);}
 `});
 
 // Render shaders
@@ -185,13 +203,48 @@ const CS=GPUShaderStage.COMPUTE;
 const shapePipe=cpPipe(shapeCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'shape');
 const bandPipe=cpPipe(bandCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'band');
 const volAccPipe=cpPipe(volAccCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'volAcc');
-const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'volAp');
+const volReducePipe=cpPipe(volReduceCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'volReduce');
+const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'volAp');
+
+// Band radius compute: GPU scans vertices, writes avg radius INTO bandInstBuf[].scale
+const bandRadCS=device.createShaderModule({label:'bandRad',code:`
+struct Band{cy:f32,tr:f32,stiff:f32,inf:f32}
+struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct P{vc:u32,bc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>bands:array<Band>;
+@group(0)@binding(2)var<storage,read_write>inst:array<Inst>;
+@group(0)@binding(3)var<uniform>p:P;
+var<workgroup>sSum:array<f32,256>;
+var<workgroup>sCnt:array<u32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
+  let bandY=bands[b].cy;let thresh=bands[b].inf*0.3;
+  var sumR=f32(0);var cnt=u32(0);
+  var vi=lid.x;
+  while(vi<p.vc){
+    let y=pos[vi].y;
+    if(abs(y-bandY)<thresh){sumR+=length(pos[vi].xz);cnt++;}
+    vi+=256u;
+  }
+  sSum[lid.x]=sumR;sCnt[lid.x]=cnt;workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sSum[lid.x]+=sSum[lid.x+s];sCnt[lid.x]+=sCnt[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){inst[b].scale=select(0.0,sSum[0]/f32(sCnt[0]),sCnt[0]>1u);}
+}
+`});
+const bandRadPipe=cpPipe(bandRadCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'bandRad');
 
 // Uniform buffers
 const shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
 const bandUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
 const volAccUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
-const volApUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+const volReduceUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+const volReduce2UB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+const volApUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+const bandRadUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+// Unified instance buffer: GPU computes radius in-place, CPU writes offset+color once
+const INST_BYTE=MAX_BANDS*24;
+const bandInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandInst');
 
 // Bind groups (ping-pong: AB and BA)
 function mkBG_AB(bgl,fAB,fBA){
@@ -209,9 +262,19 @@ const bandBG=mkBG_AB(bandPipe.bgl,
   (A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:bandB}},{binding:4,resource:{buffer:bandUB}}]
 );
 const volApBG=mkBG_AB(volApPipe.bgl,
-  (A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:volApUB}}],
-  (A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:volApUB}}]
+  (A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}],
+  (A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}]
 );
+// volAcc bind groups: only binding 0 (positions) changes with ping-pong
+const volAccBG_A=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+const volAccBG_B=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+// volReduce level 1: volB → volPartB
+const volRedBG1=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:volB}},{binding:1,resource:{buffer:volPartB}},{binding:2,resource:{buffer:volReduceUB}}]});
+// volReduce level 2: volPartB → volTotalB
+const volRedBG2=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:volPartB}},{binding:1,resource:{buffer:volTotalB}},{binding:2,resource:{buffer:volReduce2UB}}]});
+// Band radius bind groups (posA/posB ping-pong) — writes scale into bandInstBuf
+const bandRadBG_A=device.createBindGroup({layout:bandRadPipe.bgl,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
+const bandRadBG_B=device.createBindGroup({layout:bandRadPipe.bgl,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
 // Render
 const R_BGL=device.createBindGroupLayout({entries:[
   {binding:0,visibility:GPUShaderStage.VERTEX,buffer:{type:'read-only-storage'}},
@@ -224,25 +287,62 @@ const renderBG_B=device.createBindGroup({layout:R_BGL,entries:[{binding:0,resour
 const surfPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL]}),vertex:{module:surfShader,entryPoint:'vs',buffers:[]},fragment:{module:surfShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'back',frontFace:'cw'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
 const wirePipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL]}),vertex:{module:wireShader2,entryPoint:'vs',buffers:[]},fragment:{module:wireShader2,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'line-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
 
-// Preview ring (yellow circle at band height)
-const RING_SEGS=64;
-const ringVerts=[];const ringIdxs=[];
-for(let s=0;s<RING_SEGS;s++){const a=2*Math.PI*s/RING_SEGS;ringVerts.push(Math.cos(a),0,Math.sin(a),1);ringIdxs.push(s,(s+1)%RING_SEGS);}
-const ringVBuf=mkBuf(ringVerts.length*4,GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST,'ringV');
-const ringIBuf=mkBuf(ringIdxs.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST,'ringI');
-queue.writeBuffer(ringVBuf,0,new Float32Array(ringVerts));
-queue.writeBuffer(ringIBuf,0,new Uint32Array(ringIdxs));
-const ringShader=device.createShaderModule({label:'ring',code:`
+// Torus geometry for band/preview rings (3D tube, like WebGL version)
+function buildTorus(majorR,minorR,tubeSegs,radSegs){
+  const p=[],idx=[];
+  for(let i=0;i<=tubeSegs;i++){
+    const u=i/tubeSegs*Math.PI*2, cu=Math.cos(u), su=Math.sin(u);
+    for(let j=0;j<=radSegs;j++){
+      const v=j/radSegs*Math.PI*2, cv=Math.cos(v), sv=Math.sin(v);
+      p.push((majorR+minorR*cv)*cu, minorR*sv, (majorR+minorR*cv)*su);
+    }
+  }
+  const rv=radSegs+1;
+  for(let i=0;i<tubeSegs;i++)for(let j=0;j<radSegs;j++){
+    const a=i*rv+j, b=a+rv, c=a+1, d=b+1;idx.push(a,c,b, b,c,d);
+  }
+  return{positions:new Float32Array(p),indices:new Uint32Array(idx)};
+}
+const torus=buildTorus(1.0,0.03,48,16);
+const torusVBuf=mkBuf(torus.positions.length*4,GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST,'torusV');
+const torusIBuf=mkBuf(torus.indices.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST,'torusI');
+queue.writeBuffer(torusVBuf,0,torus.positions);
+queue.writeBuffer(torusIBuf,0,torus.indices);
+const TORUS_IDX_COUNT=torus.indices.length;
+const torusShader=device.createShaderModule({label:'torus',code:`
 struct U{mvp:mat4x4<f32>,offset:f32,scale:f32,color:vec4<f32>}
 @group(0)@binding(0)var<uniform>u:U;
-@vertex fn vs(@location(0) p:vec4<f32>)->@builtin(position)vec4<f32>{return u.mvp*vec4(p.x*u.scale,u.offset,p.z*u.scale,1);}
+@vertex fn vs(@location(0) p:vec4<f32>)->@builtin(position)vec4<f32>{return u.mvp*vec4(p.x*u.scale,u.offset+p.y,p.z*u.scale,1);}
 @fragment fn fs()->@location(0)vec4<f32>{return u.color;}
 `});
-const ringUB=mkBuf(96,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
-const ringBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'uniform'}}]});
-const ringBG=device.createBindGroup({layout:ringBGL,entries:[{binding:0,resource:{buffer:ringUB}}]});
-const ringPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[ringBGL]}),vertex:{module:ringShader,entryPoint:'vs',buffers:[{arrayStride:16,attributes:[{shaderLocation:0,offset:0,format:'float32x4'}]}]},fragment:{module:ringShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'line-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
+const torusUB=mkBuf(96,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+const torusBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'uniform'}}]});
+const torusBG=device.createBindGroup({layout:torusBGL,entries:[{binding:0,resource:{buffer:torusUB}}]});
+const torusPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusBGL]}),vertex:{module:torusShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}]}]},fragment:{module:torusShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
 let ringVisible=false,ringY=0,ringR=0.4;
+
+// Instanced torus for all bands — ONE draw call, reads radii from bandInstBuf (GPU-computed)
+const torusInstShader=device.createShaderModule({label:'torusInst',code:`
+struct Instance{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct U{mvp:mat4x4<f32>}
+struct VOut{@builtin(position)pos:vec4<f32>,@location(0)col:vec4<f32>}
+@group(0)@binding(0)var<storage,read>instances:array<Instance>;
+@group(0)@binding(1)var<uniform>u:U;
+@vertex fn vs(@location(0) p:vec3<f32>,@builtin(instance_index)ii:u32)->VOut{
+  let inst=instances[ii];
+  var o:VOut;
+  o.pos=u.mvp*vec4(p.x*inst.scale,inst.offset+p.y,p.z*inst.scale,1);
+  o.col=vec4(inst.r,inst.g,inst.b,inst.a);
+  return o;
+}
+@fragment fn fs(in:VOut)->@location(0)vec4<f32>{return in.col;}
+`});
+const torusInstBGL=device.createBindGroupLayout({entries:[
+  {binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'read-only-storage'}},
+  {binding:1,visibility:GPUShaderStage.VERTEX,buffer:{type:'uniform'}},
+]});
+const torusInstBG=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:bandInstBuf}},{binding:1,resource:{buffer:mvpUB}}]});
+const torusInstPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusInstBGL]}),vertex:{module:torusInstShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}],stepMode:'vertex'}]},fragment:{module:torusInstShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
 
 // Depth
 let depthTex=device.createTexture({size:[canvas.width,canvas.height],format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT});
@@ -260,18 +360,22 @@ document.getElementById('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;document.g
 
 // Bands
 const bands=[];
-const bandVisuals=[];
+function writeBandInst(b){
+  const o=b*6;const d=new Float32Array(6);
+  d[0]=bands[b].cy;d[1]=0;d[2]=1;d[3]=0.2;d[4]=0.2;d[5]=0.7;
+  queue.writeBuffer(bandInstBuf,b*24,d);
+}
 function addBand(cy){
   const m=BAND_INF*0.3;cy=Math.max(-ELLI_RY+m,Math.min(ELLI_RY-m,cy));
   const p=geo.positions;let sr=0,c=0;
   for(let i=0;i<vertexCount;i++){if(Math.abs(p[i*3+1]-cy)<BAND_INF*0.3){sr+=Math.sqrt(p[i*3]**2+p[i*3+2]**2);c++;}}
   const cr=c>1?sr/c:ELLI_RX;
   bands.push({cy,targetRadius:cr*BAND_TIGHT,stiff:BAND_STIFF,inf:BAND_INF});
-  bandVisuals.push({cy,radius:cr});
+  writeBandInst(bands.length-1);
   H.bcount.textContent=bands.length;
   console.log('Band added! count:',bands.length,'Y:',cy.toFixed(3),'R:',(cr*BAND_TIGHT).toFixed(3));
 }
-function removeBand(){if(bands.length>0){bands.pop();bandVisuals.pop();H.bcount.textContent=bands.length;}}
+function removeBand(){if(bands.length>0){bands.pop();H.bcount.textContent=bands.length;}}
 
 // Camera
 let camYaw=0.3,camPitch=0.4,camDist=7.0;
@@ -292,69 +396,44 @@ function getMVP(){
 
 // PBD dispatch
 const WG=Math.ceil(vertexCount/256),VWG=Math.ceil(TRI_COUNT/256);
-function dispatchCompute(pipe,bg,wg){
-  const cmd=device.createCommandEncoder();
-  const cp=cmd.beginComputePass();
-  cp.setPipeline(pipe);cp.setBindGroup(0,bg);
-  cp.dispatchWorkgroups(wg,1,1);cp.end();
-  device.queue.submit([cmd.finish()]);
-}
-async function readbackVol(){
-  const sz=TRI_COUNT*4;
-  const enc=device.createCommandEncoder();enc.copyBufferToBuffer(volB,0,staging,0,sz);
-  device.queue.submit([enc.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const d=new Float32Array(staging.getMappedRange().slice(0,sz));staging.unmap();
-  let t=0;for(let i=0;i<TRI_COUNT;i++)t+=d[i];return Math.abs(t);
-}
 
 async function runPBD(){
   const sp=new Float32Array(2);sp[0]=SHAPE_STIFF;sp[1]=vertexCount;
   const bp=new Float32Array(4);bp[0]=bands.length;bp[1]=vertexCount;bp[2]=HARD;bp[3]=0;
   const bd=new Float32Array(MAX_BANDS*4);
   for(let b=0;b<bands.length;b++){bd[b*4]=bands[b].cy;bd[b*4+1]=bands[b].targetRadius;bd[b*4+2]=bands[b].stiff;bd[b*4+3]=bands[b].inf;}
-  const vap=new Float32Array(1);vap[0]=TRI_COUNT;
+  const vacU=new Float32Array(1);vacU[0]=TRI_COUNT;
+  const vredU=new Float32Array(1);vredU[0]=TRI_COUNT;
+  const vapU=new Float32Array(4);vapU[0]=vertexCount;vapU[1]=restVolume;vapU[2]=VOL_STIFF;vapU[3]=restSurfaceArea;
+  const vredU2=new Float32Array(1);vredU2[0]=VOL_PART_COUNT;
 
   srcPos=posA;dstPos=posB;
 
-  // Pre-build volAcc bind groups (avoids createBindGroup per iter)
-  const volAccBG_A=device.createBindGroup({layout:volAccPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}
-  ]});
-  const volAccBG_B=device.createBindGroup({layout:volAccPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}
-  ]});
-
   for(let iter=0;iter<PBD_ITER;iter++){
-    // Shape + Band: band MUST read shape output, so band BG direction is opposite of shape
+    const isA=srcPos===posA;
+    // Write ALL uniforms before the single compute pass
     queue.writeBuffer(shapeUB,0,sp);
     if(bands.length>0){queue.writeBuffer(bandB,0,bd);queue.writeBuffer(bandUB,0,bp);}
+    queue.writeBuffer(volAccUB,0,vacU);
+    queue.writeBuffer(volTotalB,0,new Float32Array(1));
+    queue.writeBuffer(volPartB,0,new Float32Array(VOL_PART_COUNT));
+    queue.writeBuffer(volReduceUB,0,vredU);
+    queue.writeBuffer(volReduce2UB,0,vredU2);
+    queue.writeBuffer(volApUB,0,vapU);
+    // ONE submit: shape → band → volAcc → volReduce L1 → L2 → volAp
     const cmd=device.createCommandEncoder();
-    const cp0=cmd.beginComputePass();
-    // shape: srcPos->dstPos
-    cp0.setPipeline(shapePipe.pipe);cp0.setBindGroup(0,srcPos===posA?shapeBG.AB:shapeBG.BA);cp0.dispatchWorkgroups(WG,1,1);
-    // band: read dstPos (shape output), write srcPos — opposite direction!
-    if(bands.length>0){cp0.setPipeline(bandPipe.pipe);cp0.setBindGroup(0,srcPos===posA?bandBG.BA:bandBG.AB);cp0.dispatchWorkgroups(WG,1,1);}
-    cp0.end();device.queue.submit([cmd.finish()]); swap();
-    if(bands.length>0)swap();
-
-    // Volume accumulate (read from current srcPos)
-    queue.writeBuffer(volB,0,new Float32Array(TRI_COUNT));queue.writeBuffer(volAccUB,0,vap);
-    const cmd2=device.createCommandEncoder();
-    const cp1=cmd2.beginComputePass();
-    cp1.setPipeline(volAccPipe.pipe);cp1.setBindGroup(0,srcPos===posA?volAccBG_A:volAccBG_B);cp1.dispatchWorkgroups(VWG,1,1);
-    cp1.end();device.queue.submit([cmd2.finish()]);
-
-    const curVol=await readbackVol();lastVol=curVol;
-    const deficit=restVolume-curVol;
-    const push=Math.abs(deficit)>1e-9?VOL_STIFF*deficit/restSurfaceArea:0;
-    const vp=new Float32Array(2);vp[0]=vertexCount;vp[1]=push;queue.writeBuffer(volApUB,0,vp);
-    // Volume apply
-    const cmd3=device.createCommandEncoder();
-    const cp2=cmd3.beginComputePass();
-    cp2.setPipeline(volApPipe.pipe);cp2.setBindGroup(0,srcPos===posA?volApBG.AB:volApBG.BA);cp2.dispatchWorkgroups(WG,1,1);
-    cp2.end();device.queue.submit([cmd3.finish()]);
-    swap();
+    const cp=cmd.beginComputePass();
+    // shape: src→dst, then band: dst→src (result in src)
+    cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,isA?shapeBG.AB:shapeBG.BA);cp.dispatchWorkgroups(WG,1,1);
+    if(bands.length>0){cp.setPipeline(bandPipe.pipe);cp.setBindGroup(0,isA?bandBG.BA:bandBG.AB);cp.dispatchWorkgroups(WG,1,1);}
+    // volume reads from srcPos (band result)
+    cp.setPipeline(volAccPipe.pipe);cp.setBindGroup(0,isA?volAccBG_A:volAccBG_B);cp.dispatchWorkgroups(VWG,1,1);
+    cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,volRedBG1);cp.dispatchWorkgroups(VOL_PART_COUNT,1,1);
+    cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,volRedBG2);cp.dispatchWorkgroups(1,1,1);
+    // volAp: src→dst, result in dstPos
+    cp.setPipeline(volApPipe.pipe);cp.setBindGroup(0,isA?volApBG.AB:volApBG.BA);cp.dispatchWorkgroups(WG,1,1);
+    cp.end();device.queue.submit([cmd.finish()]);
+    swap(); // result now in srcPos for next iteration
   }
 }
 
@@ -437,20 +516,25 @@ window.onkeydown=e=>{if(e.key.toLowerCase()==='r')removeBand();};
 window.onresize=()=>{canvas.width=window.innerWidth;canvas.height=window.innerHeight;canvas.style.width=canvas.width+'px';canvas.style.height=canvas.height+'px';depthTex=device.createTexture({size:[canvas.width,canvas.height],format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT});};
 
 async function updateBandVisuals(){
-  if(bandVisuals.length===0)return;
+  if(bands.length===0)return;
+  const bc=bands.length;
+  // Write band data
+  const bd2=new Float32Array(MAX_BANDS*4);
+  for(let b=0;b<bc;b++){bd2[b*4]=bands[b].cy;bd2[b*4+1]=bands[b].targetRadius;bd2[b*4+2]=bands[b].stiff;bd2[b*4+3]=bands[b].inf;}
+  queue.writeBuffer(bandB,0,bd2);
+  const u=new Uint32Array(2);u[0]=vertexCount;u[1]=bc;
+  queue.writeBuffer(bandRadUB,0,u);
+  // Dispatch GPU scan: writes avg radius directly into bandInstBuf[].scale
   const enc=device.createCommandEncoder();
-  enc.copyBufferToBuffer(srcPos,0,staging,0,VERT_BYTE);
+  const cp=enc.beginComputePass();
+  cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,srcPos===posA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bc,1,1);
+  cp.end();
+  enc.copyBufferToBuffer(volTotalB,0,staging,0,4);
   device.queue.submit([enc.finish()]);
+  // Only read back volume for HUD (radii stay on GPU in bandInstBuf)
   await staging.mapAsync(GPUMapMode.READ);
-  const raw=new Float32Array(staging.getMappedRange().slice(0,VERT_BYTE));
-  const pos=new Float32Array(raw); staging.unmap();
-  const n=bandVisuals.length, threshold=BAND_INF*0.3;
-  const sumR=new Float32Array(n), cnt=new Uint32Array(n);
-  for(let i=0;i<vertexCount;i++){
-    const i4=i*4, y=pos[i4+1], r=Math.sqrt(pos[i4]**2+pos[i4+2]**2);
-    for(let b=0;b<n;b++){if(Math.abs(y-bandVisuals[b].cy)<threshold){sumR[b]+=r;cnt[b]++;}}
-  }
-  for(let b=0;b<n;b++){if(cnt[b]>1)bandVisuals[b].radius=sumR[b]/cnt[b];}
+  lastVol=Math.abs(new Float32Array(staging.getMappedRange().slice(0,4))[0]);
+  staging.unmap();
 }
 const clock={last:performance.now()};
 async function animate(){
@@ -462,28 +546,25 @@ async function animate(){
   const mvp=getMVP();queue.writeBuffer(mvpUB,0,mvp);
   const tv=context.getCurrentTexture().createView();
   const dv=depthTex.createView();
-  // Main pass: surface + wireframe + preview ring
+  // Main pass: surface + wireframe + preview ring + ALL band toruses
   const cmd=device.createCommandEncoder();
   const rp=cmd.beginRenderPass({colorAttachments:[{view:tv,clearValue:[0.07,0.07,0.13,1],loadOp:'clear',storeOp:'store'}],depthStencilAttachment:{view:dv,depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'store'}});
   const rbg=srcPos===posA?renderBG_A:renderBG_B;
   rp.setPipeline(surfPipe);rp.setBindGroup(0,rbg);rp.setIndexBuffer(idxB,'uint32');rp.drawIndexed(TRI_COUNT*3);
   rp.setPipeline(wirePipe);rp.setBindGroup(0,rbg);rp.setIndexBuffer(lineIdxB,'uint32');rp.drawIndexed(lineIndices.length);
+  // Preview ring (single torus)
   if(ringVisible){
-    const ru=new Float32Array(24);ru.set(mvp,0);ru[16]=ringY;ru[17]=ringR;ru[18]=0;ru[19]=0;ru[20]=1;ru[21]=1;ru[22]=0;ru[23]=0.8;
-    queue.writeBuffer(ringUB,0,ru);
-    rp.setPipeline(ringPipe);rp.setBindGroup(0,ringBG);rp.setVertexBuffer(0,ringVBuf);rp.setIndexBuffer(ringIBuf,'uint32');rp.drawIndexed(ringIdxs.length);
+    const ru=new Float32Array(24);ru.set(mvp,0);ru[16]=ringY;ru[17]=ringR;ru[18]=0;ru[19]=0;ru[20]=1;ru[21]=1;ru[22]=0;ru[23]=0.6;
+    queue.writeBuffer(torusUB,0,ru);
+    rp.setPipeline(torusPipe);rp.setBindGroup(0,torusBG);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_IDX_COUNT);
+  }
+  // All band toruses — ONE instanced draw, radii from GPU bandInstBuf
+  if(bands.length>0){
+    rp.setPipeline(torusInstPipe);rp.setBindGroup(0,torusInstBG);
+    rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');
+    rp.drawIndexed(TORUS_IDX_COUNT,bands.length);
   }
   rp.end();device.queue.submit([cmd.finish()]);
-
-  // Band rings — each in own pass so uniforms don't overwrite
-  for(const bv of bandVisuals){
-    const ru=new Float32Array(24);ru.set(mvp,0);ru[16]=bv.cy;ru[17]=bv.radius;ru[18]=0;ru[19]=0;ru[20]=1;ru[21]=0.2;ru[22]=0.2;ru[23]=0.8;
-    queue.writeBuffer(ringUB,0,ru);
-    const bcmd=device.createCommandEncoder();
-    const brp=bcmd.beginRenderPass({colorAttachments:[{view:tv,loadOp:'load',storeOp:'store'}],depthStencilAttachment:{view:dv,depthLoadOp:'load',depthStoreOp:'store'}});
-    brp.setPipeline(ringPipe);brp.setBindGroup(0,ringBG);brp.setVertexBuffer(0,ringVBuf);brp.setIndexBuffer(ringIBuf,'uint32');brp.drawIndexed(ringIdxs.length);
-    brp.end();device.queue.submit([bcmd.finish()]);
-  }
 
   H.fps.textContent=Math.round(1/dt);
   H.framems.textContent=(performance.now()-now).toFixed(1);
