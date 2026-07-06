@@ -109,9 +109,6 @@ let lastVol=0,pbdConverged=false,convergeFrames=0,needsRestore=false;
 let pbdAccumTime=0;
 let CONVERGE_FRAMES=5;
 
-// Position readback buffer for updating Three.js geometry
-let posReadback;
-
 function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
 
 // Slider wiring
@@ -200,23 +197,43 @@ function updateBandRings(){
 }
 
 // Update actual band ring scales from deformed positions (called after PBD)
-function updateBandActualRadii(){
-  if(!posReadback||bands.length===0)return;
+// Uses a small GPU→CPU readback for band radius data only (~1KB)
+async function updateBandActualRadii(){
+  if(bands.length===0||!srcPos)return;
+  // Sample vertices near each band's Y for radius computation
+  // Read ~1000 vertices (16KB) to compute band radii
+  const SAMPLE_COUNT = Math.min(vertexCount, 1000);
+  const sampleStride = Math.max(1, Math.floor(vertexCount / SAMPLE_COUNT));
+  const sampleSize = SAMPLE_COUNT * 4 * 4; // vec4 = 16 bytes each
+  const bandStaging = mkBuf(sampleSize, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, 'bandStaging');
+  
+  const cmd = device.createCommandEncoder();
+  // Copy strided samples from srcPos to staging
+  for(let s = 0; s < SAMPLE_COUNT; s++){
+    const vi = Math.min(s * sampleStride, vertexCount - 1);
+    cmd.copyBufferToBuffer(srcPos, vi * 4 * 4, bandStaging, s * 4 * 4, 4 * 4);
+  }
+  device.queue.submit([cmd.finish()]);
+  await bandStaging.mapAsync(GPUMapMode.READ);
+  const samples = new Float32Array(bandStaging.getMappedRange(0, sampleSize));
+  
   for(let i=0;i<bands.length;i++){
     if(i>=bandRingGroup.children.length)break;
     const b=bands[i];
     const thresh=b.inf*0.3;
     let sumR=0,cnt=0;
-    for(let v=0;v<vertexCount;v++){
-      const y=posReadback[v*3+1];
+    for(let s=0;s<SAMPLE_COUNT;s++){
+      const y=samples[s*4+1];
       if(Math.abs(y-b.centerY)<thresh){
-        sumR+=Math.sqrt(posReadback[v*3]**2+posReadback[v*3+2]**2);
+        sumR+=Math.sqrt(samples[s*4]**2+samples[s*4+2]**2);
         cnt++;
       }
     }
     const actualR=cnt>1?sumR/cnt:getRadiusAtY(b.centerY);
     bandRingGroup.children[i].scale.setScalar(actualR);
   }
+  bandStaging.unmap();
+  bandStaging.destroy();
 }
 
 // Update target (green) ring scales when target radius slider changes
@@ -309,6 +326,60 @@ struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
 }
 `});
 
+// Normal recompute shader — recalculates smooth vertex normals from deformed positions
+const normCS=device.createShaderModule({label:'norm',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read>adjOff:array<u32>;
+@group(0)@binding(3)var<storage,read>adjData:array<u32>;
+@group(0)@binding(4)var<storage,read_write>norms:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let vi=gid.x;if(vi>=p.vc){return;}
+  let start=adjOff[vi];let end=adjOff[vi+1u];
+  var sumN=vec3<f32>(0.0);
+  for(var j=start;j<end;j++){
+    let ti=adjData[j];
+    let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+    let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
+    sumN+=normalize(cross(p1-p0,p2-p0));
+  }
+  let N=normalize(sumN);
+  norms[vi]=vec4<f32>(N,0.0);
+}
+`});
+
+// Unpack vec4 normals to flat float array for GPU→GPU copy to Three.js
+const normUnpackCS=device.createShaderModule({label:'normUnpack',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let v=src[i];
+  dst[i*3u]=v.x;
+  dst[i*3u+1u]=v.y;
+  dst[i*3u+2u]=v.z;
+}
+`});
+
+// Unpack vec4 positions to flat vec3 for GPU→GPU copy to Three.js (Three.js uses 12 bytes/vertex)
+const posUnpackCS=device.createShaderModule({label:'posUnpack',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let v=src[i];
+  dst[i*3u]=v.x;
+  dst[i*3u+1u]=v.y;
+  dst[i*3u+2u]=v.z;
+}
+`});
+
 // ── Compute Pipelines ──
 function cpPipe(shader,entry,bgEntries,label){
   const bgl=device.createBindGroupLayout({entries:bgEntries});
@@ -325,6 +396,9 @@ const bandPipe=cpPipe(bandCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),
 const volAccPipe=cpPipe(volAccCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'volAcc');
 const volReducePipe=cpPipe(volReduceCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'volReduce');
 const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'volAp');
+const normPipe=cpPipe(normCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'norm');
+const normUnpackPipe=cpPipe(normUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'normUnpack');
+const posUnpackPipe=cpPipe(posUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'posUnpack');
 
 const shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
 const bandUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandU');
@@ -373,6 +447,21 @@ async function loadModel(){
   console.log('✅ 菠萝:',vertexCount.toLocaleString(),'顶点,',Math.round(triCount).toLocaleString(),'三角形');
   console.log('   restVolume:',restVolume.toFixed(4),'restSurfaceArea:',restSurfaceArea.toFixed(2));
 
+  // Build vertex→triangle adjacency for GPU normal recomputation
+  const adjLists = new Array(vertexCount);
+  for (let i = 0; i < vertexCount; i++) adjLists[i] = [];
+  for (let t = 0; t < idxArr.length; t += 3) {
+    const a = idxArr[t], b = idxArr[t+1], c = idxArr[t+2];
+    adjLists[a].push(t / 3); adjLists[b].push(t / 3); adjLists[c].push(t / 3);
+  }
+  const adjOffsets = new Uint32Array(vertexCount + 1);
+  let totalAdj = 0;
+  for (let i = 0; i < vertexCount; i++) { adjOffsets[i] = totalAdj; totalAdj += adjLists[i].length; }
+  adjOffsets[vertexCount] = totalAdj;
+  const adjData = new Uint32Array(totalAdj);
+  let cursor = 0;
+  for (let i = 0; i < vertexCount; i++) for (const t of adjLists[i]) adjData[cursor++] = t;
+
   // ── Create Three.js mesh with the model's original material ──
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos.slice(), 3));
@@ -387,21 +476,25 @@ async function loadModel(){
   scene.add(pineappleMesh);
 
   buildRadiusProfile(pos);
-  initPBD(pos,idxArr);
+  initPBD(pos,idxArr,adjOffsets,adjData);
 }
 loadModel().catch(e=>console.error('加载失败:',e));
 
 // ═══════ GPU PBD Init ═══════
 let shapeBG_AB,shapeBG_BA,bandBG_AB,bandBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B;
+let normBG_A,normBG_B,normUnpackBG_A,normUnpackBG_B,normB,norm3B,normUB;
+let pos3B,posUnpackBG_A,posUnpackBG_B;
 
-function initPBD(posArr,idxArr){
+function initPBD(posArr,idxArr,adjOffsets,adjData){
   WG=Math.ceil(vertexCount/256);VWG=Math.ceil(triCount/256);
   const VB=vertexCount*4*4;
+  const N3B=vertexCount*3*4;  // vec3 = 12 bytes per vertex
   posA=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posA');
   posB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posB');
   restB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'rest');
   idxB=mkBuf(idxArr.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'idx');
   bandB=mkBuf(MAX_BANDS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'band');
+  normB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'norm');
 
   const pos4=new Float32Array(vertexCount*4);
   for(let i=0;i<vertexCount;i++){pos4[i*4]=posArr[i*3];pos4[i*4+1]=posArr[i*3+1];pos4[i*4+2]=posArr[i*3+2];pos4[i*4+3]=1;}
@@ -420,12 +513,36 @@ function initPBD(posArr,idxArr){
       lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:db}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);srcCount=dc;srcBuf=db;}
   }
 
-  // Staging buffer for volume + position readback
-  const stagingSize = Math.max(VB, 4);
-  staging=mkBuf(stagingSize,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
-  
-  // Separate staging for position readback (for Three.js)
-  posReadback = new Float32Array(vertexCount * 3);
+  // Staging buffer for volume readback only (positions go GPU→GPU to Three.js)
+  staging=mkBuf(4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+
+  // Adjacency buffers for GPU normal recomputation
+  const adjOffB=mkBuf(adjOffsets.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'adjOff');
+  const adjDataB=mkBuf(adjData.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'adjData');
+  queue.writeBuffer(adjOffB,0,adjOffsets);
+  queue.writeBuffer(adjDataB,0,adjData);
+
+  // Normal buffer (vec4) for normCS output
+  norm3B=mkBuf(N3B,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'norm3');
+  normUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'normU');
+  queue.writeBuffer(normUB,0,new Uint32Array([vertexCount]));
+
+  // Normal recompute bind groups
+  normBG_A=device.createBindGroup({layout:normPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:adjOffB}},{binding:3,resource:{buffer:adjDataB}},{binding:4,resource:{buffer:normB}},{binding:5,resource:{buffer:normUB}}]});
+  normBG_B=device.createBindGroup({layout:normPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:adjOffB}},{binding:3,resource:{buffer:adjDataB}},{binding:4,resource:{buffer:normB}},{binding:5,resource:{buffer:normUB}}]});
+  normUnpackBG_A=device.createBindGroup({layout:normUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:normB}},{binding:1,resource:{buffer:norm3B}},{binding:2,resource:{buffer:normUB}}]});
+  normUnpackBG_B=device.createBindGroup({layout:normUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:normB}},{binding:1,resource:{buffer:norm3B}},{binding:2,resource:{buffer:normUB}}]});
+
+  // Position unpack buffers for GPU→GPU copy to Three.js (vec4→vec3)
+  pos3B=mkBuf(N3B,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'pos3');
+  posUnpackBG_A=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:pos3B}},{binding:2,resource:{buffer:normUB}}]});
+  posUnpackBG_B=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:pos3B}},{binding:2,resource:{buffer:normUB}}]});
 
   // Compute bind groups
   const mkBG2=(bgl,fAB,fBA)=>({AB:device.createBindGroup({layout:bgl,entries:fAB(posA,posB)}),BA:device.createBindGroup({layout:bgl,entries:fBA(posA,posB)})});
@@ -480,7 +597,7 @@ async function runPBD_GPU(){
     swap();
   }
 
-  // Read back volume (4 bytes)
+  // Read back volume (4 bytes only — positions go GPU→GPU)
   {
     const cmd=device.createCommandEncoder();
     cmd.copyBufferToBuffer(volTotalB,0,staging,0,4);
@@ -490,20 +607,34 @@ async function runPBD_GPU(){
   lastVol=Math.abs(new Float32Array(staging.getMappedRange(0,4))[0]);
   staging.unmap();
 
-  // Read back positions for Three.js (separate staging to avoid conflict)
+  // GPU normal + position unpack for Three.js
   {
     const cmd=device.createCommandEncoder();
-    cmd.copyBufferToBuffer(srcPos,0,staging,0,vertexCount*4*4);
-    device.queue.submit([cmd.finish()]);
+    const cp=cmd.beginComputePass();
+    cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,srcPos===posA?normBG_A:normBG_B);cp.dispatchWorkgroups(WG,1,1);
+    cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,srcPos===posA?normUnpackBG_A:normUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
+    cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,srcPos===posA?posUnpackBG_A:posUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
+    cp.end();device.queue.submit([cmd.finish()]);
   }
-  await staging.mapAsync(GPUMapMode.READ);
-  const mappedPositions = new Float32Array(staging.getMappedRange(0, vertexCount*4*4));
-  for(let i=0;i<vertexCount;i++){
-    posReadback[i*3] = mappedPositions[i*4];
-    posReadback[i*3+1] = mappedPositions[i*4+1];
-    posReadback[i*3+2] = mappedPositions[i*4+2];
+
+  // GPU→GPU copy: unpacked positions (vec3) → Three.js vertex buffer
+  if(pineappleMesh){
+    const posAttr = pineappleMesh.geometry.attributes.position;
+    const posData = renderer.backend.get(posAttr);
+    if(posData&&posData.buffer){
+      const cmd=device.createCommandEncoder();
+      cmd.copyBufferToBuffer(pos3B,0,posData.buffer,0,vertexCount*3*4);
+      device.queue.submit([cmd.finish()]);
+    }
+    // GPU→GPU copy: unpacked normals (vec3) → Three.js normal buffer
+    const normAttr = pineappleMesh.geometry.attributes.normal;
+    const normData = renderer.backend.get(normAttr);
+    if(normData&&normData.buffer){
+      const cmd=device.createCommandEncoder();
+      cmd.copyBufferToBuffer(norm3B,0,normData.buffer,0,vertexCount*3*4);
+      device.queue.submit([cmd.finish()]);
+    }
   }
-  staging.unmap();
 
   H.vratio.textContent=(lastVol/restVolume*100).toFixed(1);
   return performance.now()-t0;
@@ -653,12 +784,10 @@ async function animate(){
     convergeFrames++;
     if(convergeFrames>=CONVERGE_FRAMES){pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';}
     
-    // Update Three.js geometry with new positions
-    if(pineappleMesh&&posReadback){
-      pineappleMesh.geometry.attributes.position.array.set(posReadback);
-      pineappleMesh.geometry.attributes.position.needsUpdate = true;
-      pineappleMesh.geometry.computeVertexNormals();
-      updateBandActualRadii();
+    // GPU-to-GPU copy already done inside runPBD_GPU (positions + normals)
+    // Do NOT set needsUpdate=true — that would overwrite our GPU data with stale CPU array
+    if(pineappleMesh){
+      await updateBandActualRadii();
     }
   }else if(bands.length>0&&pbdConverged){
     H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';
@@ -666,6 +795,7 @@ async function animate(){
     await runRestore_GPU();
     H.pbdtime.textContent='已恢复 ✓';
     if(pineappleMesh){
+      // Restore Three.js buffers from CPU rest data
       pineappleMesh.geometry.attributes.position.array.set(restPositions);
       pineappleMesh.geometry.attributes.position.needsUpdate = true;
       pineappleMesh.geometry.computeVertexNormals();
