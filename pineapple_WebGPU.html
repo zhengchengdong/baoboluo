@@ -79,6 +79,16 @@ canvas.style.width=canvas.width+'px';canvas.style.height=canvas.height+'px';
 const canvasFormat=navigator.gpu.getPreferredCanvasFormat();
 context.configure({device,format:canvasFormat,alphaMode:'premultiplied'});
 
+// MSAA
+const SAMPLE_COUNT=4;
+let msaaColorTex,msaaDepthTex;
+function createMSAATextures(){
+  const w=canvas.width,h=canvas.height;
+  msaaColorTex=device.createTexture({size:[w,h],format:canvasFormat,sampleCount:SAMPLE_COUNT,usage:GPUTextureUsage.RENDER_ATTACHMENT});
+  msaaDepthTex=device.createTexture({size:[w,h],format:'depth24plus',sampleCount:SAMPLE_COUNT,usage:GPUTextureUsage.RENDER_ATTACHMENT});
+}
+createMSAATextures();
+
 // ═══════ State ═══════
 let vertexCount=0,triCount=0,restVolume=0,restSurfaceArea=0;
 let bboxRx=0.8,bboxRy=1.5,bboxRz=0.8,modelMinY=-1.5,modelMaxY=1.5; // updated after model loads
@@ -254,6 +264,30 @@ struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
 }
 `});
 
+// Normal recompute shader — recalculates smooth vertex normals from deformed positions
+const normCS=device.createShaderModule({label:'norm',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read>adjOff:array<u32>;
+@group(0)@binding(3)var<storage,read>adjData:array<u32>;
+@group(0)@binding(4)var<storage,read_write>norms:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let vi=gid.x;if(vi>=p.vc){return;}
+  let start=adjOff[vi];let end=adjOff[vi+1u];
+  var sumN=vec3<f32>(0.0);
+  for(var j=start;j<end;j++){
+    let ti=adjData[j];
+    let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+    let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
+    sumN+=normalize(cross(p1-p0,p2-p0));
+  }
+  let N=normalize(sumN);
+  norms[vi]=vec4<f32>(N,0.0);
+}
+`});
+
 // Render shaders
 const surfShader=device.createShaderModule({label:'surf',code:`
 struct U{mvp:mat4x4<f32>,camPos:vec4<f32>}
@@ -301,7 +335,10 @@ fn perturbNormal(N: vec3<f32>, p: vec3<f32>, uv: vec2<f32>, normalSample: vec3<f
   let B_norm = B * invmax;
   
   let mapN = normalSample * 2.0 - 1.0;
-  return normalize(T_norm * mapN.x + B_norm * mapN.y + N * mapN.z);
+  // Reduce normal map intensity to suppress texel-level aliasing at extreme close-up
+  // (Three.js achieves this via mipmaps; we compensate with a global scale)
+  let nmStr = 0.7;
+  return normalize(T_norm * mapN.x * nmStr + B_norm * mapN.y * nmStr + N * mapN.z);
 }
 
 fn DistributionGGX(N: vec3<f32>, H: vec3<f32>, roughness: f32) -> f32 {
@@ -335,15 +372,13 @@ fn FresnelSchlick(cosTheta: f32, F0: vec3<f32>) -> vec3<f32> {
   let metalRough = textureSample(t_metal_rough, s, in.uv).rgb;
   
   let metallic = metalRough.b;
-  let roughness = max(metalRough.g, 0.05);
+  // Higher roughness floor to suppress specular aliasing from normal map detail
+  let roughness = max(metalRough.g, 0.1);
   
-  // Compute geometric normal from deformed positions via screen-space derivatives.
-  // This correctly reflects PBD deformation — unlike the static vertex normals
-  // which are never updated after the mesh is squeezed by bands.
+  // Smooth vertex normal (recomputed from deformed positions by normCS each frame)
   let worldPos = in.worldPos;
   let V = normalize(u.camPos.xyz - worldPos);
-  let geoN = normalize(cross(dpdx(worldPos), dpdy(worldPos)));
-  let N = select(-geoN, geoN, dot(geoN, V) >= 0.0);
+  let N = normalize(in.normal);
   let perturbedN = perturbNormal(N, worldPos, in.uv, normalSample);
   
   var F0 = vec3<f32>(0.04);
@@ -351,7 +386,7 @@ fn FresnelSchlick(cosTheta: f32, F0: vec3<f32>) -> vec3<f32> {
   
   // Lights — single white directional from above (matches index.html)
   // DirectionalLight('#fff', 1.5) at y=5 → direction (0,1,0) toward light
-  let L_dir = normalize(vec3<f32>(0.15, 1.0, 0.0));
+  let L_dir = normalize(vec3<f32>(0.0, 1.0, 0.0));  // straight down, matches index.html DirectionalLight at y=5
   let L_color = vec3<f32>(1.5, 1.5, 1.5);
   
   let L = L_dir;
@@ -367,7 +402,7 @@ fn FresnelSchlick(cosTheta: f32, F0: vec3<f32>) -> vec3<f32> {
   var kD = vec3<f32>(1.0) - kS;
   kD *= 1.0 - metallic;
   
-  let specular = (D * G * F) / (4.0 * NdotV * NdotL + 0.0001);
+  let specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.004);  // clamp denominator to suppress fireflies in crevices
   var Lo = (kD * albedo / PI + specular) * L_color * NdotL;
   
   // Ambient (matches index.html AmbientLight('#fff', 0.5))
@@ -617,6 +652,21 @@ async function loadModel(){
   console.log('✅ 菠萝:',vertexCount.toLocaleString(),'顶点,',Math.round(triCount).toLocaleString(),'三角形');
   console.log('   restVolume:',restVolume.toFixed(4),'restSurfaceArea:',restSurfaceArea.toFixed(2));
 
+  // Build vertex→triangle adjacency for GPU normal recomputation
+  const adjLists = new Array(vertexCount);
+  for (let i = 0; i < vertexCount; i++) adjLists[i] = [];
+  for (let t = 0; t < idxArr.length; t += 3) {
+    const a = idxArr[t], b = idxArr[t+1], c = idxArr[t+2];
+    adjLists[a].push(t / 3); adjLists[b].push(t / 3); adjLists[c].push(t / 3);
+  }
+  const adjOffsets = new Uint32Array(vertexCount + 1);
+  let totalAdj = 0;
+  for (let i = 0; i < vertexCount; i++) { adjOffsets[i] = totalAdj; totalAdj += adjLists[i].length; }
+  adjOffsets[vertexCount] = totalAdj;
+  const adjData = new Uint32Array(totalAdj);
+  let cursor = 0;
+  for (let i = 0; i < vertexCount; i++) for (const t of adjLists[i]) adjData[cursor++] = t;
+
   // Extract PBR textures from model material
   let texAlbedo = null, texNormal = null, texMetalRough = null, gpuSampler = null;
   
@@ -679,7 +729,7 @@ async function loadModel(){
   }
 
   buildRadiusProfile(pos);
-  initGPU(pos,norms,uvs,idxArr,texAlbedo,texNormal,texMetalRough,gpuSampler);
+  initGPU(pos,norms,uvs,idxArr,adjOffsets,adjData,texAlbedo,texNormal,texMetalRough,gpuSampler);
 
   // Wireframe index buffer
   const lineIdx=[];
@@ -695,7 +745,7 @@ loadModel().catch(e=>console.error('加载失败:',e));
 let shapeBG_AB,shapeBG_BA,bandBG_AB,bandBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B,bandRadBG_A,bandRadBG_B;
 let volRedBGs=[];
 
-function initGPU(posArr,normArr,uvArr,idxArr,texAlbedo,texNormal,texMetalRough,gpuSampler){
+function initGPU(posArr,normArr,uvArr,idxArr,adjOffsets,adjData,texAlbedo,texNormal,texMetalRough,gpuSampler){
   WG=Math.ceil(vertexCount/256);VWG=Math.ceil(triCount/256);
   const VB=vertexCount*4*4;
   posA=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posA');
@@ -726,6 +776,19 @@ function initGPU(posArr,normArr,uvArr,idxArr,texAlbedo,texNormal,texMetalRough,g
   }
 
   staging=mkBuf(Math.max(VB,4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+
+  // Adjacency buffers for normal recomputation
+  const adjOffB=mkBuf(adjOffsets.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'adjOff');
+  const adjDataB=mkBuf(adjData.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'adjData');
+  queue.writeBuffer(adjOffB,0,adjOffsets);
+  queue.writeBuffer(adjDataB,0,adjData);
+  const normUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'normU');
+  queue.writeBuffer(normUB,0,new Uint32Array([vertexCount]));
+  const normPipe=cpPipe(normCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'norm');
+  const normBG_A=device.createBindGroup({layout:normPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:adjOffB}},{binding:3,resource:{buffer:adjDataB}},{binding:4,resource:{buffer:normB}},{binding:5,resource:{buffer:normUB}}]});
+  const normBG_B=device.createBindGroup({layout:normPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:adjOffB}},{binding:3,resource:{buffer:adjDataB}},{binding:4,resource:{buffer:normB}},{binding:5,resource:{buffer:normUB}}]});
 
   // Compute bind groups
   const mkBG2=(bgl,fAB,fBA)=>({AB:device.createBindGroup({layout:bgl,entries:fAB(posA,posB)}),BA:device.createBindGroup({layout:bgl,entries:fBA(posA,posB)})});
@@ -774,11 +837,11 @@ function initGPU(posArr,normArr,uvArr,idxArr,texAlbedo,texNormal,texMetalRough,g
     {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:normB}},{binding:2,resource:{buffer:uvB}},
     {binding:3,resource:{buffer:mvpUB}},{binding:4,resource:viewAlbedo},{binding:5,resource:viewNormal},
     {binding:6,resource:viewMetalRough},{binding:7,resource:finalSampler}]});
-  surfPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL_surf]}),vertex:{module:surfShader,entryPoint:'vs',buffers:[]},fragment:{module:surfShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'back',frontFace:'cw'},depthStencil:{format:'depth24plus',depthWriteEnabled:true,depthCompare:'less'}});
+  surfPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL_surf]}),vertex:{module:surfShader,entryPoint:'vs',buffers:[]},fragment:{module:surfShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'back',frontFace:'cw'},multisample:{count:SAMPLE_COUNT},depthStencil:{format:'depth24plus',depthWriteEnabled:true,depthCompare:'less'}});
 
   const wireBG_A=device.createBindGroup({layout:R_BGL_wire,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:mvpUB}}]});
   const wireBG_B=device.createBindGroup({layout:R_BGL_wire,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:mvpUB}}]});
-  wirePipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL_wire]}),vertex:{module:wireShader,entryPoint:'vs',buffers:[]},fragment:{module:wireShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'line-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
+  wirePipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[R_BGL_wire]}),vertex:{module:wireShader,entryPoint:'vs',buffers:[]},fragment:{module:wireShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'line-list',cullMode:'none'},multisample:{count:SAMPLE_COUNT},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
 
   // Torus pipelines
   torusVBuf=mkBuf(torus.positions.length*4,GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST,'torusV');
@@ -787,19 +850,19 @@ function initGPU(posArr,normArr,uvArr,idxArr,texAlbedo,texNormal,texMetalRough,g
   torusUB=mkBuf(96,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'torusU');
   const torusBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'uniform'}}]});
   torusBG=device.createBindGroup({layout:torusBGL,entries:[{binding:0,resource:{buffer:torusUB}}]});
-  torusPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusBGL]}),vertex:{module:torusSingleShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}]}]},fragment:{module:torusSingleShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'always'}});
+  torusPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusBGL]}),vertex:{module:torusSingleShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}]}]},fragment:{module:torusSingleShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},multisample:{count:SAMPLE_COUNT},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'always'}});
 
   // Instanced torus bind groups for band rings
   const torusInstBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'read-only-storage'}},{binding:1,visibility:GPUShaderStage.VERTEX,buffer:{type:'uniform'}}]});
   const torusInstBG=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:bandInstBuf}},{binding:1,resource:{buffer:mvpUB}}]});
   const targetInstBG=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:targetInstBuf}},{binding:1,resource:{buffer:mvpUB}}]});
-  const torusInstPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusInstBGL]}),vertex:{module:torusInstShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}],stepMode:'vertex'}]},fragment:{module:torusInstShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'always'}});
+  const torusInstPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusInstBGL]}),vertex:{module:torusInstShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}],stepMode:'vertex'}]},fragment:{module:torusInstShader,entryPoint:'fs',targets:[{format:canvasFormat,blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'},multisample:{count:SAMPLE_COUNT},depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'always'}});
 
   srcPos=posA;dstPos=posB;lastVol=restVolume;
   console.log('⚡ 纯GPU PBD 就绪. Verts:',vertexCount.toLocaleString(),'Tris:',Math.round(triCount).toLocaleString(),'WG:',WG,'VWG:',VWG,'VolRed:',volRedLevels.length);
 
   // Keep render references accessible from animation loop
-  window._gpu={bandInstBuf,targetInstBuf,torusInstBG,targetInstBG,torusInstPipe};
+  window._gpu={bandInstBuf,targetInstBuf,torusInstBG,targetInstBG,torusInstPipe,normPipe,normBG_A,normBG_B};
   window._wire={wireBG_A,wireBG_B};
 }
 
@@ -872,10 +935,7 @@ canvas.onmousemove=e=>{
 };
 canvas.onwheel=e=>{e.preventDefault();let d=e.deltaY;if(e.deltaMode===1)d*=40;if(e.deltaMode===2)d*=800;camDist=Math.max(1.5,Math.min(15,camDist*(1+d*0.001)));},{passive:false};
 window.onkeydown=e=>{if(e.key.toLowerCase()==='r')removeBand();};
-window.onresize=()=>{canvas.width=window.innerWidth;canvas.height=window.innerHeight;canvas.style.width=canvas.width+'px';canvas.style.height=canvas.height+'px';depthTex=device.createTexture({size:[canvas.width,canvas.height],format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT});};
-
-// ═══════ Depth texture ═══════
-let depthTex=device.createTexture({size:[canvas.width,canvas.height],format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT});
+window.onresize=()=>{canvas.width=window.innerWidth;canvas.height=window.innerHeight;canvas.style.width=canvas.width+'px';canvas.style.height=canvas.height+'px';createMSAATextures();};
 
 // ═══════ Band visual writer ═══════
 function writeBandInstances(){
@@ -893,7 +953,6 @@ function writeBandInstances(){
 
 // ═══════ Animation loop ═══════
 const clock={last:performance.now()};
-let depthTexValid=true;
 
 async function animate(){
   const now=performance.now(),dt=Math.min((now-clock.last)/1000,0.1);clock.last=now;
@@ -923,6 +982,18 @@ async function animate(){
     H.pbdtime.textContent='空闲';
   }
 
+  // Recompute smooth vertex normals from deformed positions
+  if(window._gpu&&window._gpu.normPipe){
+    const nbg=srcPos===posA?window._gpu.normBG_A:window._gpu.normBG_B;
+    const ncmd=device.createCommandEncoder();
+    const ncp=ncmd.beginComputePass();
+    ncp.setPipeline(window._gpu.normPipe.pipe);
+    ncp.setBindGroup(0,nbg);
+    ncp.dispatchWorkgroups(WG,1,1);
+    ncp.end();
+    device.queue.submit([ncmd.finish()]);
+  }
+
   // Render
   const mvp=getMVP();
   const ex=camDist*Math.sin(camYaw)*Math.cos(camPitch),ey=camDist*Math.sin(camPitch),ez=camDist*Math.cos(camYaw)*Math.cos(camPitch);
@@ -930,9 +1001,8 @@ async function animate(){
   mvpData.set(mvp,0);mvpData[16]=ex;mvpData[17]=ey;mvpData[18]=ez;mvpData[19]=1.0;
   queue.writeBuffer(mvpUB,0,mvpData);
   const tv=context.getCurrentTexture().createView();
-  const dv=depthTex.createView();
   const cmd=device.createCommandEncoder();
-  const rp=cmd.beginRenderPass({colorAttachments:[{view:tv,clearValue:[0.07,0.07,0.13,1],loadOp:'clear',storeOp:'store'}],depthStencilAttachment:{view:dv,depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'store'}});
+  const rp=cmd.beginRenderPass({colorAttachments:[{view:msaaColorTex.createView(),resolveTarget:tv,clearValue:[0.07,0.07,0.13,1],loadOp:'clear',storeOp:'discard'}],depthStencilAttachment:{view:msaaDepthTex.createView(),depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'discard'}});
 
   // Surface
   const rbg=srcPos===posA?renderBG_A:renderBG_B;
