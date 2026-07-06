@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PBD 代理模型 — Three.js WebGPU</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#111; overflow:hidden; font-family:monospace; }
+canvas { display:block; cursor:crosshair; }
+#hud { position:fixed; top:12px; left:12px; z-index:10; color:#ccc; font-size:13px; line-height:1.7; pointer-events:none; }
+#hud .val { color:#0f0; }
+#info { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); color:#888; font-size:12px; z-index:10; pointer-events:none; }
+#panel { position:fixed; top:12px; right:12px; z-index:20; background:rgba(0,0,0,0.8); border:1px solid #444; border-radius:8px; padding:14px 18px; color:#ccc; font-size:13px; min-width:220px; pointer-events:all; user-select:none; }
+#panel label { display:block; margin:8px 0 2px; color:#aaa; }
+#panel input[type=range] { width:100%; accent-color:#cc44ff; }
+#panel .val { color:#cc44ff; float:right; }
+#panel h3 { margin:0 0 6px; color:#fff; font-size:14px; }
+#panel .badge { display:inline-block; background:#cc44ff; color:#000; font-size:10px; padding:1px 6px; border-radius:3px; margin-left:4px; font-weight:bold; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+ <div>FPS: <span class="val" id="fps">--</span></div>
+ <div>帧耗时: <span class="val" id="framems">--</span> ms</div>
+ <div>顶点: <span class="val" id="vcount">--</span></div>
+ <div>三角形: <span class="val" id="tcount">--</span></div>
+ <div>皮筋: <span class="val" id="bcount">0</span></div>
+ <div>体积: <span class="val" id="vratio">100</span>%</div>
+ <div>PBD迭代: <span class="val" id="pbditer">10</span></div>
+ <div>PBD耗时: <span class="val" id="pbdtime">--</span> ms</div>
+</div>
+<div id="info">🖱️ 点击菠萝表面绑皮筋 &nbsp; R 键割一根 &nbsp; 拖拽旋转/滚轮缩放 &nbsp; <span style="color:#cc44ff">⚡ GPU PBD + Three.js WebGPU</span></div>
+
+<div id="panel">
+ <h3>🔧 GPU PBD 参数 <span class="badge">GPU</span></h3>
+ <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
+ <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
+ <label>皮筋刚度 <span class="val" id="sv_bs">0.50</span></label>
+ <input type="range" id="sl_bs" min="0.001" max="1.0" step="0.001" value="0.50">
+ <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
+ <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
+ <label>影响半径 <span class="val" id="sv_bi">0.60</span></label>
+ <input type="range" id="sl_bi" min="0.2" max="1.5" step="0.05" value="0.60">
+ <label>皮筋目标半径 <span class="val" id="sv_tr">0.40</span></label>
+ <input type="range" id="sl_tr" min="0.05" max="0.80" step="0.01" value="0.40">
+ <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
+ <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
+ <label>收敛帧数 <span class="val" id="sv_cf">5</span></label>
+<input type="range" id="sl_cf" min="1" max="20" step="1" value="5">
+</div>
+<canvas id="canvas"></canvas>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.174.0/build/three.webgpu.js", "three/addons/loaders/GLTFLoader.js": "https://cdn.jsdelivr.net/npm/three@0.174.0/examples/jsm/loaders/GLTFLoader.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ═══════ DOM ═══════
+const $=id=>document.getElementById(id);
+const H={fps:$('fps'),framems:$('framems'),vcount:$('vcount'),tcount:$('tcount'),bcount:$('bcount'),vratio:$('vratio'),pbditer:$('pbditer'),pbdtime:$('pbdtime')};
+const canvas=$('canvas');
+
+// ═══════ WebGPU adapter (shared between PBD and Three.js) ═══════
+if(!navigator.gpu){alert('需要WebGPU！Chrome 113+');throw new Error('No WebGPU');}
+let adapter=null;for(let i=0;i<3&&!adapter;i++){adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!adapter&&i<2)await new Promise(r=>setTimeout(r,500));}
+if(!adapter){alert('无法获取GPU适配器');throw new Error('No adapter');}
+const device=await adapter.requestDevice();
+device.addEventListener('uncapturederror',ev=>console.error('GPU error:',ev.error));
+const queue=device.queue;
+
+// NOTE: canvas context is managed by Three.js WebGPURenderer — we don't configure it ourselves.
+
+// ═══════ Three.js WebGPU Renderer setup ═══════
+const renderer = new THREE.WebGPURenderer({ canvas, device, antialias: true, alpha: false, depth: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+await renderer.init();  // must await before first render()
+
+// ═══════ Three.js Scene ═══════
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#111122');
+
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 50);
+camera.position.set(1.5, 1.8, 3.5);
+camera.lookAt(0, 0, 0);
+
+// Lighting — matches index.html
+scene.add(new THREE.AmbientLight('#fff', 0.5));
+scene.add(new THREE.DirectionalLight('#fff', 1.5).translateY(5));
+
+// ═══════ State ═══════
+let vertexCount=0,triCount=0,restVolume=0,restSurfaceArea=0;
+let modelMinY=-1.5,modelMaxY=1.5;
+let posA,posB,restB,idxB,bandB,volB,volTotalB,staging;
+let volRedLevels=[];
+let srcPos,dstPos;
+let WG,VWG;
+function swap(){[srcPos,dstPos]=[dstPos,srcPos];}
+
+// PBD params
+let SHAPE_STIFF=0.30,BAND_STIFF=0.50,VOL_STIFF=0.40,BAND_INF=0.60,BAND_TARGET=0.40,PBD_ITER=10;
+let lastVol=0,pbdConverged=false,convergeFrames=0,needsRestore=false;
+let pbdAccumTime=0;
+let CONVERGE_FRAMES=5;
+
+function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
+
+// Slider wiring
+$('sl_ss').oninput=e=>{SHAPE_STIFF=+e.target.value;$('sv_ss').textContent=SHAPE_STIFF.toFixed(2);markPbdDirty();};
+$('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(3);for(const b of bands)b.stiff=BAND_STIFF;markPbdDirty();};
+$('sl_vs').oninput=e=>{VOL_STIFF=+e.target.value;$('sv_vs').textContent=VOL_STIFF.toFixed(2);markPbdDirty();};
+$('sl_bi').oninput=e=>{BAND_INF=+e.target.value;$('sv_bi').textContent=BAND_INF.toFixed(2);for(const b of bands)b.inf=BAND_INF;markPbdDirty();};
+$('sl_tr').oninput=e=>{BAND_TARGET=+e.target.value;$('sv_tr').textContent=BAND_TARGET.toFixed(2);for(const b of bands)b.targetRadius=BAND_TARGET;markPbdDirty();writeBandInstances();};
+$('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
+$('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
+
+// ═══════ Bands ═══════
+const MAX_BANDS=256;
+const bands=[];
+const RADIUS_BUCKETS=64;
+let radiusProfile=null;
+
+function buildRadiusProfile(positions){
+  let minY=Infinity,maxY=-Infinity;
+  for(let i=0;i<vertexCount;i++){const y=positions[i*3+1];if(y<minY)minY=y;if(y>maxY)maxY=y;}
+  modelMinY=minY;modelMaxY=maxY;
+  const range=maxY-minY||0.01;
+  const buckets=new Float32Array(RADIUS_BUCKETS),cnts=new Uint32Array(RADIUS_BUCKETS);
+  for(let i=0;i<vertexCount;i++){
+    const y=positions[i*3+1],r=Math.sqrt(positions[i*3]**2+positions[i*3+2]**2);
+    const idx=Math.min(RADIUS_BUCKETS-1,Math.floor((y-minY)/range*RADIUS_BUCKETS));
+    buckets[idx]+=r;cnts[idx]++;
+  }
+  radiusProfile={minY,maxY,buckets,counts:cnts};
+}
+
+function getRadiusAtY(targetY){
+  if(!radiusProfile)return 0.5;
+  const{minY,maxY,buckets,counts}=radiusProfile;
+  const range=maxY-minY||0.01;
+  const idx=Math.min(RADIUS_BUCKETS-1,Math.max(0,Math.floor((targetY-minY)/range*RADIUS_BUCKETS)));
+  let sumR=buckets[idx],sumC=counts[idx];
+  if(idx>0){sumR+=buckets[idx-1];sumC+=counts[idx-1];}
+  if(idx<RADIUS_BUCKETS-1){sumR+=buckets[idx+1];sumC+=counts[idx+1];}
+  return sumC>0?sumR/sumC:0.5;
+}
+
+function addBand(centerY){
+  if(!restVolume)return;
+  if(bands.length>=MAX_BANDS){console.warn('达到最大皮筋数:',MAX_BANDS);return;}
+  const margin=BAND_INF*0.3;
+  centerY=Math.max(modelMinY+margin,Math.min(modelMaxY-margin,centerY));
+  bands.push({centerY,targetRadius:BAND_TARGET,stiff:BAND_STIFF,inf:BAND_INF});
+  H.bcount.textContent=bands.length;
+  markPbdDirty();
+  writeBandInstances();
+  console.log('皮筋 #'+bands.length,'y='+centerY.toFixed(3),'target='+BAND_TARGET.toFixed(3));
+}
+
+function removeBand(){
+  if(bands.length>0){bands.pop();H.bcount.textContent=bands.length;needsRestore=true;markPbdDirty();writeBandInstances();}
+}
+
+// Write band offset + color to GPU instance buffers (scale is written by bandRadCS)
+function writeBandInstances(){
+  if(!bandInstBuf||!targetInstBuf)return;
+  for(let b=0;b<bands.length;b++){
+    // Actual ring (red): offset+color, scale computed by bandRadCS on GPU
+    const d=new Float32Array([bands[b].centerY,0,1,0.2,0.2,0.8]);
+    queue.writeBuffer(bandInstBuf,b*24,d);
+    // Target ring (green): fixed target radius
+    const td=new Float32Array([bands[b].centerY,bands[b].targetRadius,0,1,0,0.6]);
+    queue.writeBuffer(targetInstBuf,b*24,td);
+  }
+}
+
+// ═══════ Band ring visualization (our own WebGPU, zero CPU readback) ═══════
+function buildTorus(majorR,minorR,tubeSegs,radSegs){
+  const p=[],idx=[];
+  for(let i=0;i<=tubeSegs;i++){const u=i/tubeSegs*Math.PI*2,cu=Math.cos(u),su=Math.sin(u);for(let j=0;j<=radSegs;j++){const v=j/radSegs*Math.PI*2,cv=Math.cos(v),sv=Math.sin(v);p.push((majorR+minorR*cv)*cu,minorR*sv,(majorR+minorR*cv)*su);}}
+  const rv=radSegs+1;
+  for(let i=0;i<tubeSegs;i++)for(let j=0;j<radSegs;j++){const a=i*rv+j,b=a+rv,c=a+1,d=b+1;idx.push(a,c,b,b,c,d);}
+  return{positions:new Float32Array(p),indices:new Uint32Array(idx)};
+}
+const torus=buildTorus(1.0,0.025,48,16);
+const TORUS_I_COUNT=torus.indices.length;
+let torusVBuf,torusIBuf;
+
+// Instanced torus shader for band rings
+const torusInstShader=device.createShaderModule({label:'torusInst',code:`
+struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct U{mvp:mat4x4<f32>}
+struct VOut{@builtin(position)pos:vec4<f32>,@location(0)col:vec4<f32>}
+@group(0)@binding(0)var<storage,read>instances:array<Inst>;
+@group(0)@binding(1)var<uniform>u:U;
+@vertex fn vs(@location(0)p:vec3<f32>,@builtin(instance_index)ii:u32)->VOut{
+  let inst=instances[ii];
+  var o:VOut;
+  o.pos=u.mvp*vec4(p.x*inst.scale,inst.offset+p.y,p.z*inst.scale,1.0);
+  o.col=vec4(inst.r,inst.g,inst.b,inst.a);
+  return o;
+}
+@fragment fn fs(in:VOut)->@location(0)vec4<f32>{return in.col;}
+`});
+
+// Single torus shader for preview ring
+const torusSingleShader=device.createShaderModule({label:'torusSingle',code:`
+struct U{mvp:mat4x4<f32>,offset:f32,scale:f32,color:vec4<f32>}
+@group(0)@binding(0)var<uniform>u:U;
+@vertex fn vs(@location(0)p:vec4<f32>)->@builtin(position)vec4<f32>{
+  return u.mvp*vec4(p.x*u.scale,u.offset+p.y,p.z*u.scale,1.0);
+}
+@fragment fn fs()->@location(0)vec4<f32>{return u.color;}
+`});
+
+let torusBG,torusPipeline,torusSinglePipeline;
+let bandInstBuf,targetInstBuf,previewUB;
+const INST_BYTE=MAX_BANDS*24; // 6 floats per band: offset,scale,r,g,b,a
+
+// ═══════ Utility ═══════
+function mkBuf(size,usage,label){return device.createBuffer({size,usage,label});}
+
+// ═══════ WGSL Compute Shaders (identical to pineapple_WebGPU.html) ═══════
+const shapeCS=device.createShaderModule({label:'shape',code:`
+struct P{stiffness:f32,vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let cur=src[i];let r=rest[i];let d=r.xyz-cur.xyz;
+  dst[i]=vec4(cur.xyz+d*p.stiffness,1.0);
+}
+`});
+
+const bandCS=device.createShaderModule({label:'band',code:`
+struct Band{cy:f32,tr:f32,stiff:f32,inf:f32}
+struct P{bc:u32,vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(3)var<storage,read>bands:array<Band>;
+@group(0)@binding(4)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  var cur=src[i];
+  for(var b=0u;b<256u;b++){if(b>=p.bc){break;}
+    let bd=bands[b];let dy=abs(cur.y-bd.cy);if(dy>=bd.inf){continue;}
+    let r=length(cur.xz);if(r<1e-6){continue;}
+    let t=dy/bd.inf;let st=t*t*(3.0-2.0*t);let eff=bd.tr+(r-bd.tr)*st;
+    if(r>eff){let push=bd.stiff*(r-eff);let s=max(0.01,(r-push)/r);cur.x*=s;cur.z*=s;}
+  }
+  dst[i]=cur;
+}
+`});
+
+const volAccCS=device.createShaderModule({label:'volAcc',code:`
+struct P{tc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>indices:array<u32>;
+@group(0)@binding(2)var<storage,read_write>volOut:array<f32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let t=gid.x;if(t>=p.tc){return;}
+  let i0=indices[t*3u];let i1=indices[t*3u+1u];let i2=indices[t*3u+2u];
+  let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
+  volOut[t]=(p0.x*(p1.y*p2.z-p1.z*p2.y)+p0.y*(p1.z*p2.x-p1.x*p2.z)+p0.z*(p1.x*p2.y-p1.y*p2.x))/6.0;
+}
+`});
+
+const volReduceCS=device.createShaderModule({label:'volReduce',code:`
+struct P{count:u32}
+@group(0)@binding(0)var<storage,read>src:array<f32>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+var<workgroup>sdata:array<f32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  sdata[lid.x]=select(0.0,src[gid.x],gid.x<p.count);workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sdata[lid.x]+=sdata[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){dst[wg.x]=sdata[0];}
+}
+`});
+
+const volApCS=device.createShaderModule({label:'volAp',code:`
+struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>volTotal:array<f32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let cur=src[i];let r=length(cur.xz);
+  if(r<1e-6){dst[i]=cur;return;}
+  let curVol=abs(volTotal[0]);let deficit=p.rest-curVol;
+  let push=select(p.stiff*deficit/p.surface,0.0,abs(deficit)<1e-9);
+  let s=clamp((r+push)/r,0.7,1.3);
+  dst[i]=vec4(cur.x*s,cur.y,cur.z*s,1.0);
+}
+`});
+
+// Normal recompute shader — recalculates smooth vertex normals from deformed positions
+const normCS=device.createShaderModule({label:'norm',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read>adjOff:array<u32>;
+@group(0)@binding(3)var<storage,read>adjData:array<u32>;
+@group(0)@binding(4)var<storage,read_write>norms:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let vi=gid.x;if(vi>=p.vc){return;}
+  let start=adjOff[vi];let end=adjOff[vi+1u];
+  var sumN=vec3<f32>(0.0);
+  for(var j=start;j<end;j++){
+    let ti=adjData[j];
+    let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+    let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
+    sumN+=normalize(cross(p1-p0,p2-p0));
+  }
+  let N=normalize(sumN);
+  norms[vi]=vec4<f32>(N,0.0);
+}
+`});
+
+// Unpack vec4 normals to flat float array for GPU→GPU copy to Three.js
+const normUnpackCS=device.createShaderModule({label:'normUnpack',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let v=src[i];
+  dst[i*3u]=v.x;
+  dst[i*3u+1u]=v.y;
+  dst[i*3u+2u]=v.z;
+}
+`});
+
+// Unpack vec4 positions to flat vec3 for GPU→GPU copy to Three.js (Three.js uses 12 bytes/vertex)
+const posUnpackCS=device.createShaderModule({label:'posUnpack',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let v=src[i];
+  dst[i*3u]=v.x;
+  dst[i*3u+1u]=v.y;
+  dst[i*3u+2u]=v.z;
+}
+`});
+
+// GPU band radius scanner — writes actual radius to bandInstBuf (used by rendering)
+const bandRadCS=device.createShaderModule({label:'bandRad',code:`
+struct B{cy:f32,tr:f32,stiff:f32,inf:f32}
+struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct P{vc:u32,bc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>bands:array<B>;
+@group(0)@binding(2)var<storage,read_write>inst:array<Inst>;
+@group(0)@binding(3)var<uniform>p:P;
+var<workgroup>sSum:array<f32,256>;
+var<workgroup>sCnt:array<u32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
+  let bandY=bands[b].cy;let thresh=bands[b].inf*0.3;
+  var sumR=f32(0);var cnt=u32(0);var vi=lid.x;
+  while(vi<p.vc){
+    let y=pos[vi].y;
+    if(abs(y-bandY)<thresh){sumR+=length(pos[vi].xz);cnt++;}
+    vi+=256u;
+  }
+  sSum[lid.x]=sumR;sCnt[lid.x]=cnt;workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sSum[lid.x]+=sSum[lid.x+s];sCnt[lid.x]+=sCnt[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){inst[b].scale=select(0.0,sSum[0]/f32(sCnt[0]),sCnt[0]>1u);}
+}
+`});
+
+// Delta field builder: scans proxy deformed positions, builds 1D scale lookup table
+const buildDeltaCS=device.createShaderModule({label:'buildDelta',code:`
+struct P{vc:u32,buckets:u32,minY:f32,range:f32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read_write>delta:array<f32>;
+@group(0)@binding(3)var<storage,read_write>cnts:array<u32>;
+@group(0)@binding(4)var<uniform>p:P;
+var<workgroup>sSumR:array<f32,256>;
+var<workgroup>sSumD:array<f32,256>;
+var<workgroup>sCnt:array<u32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.buckets){return;}
+  let lo=p.minY+p.range*f32(b)/f32(p.buckets);
+  let hi=p.minY+p.range*f32(b+1u)/f32(p.buckets);
+  var sr=f32(0);var sd=f32(0);var sc=u32(0);var vi=lid.x;
+  while(vi<p.vc){
+    let y=pos[vi].y;if(y>=lo&&y<hi){
+      let rr=length(rest[vi].xz);let dr=length(pos[vi].xz);
+      sr+=rr;sd+=dr;sc++;
+    }
+    vi+=256u;
+  }
+  sSumR[lid.x]=sr;sSumD[lid.x]=sd;sCnt[lid.x]=sc;workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sSumR[lid.x]+=sSumR[lid.x+s];sSumD[lid.x]+=sSumD[lid.x+s];sCnt[lid.x]+=sCnt[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){
+    let scale=select(1.0,sSumD[0]/max(sSumR[0],0.001),sCnt[0]>1u);
+    delta[b]=clamp(scale,0.1,3.0);cnts[b]=sCnt[0];
+  }
+}
+`});
+
+// Apply delta field to high-res mesh: each vertex looks up scale from 1D table
+const applyDeltaCS=device.createShaderModule({label:'applyDelta',code:`
+struct P{vc:u32,buckets:u32,minY:f32,range:f32}
+@group(0)@binding(0)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>delta:array<f32>;
+@group(0)@binding(2)var<storage,read_write>outPos:array<vec4<f32>>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let rp=rest[i];let y=rp.y;
+  let tf=(y-p.minY)/p.range*f32(p.buckets);
+  let bidx0=u32(floor(tf));
+  let bidx1=min(bidx0+1u,p.buckets-1u);
+  let frac=tf-f32(bidx0);
+  let scale=mix(delta[bidx0],delta[bidx1],frac);
+  outPos[i]=vec4(rp.x*scale,y,rp.z*scale,1.0);
+}
+`});
+
+// ── Compute Pipelines ──
+function cpPipe(shader,entry,bgEntries,label){
+  const bgl=device.createBindGroupLayout({entries:bgEntries});
+  const layout=device.createPipelineLayout({bindGroupLayouts:[bgl]});
+  return{pipe:device.createComputePipeline({layout,compute:{module:shader,entryPoint:entry}}),bgl,layout};
+}
+const S_R=(b,v)=>({binding:b,visibility:v,buffer:{type:'storage'}});
+const S_RO=(b,v)=>({binding:b,visibility:v,buffer:{type:'read-only-storage'}});
+const U_B=(b,v)=>({binding:b,visibility:v,buffer:{type:'uniform'}});
+const CS=GPUShaderStage.COMPUTE;
+
+const shapePipe=cpPipe(shapeCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'shape');
+const bandPipe=cpPipe(bandCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'band');
+const volAccPipe=cpPipe(volAccCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'volAcc');
+const volReducePipe=cpPipe(volReduceCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'volReduce');
+const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'volAp');
+const normPipe=cpPipe(normCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'norm');
+const normUnpackPipe=cpPipe(normUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'normUnpack');
+const posUnpackPipe=cpPipe(posUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'posUnpack');
+const bandRadPipe=cpPipe(bandRadCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'bandRad');
+const buildDeltaPipe=cpPipe(buildDeltaCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),U_B(4,CS)],'buildDelta');
+const applyDeltaPipe=cpPipe(applyDeltaCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'applyDelta');
+
+const shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
+const bandUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandU');
+const volAccUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volAccU');
+const volApUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volApU');
+
+// ═══════ Dual model loading (proxy for PBD, high-res for Three.js rendering) ═══════
+let pineappleMesh;         // Three.js high-res mesh for rendering
+let proxyVertexCount=0, proxyTriCount=0;  // proxy mesh dimensions (PBD compute)
+let proxyPositions, proxyIdxArr;          // CPU copies of proxy data
+const DELTA_BUCKETS=256;                  // 1D lookup table resolution
+
+async function loadModel(name, doProcess){
+  const loader=new GLTFLoader();
+  const gltf=await new Promise((res,rej)=>loader.load(name,res,undefined,rej));
+  let srcMesh=null;gltf.scene.traverse(c=>{if(c.isMesh&&!srcMesh)srcMesh=c;});
+  if(!srcMesh)throw new Error('No mesh in '+name);
+  const srcGeo=srcMesh.geometry;
+  srcGeo.computeBoundingBox();
+  const cen=new THREE.Vector3();srcGeo.boundingBox.getCenter(cen);
+  const siz=new THREE.Vector3();srcGeo.boundingBox.getSize(siz);
+  const sc=3.0/siz.y;
+  const pa=srcGeo.attributes.position.array;
+  const vc=srcGeo.attributes.position.count;
+  const pos=new Float32Array(vc*3);
+  for(let i=0;i<vc;i++){pos[i*3]=(pa[i*3]-cen.x)*sc;pos[i*3+1]=(pa[i*3+1]-cen.y)*sc;pos[i*3+2]=(pa[i*3+2]-cen.z)*sc;}
+  const idxArr=srcGeo.index?new Uint32Array(srcGeo.index.array):(()=>{const a=new Uint32Array(vc);for(let i=0;i<vc;i++)a[i]=i;return a;})();
+  if(doProcess){
+    // Proxy model: run PBD on this
+    proxyVertexCount=vc;proxyTriCount=idxArr.length/3;
+    proxyPositions=pos;proxyIdxArr=idxArr;
+    let vol=0,area=0;
+    for(let t=0;t<idxArr.length;t+=3){
+      const ai=idxArr[t]*3,bi=idxArr[t+1]*3,ci=idxArr[t+2]*3;
+      const ax=pos[ai],ay=pos[ai+1],az=pos[ai+2],bx=pos[bi],by=pos[bi+1],bz=pos[bi+2],cx=pos[ci],cy=pos[ci+1],cz=pos[ci+2];
+      vol+=(ax*(by*cz-bz*cy)+ay*(bz*cx-bx*cz)+az*(bx*cy-by*cx))/6;
+      const abx=bx-ax,aby=by-ay,abz=bz-az,acx=cx-ax,acy=cy-ay,acz=cz-az;
+      area+=0.5*Math.sqrt((aby*acz-abz*acy)**2+(abz*acx-abx*acz)**2+(abx*acy-aby*acx)**2);
+    }
+    restVolume=Math.abs(vol);restSurfaceArea=area;
+    vertexCount=vc;triCount=idxArr.length/3;
+    H.vcount.textContent=proxyVertexCount.toLocaleString();
+    H.tcount.textContent=Math.round(proxyTriCount).toLocaleString();
+    H.pbditer.textContent=PBD_ITER;
+    console.log('📦 代理模型:',proxyVertexCount.toLocaleString(),'顶点,',Math.round(proxyTriCount).toLocaleString(),'三角形');
+    console.log('   restVolume:',restVolume.toFixed(4),'restSurfaceArea:',restSurfaceArea.toFixed(2));
+    buildRadiusProfile(pos);
+  }
+  return{pos,idxArr,srcGeo,srcMesh};
+}
+
+let highResRestPositions;  // CPU copy of high-res rest positions
+
+async function loadModels(){
+  // Load proxy first (small mesh, used for PBD)
+  await loadModel('pineapple_py.glb', true);
+  // Load high-res (display mesh, receives delta field)
+  const hr=await loadModel('pineapple.glb', false);
+  const srcGeo=hr.srcGeo;const pos=hr.pos;const idxArr=hr.idxArr;
+  const srcMesh=hr.srcMesh;
+  const hvc=pos.length/3;
+  highResRestPositions=new Float32Array(pos);
+  
+  // Build adjacency for high-res normals
+  const adjLists=new Array(hvc);for(let i=0;i<hvc;i++)adjLists[i]=[];
+  for(let t=0;t<idxArr.length;t+=3){const a=idxArr[t],b=idxArr[t+1],c=idxArr[t+2];adjLists[a].push(t/3);adjLists[b].push(t/3);adjLists[c].push(t/3);}
+  const adjOffsets=new Uint32Array(hvc+1);let totalAdj=0;
+  for(let i=0;i<hvc;i++){adjOffsets[i]=totalAdj;totalAdj+=adjLists[i].length;}
+  adjOffsets[hvc]=totalAdj;const adjData=new Uint32Array(totalAdj);let cursor=0;
+  for(let i=0;i<hvc;i++)for(const t of adjLists[i])adjData[cursor++]=t;
+
+  // Create Three.js high-res mesh
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(pos.slice(),3));
+  geo.setAttribute('normal',srcGeo.attributes.normal?srcGeo.attributes.normal.clone():new THREE.Float32BufferAttribute(new Float32Array(hvc*3),3));
+  if(srcGeo.attributes.uv)geo.setAttribute('uv',srcGeo.attributes.uv.clone());
+  geo.setIndex(new THREE.BufferAttribute(idxArr,1));
+  const mat=srcMesh.material||new THREE.MeshStandardMaterial({color:'#cc9944',roughness:0.6,metalness:0.0});
+  pineappleMesh=new THREE.Mesh(geo,mat);
+  scene.add(pineappleMesh);
+
+  // Compute high-res volume + surface area (used for proxy PBD volume constraint)
+  let hrVol=0,hrArea=0;
+  for(let t=0;t<idxArr.length;t+=3){
+    const ai=idxArr[t]*3,bi=idxArr[t+1]*3,ci=idxArr[t+2]*3;
+    hrVol+=(pos[ai]*(pos[bi+1]*pos[ci+2]-pos[bi+2]*pos[ci+1])+pos[ai+1]*(pos[bi+2]*pos[ci]-pos[bi]*pos[ci+2])+pos[ai+2]*(pos[bi]*pos[ci+1]-pos[bi+1]*pos[ci]))/6;
+    const ax=pos[ai],ay=pos[ai+1],az=pos[ai+2],bx=pos[bi],by=pos[bi+1],bz=pos[bi+2],cx=pos[ci],cy=pos[ci+1],cz=pos[ci+2];
+    const abx=bx-ax,aby=by-ay,abz=bz-az,acx=cx-ax,acy=cy-ay,acz=cz-az;
+    hrArea+=0.5*Math.sqrt((aby*acz-abz*acy)**2+(abz*acx-abx*acz)**2+(abx*acy-aby*acx)**2);
+  }
+  restVolume=Math.abs(hrVol);restSurfaceArea=hrArea;
+  console.log('🖼️ 高模渲染:',hvc.toLocaleString(),'顶点, 高模体积:',restVolume.toFixed(4),'(覆盖代理体积)');
+
+  initPBD(proxyPositions,proxyIdxArr,adjOffsets,adjData,hr.idxArr);
+}
+loadModels().catch(e=>console.error('加载失败:',e));
+
+// ═══════ GPU PBD Init (proxy + delta + high-res) ═══════
+let shapeBG_AB,shapeBG_BA,bandBG_AB,bandBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B;
+let bandRadBG_A,bandRadBG_B,bandRadUB;
+let torusInstBG_actual,torusInstBG_target;
+let deltaBuf,deltaCntBuf,buildDeltaBG_A,buildDeltaBG_B,buildDeltaUB;
+let highResRestB,highResOutB,highResStaging,applyDeltaBG,applyDeltaUB,hrPos3B;
+let highResUnpackBG,highResRestUnpackBG,highResCount=0;
+let hrNormBG,hrNormUnpackBG,hrNorm3B;
+
+function initPBD(posArr,idxArr,adjOffsets,adjData,hrIdxArr){
+  WG=Math.ceil(proxyVertexCount/256);VWG=Math.ceil(proxyTriCount/256);
+  const VB=proxyVertexCount*4*4;
+  posA=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posA');
+  posB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posB');
+  restB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'rest');
+  idxB=mkBuf(idxArr.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'idx');
+  bandB=mkBuf(MAX_BANDS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'band');
+
+  const pos4=new Float32Array(proxyVertexCount*4);
+  for(let i=0;i<proxyVertexCount;i++){pos4[i*4]=posArr[i*3];pos4[i*4+1]=posArr[i*3+1];pos4[i*4+2]=posArr[i*3+2];pos4[i*4+3]=1;}
+  queue.writeBuffer(posA,0,pos4);queue.writeBuffer(posB,0,pos4);queue.writeBuffer(restB,0,pos4);
+  queue.writeBuffer(idxB,0,idxArr);
+
+  // Volume reduction chain (proxy scale)
+  volTotalB=mkBuf(4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volTotal');
+  volB=mkBuf(proxyTriCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'vol');
+  volRedLevels=[];
+  {let srcCount=proxyTriCount,srcBuf=volB;
+    while(true){const dc=Math.ceil(srcCount/256);const lv={srcBuf,srcCount,dstBuf:null,wgCount:dc,ub:null,bg:null};
+      if(dc===1){lv.dstBuf=volTotalB;lv.ub=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volRedU_f');queue.writeBuffer(lv.ub,0,new Uint32Array([srcCount]));lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:volTotalB}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);break;}
+      const db=mkBuf(dc*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volRedL'+volRedLevels.length);
+      lv.dstBuf=db;lv.ub=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volRedU_L'+volRedLevels.length);queue.writeBuffer(lv.ub,0,new Uint32Array([srcCount]));
+      lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:db}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);srcCount=dc;srcBuf=db;}
+  }
+
+  // Staging for volume readback
+  staging=mkBuf(Math.max(4,MAX_BANDS*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+
+  // Delta field buffers (1D lookup table, 256 floats)
+  deltaBuf=mkBuf(DELTA_BUCKETS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'delta');
+  deltaCntBuf=mkBuf(DELTA_BUCKETS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'deltaCnt');
+  // Initialize delta table to 1.0 (no deformation) to avoid uninitialized GPU memory
+  const initDelta=new Float32Array(DELTA_BUCKETS);for(let i=0;i<DELTA_BUCKETS;i++)initDelta[i]=1.0;
+  queue.writeBuffer(deltaBuf,0,initDelta);
+  buildDeltaUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'buildDeltaU');
+  buildDeltaBG_A=device.createBindGroup({layout:buildDeltaPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:restB}},{binding:2,resource:{buffer:deltaBuf}},{binding:3,resource:{buffer:deltaCntBuf}},{binding:4,resource:{buffer:buildDeltaUB}}]});
+  buildDeltaBG_B=device.createBindGroup({layout:buildDeltaPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:restB}},{binding:2,resource:{buffer:deltaBuf}},{binding:3,resource:{buffer:deltaCntBuf}},{binding:4,resource:{buffer:buildDeltaUB}}]});
+
+  // High-res mesh buffers (for delta application)
+  highResCount=highResRestPositions.length/3;
+  const HRB=highResCount*4*4;
+  highResRestB=mkBuf(HRB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrRest');
+  highResOutB=mkBuf(HRB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrOut');
+  const hr4=new Float32Array(highResCount*4);
+  for(let i=0;i<highResCount;i++){hr4[i*4]=highResRestPositions[i*3];hr4[i*4+1]=highResRestPositions[i*3+1];hr4[i*4+2]=highResRestPositions[i*3+2];hr4[i*4+3]=1;}
+  queue.writeBuffer(highResRestB,0,hr4);
+  applyDeltaUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'applyDeltaU');
+  applyDeltaBG=device.createBindGroup({layout:applyDeltaPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResRestB}},{binding:1,resource:{buffer:deltaBuf}},{binding:2,resource:{buffer:highResOutB}},{binding:3,resource:{buffer:applyDeltaUB}}]});
+
+  // High-res normal compute (normCS on delta-applied positions)
+  const hrAdjOffB=mkBuf(adjOffsets.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'hrAdjOff');
+  const hrAdjDataB=mkBuf(adjData.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'hrAdjData');
+  queue.writeBuffer(hrAdjOffB,0,adjOffsets);queue.writeBuffer(hrAdjDataB,0,adjData);
+  const hrIdxB=mkBuf(hrIdxArr.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'hrIdx');
+  queue.writeBuffer(hrIdxB,0,hrIdxArr);
+  const hrNormB=mkBuf(highResCount*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrNorm');
+  hrNorm3B=mkBuf(highResCount*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrNorm3');
+  const hrNormUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'hrNormU');
+  queue.writeBuffer(hrNormUB,0,new Uint32Array([highResCount]));
+  hrNormBG=device.createBindGroup({layout:normPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResOutB}},{binding:1,resource:{buffer:hrIdxB}},{binding:2,resource:{buffer:hrAdjOffB}},{binding:3,resource:{buffer:hrAdjDataB}},{binding:4,resource:{buffer:hrNormB}},{binding:5,resource:{buffer:hrNormUB}}]});
+  hrNormUnpackBG=device.createBindGroup({layout:normUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:hrNormB}},{binding:1,resource:{buffer:hrNorm3B}},{binding:2,resource:{buffer:hrNormUB}}]});
+  highResStaging=mkBuf(highResCount*3*4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'hrStaging');
+
+  // High-res position unpack (vec4→vec3) for staging readback
+  hrPos3B=mkBuf(highResCount*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrPos3');
+  const hrUnpackUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'hrUnpackU');
+  queue.writeBuffer(hrUnpackUB,0,new Uint32Array([highResCount]));
+  highResUnpackBG=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResOutB}},{binding:1,resource:{buffer:hrPos3B}},{binding:2,resource:{buffer:hrUnpackUB}}]});
+  highResRestUnpackBG=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResRestB}},{binding:1,resource:{buffer:hrPos3B}},{binding:2,resource:{buffer:hrUnpackUB}}]});
+
+  // Band instance buffers (unchanged, but uses proxy positions for radius scan)
+  bandInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandInst');
+  targetInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'targetInst');
+  bandRadUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandRadU');
+  bandRadBG_A=device.createBindGroup({layout:bandRadPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
+  bandRadBG_B=device.createBindGroup({layout:bandRadPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
+
+  // Torus geometry buffers for ring rendering
+  torusVBuf=mkBuf(torus.positions.length*4,GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST,'torusV');
+
+  // Torus geometry buffers for ring rendering
+  torusVBuf=mkBuf(torus.positions.length*4,GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST,'torusV');
+  torusIBuf=mkBuf(torus.indices.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST,'torusI');
+  queue.writeBuffer(torusVBuf,0,torus.positions);queue.writeBuffer(torusIBuf,0,torus.indices);
+  previewUB=mkBuf(96,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'previewU');
+  const torusBGL=device.createBindGroupLayout({entries:[
+    {binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'uniform'}}]});
+  torusBG=device.createBindGroup({layout:torusBGL,entries:[{binding:0,resource:{buffer:previewUB}}]});
+  torusSinglePipeline=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusBGL]}),vertex:{module:torusSingleShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}]}]},fragment:{module:torusSingleShader,entryPoint:'fs',targets:[{format:navigator.gpu.getPreferredCanvasFormat(),blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'}});
+  const torusInstBGL=device.createBindGroupLayout({entries:[
+    {binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'read-only-storage'}},
+    {binding:1,visibility:GPUShaderStage.VERTEX,buffer:{type:'uniform'}}]});
+  torusInstBG_actual=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:bandInstBuf}},{binding:1,resource:{buffer:previewUB}}]});
+  torusInstBG_target=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:targetInstBuf}},{binding:1,resource:{buffer:previewUB}}]});
+  torusPipeline=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusInstBGL]}),vertex:{module:torusInstShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}],stepMode:'vertex'}]},fragment:{module:torusInstShader,entryPoint:'fs',targets:[{format:navigator.gpu.getPreferredCanvasFormat(),blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'}});
+
+  // Compute bind groups
+  const mkBG2=(bgl,fAB,fBA)=>({AB:device.createBindGroup({layout:bgl,entries:fAB(posA,posB)}),BA:device.createBindGroup({layout:bgl,entries:fBA(posA,posB)})});
+  const sh=mkBG2(shapePipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:shapeUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:shapeUB}}]);
+  shapeBG_AB=sh.AB;shapeBG_BA=sh.BA;
+  const bd=mkBG2(bandPipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:bandB}},{binding:4,resource:{buffer:bandUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:bandB}},{binding:4,resource:{buffer:bandUB}}]);
+  bandBG_AB=bd.AB;bandBG_BA=bd.BA;
+  const vap=mkBG2(volApPipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}]);
+  volApBG_AB=vap.AB;volApBG_BA=vap.BA;
+  volAccBG_A=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+  volAccBG_B=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+
+  srcPos=posA;dstPos=posB;lastVol=restVolume;
+  console.log('⚡ 代理PBD就绪. 代理:',proxyVertexCount.toLocaleString(),'顶点 高模:',highResCount.toLocaleString(),'顶点');
+}
+
+// ── PBD dispatch (proxy + delta + high-res) ──
+let _zeroTriP=new Float32Array(1);
+const _zero1=new Float32Array(1);
+const _zeroRedLv=[];
+
+async function runPBD_GPU(){
+  const t0=performance.now();
+  const sp=new ArrayBuffer(8);new Float32Array(sp)[0]=SHAPE_STIFF;new Uint32Array(sp)[1]=proxyVertexCount;
+  const bp=new Uint32Array([bands.length,proxyVertexCount]);
+  const bd=new Float32Array(bands.length*4);
+  for(let b=0;b<bands.length;b++){bd[b*4]=bands[b].centerY;bd[b*4+1]=bands[b].targetRadius;bd[b*4+2]=bands[b].stiff;bd[b*4+3]=bands[b].inf;}
+  const vacU=new Uint32Array([proxyTriCount]);
+  const vapU=new ArrayBuffer(16);new Uint32Array(vapU)[0]=proxyVertexCount;new Float32Array(vapU)[1]=restVolume;new Float32Array(vapU)[2]=VOL_STIFF;new Float32Array(vapU)[3]=restSurfaceArea;
+  if(_zeroTriP.length<proxyTriCount){_zeroTriP=new Float32Array(proxyTriCount);for(let i=0;i<proxyTriCount;i++)_zeroTriP[i]=0;}
+  if(_zeroRedLv.length===0){for(const lv of volRedLevels){if(lv.dstBuf!==volTotalB)_zeroRedLv.push(new Float32Array(lv.wgCount));}}
+
+  srcPos=posA;dstPos=posB;
+  const lastIter=PBD_ITER-1;
+  for(let iter=0;iter<PBD_ITER;iter++){
+    const isA=srcPos===posA,isLast=iter===lastIter;
+    queue.writeBuffer(shapeUB,0,sp);if(bands.length>0){queue.writeBuffer(bandB,0,bd);queue.writeBuffer(bandUB,0,bp);}
+    queue.writeBuffer(volAccUB,0,vacU);queue.writeBuffer(volTotalB,0,_zero1);queue.writeBuffer(volB,0,_zeroTriP);
+    for(let li=0;li<volRedLevels.length;li++){const lv=volRedLevels[li];if(lv.dstBuf!==volTotalB)queue.writeBuffer(lv.dstBuf,0,_zeroRedLv[li]);}
+    queue.writeBuffer(volApUB,0,vapU);
+
+    const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();
+    cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,isA?shapeBG_AB:shapeBG_BA);cp.dispatchWorkgroups(WG,1,1);
+    if(bands.length>0){cp.setPipeline(bandPipe.pipe);cp.setBindGroup(0,isA?bandBG_BA:bandBG_AB);cp.dispatchWorkgroups(WG,1,1);}
+    cp.setPipeline(volAccPipe.pipe);cp.setBindGroup(0,isA?volAccBG_A:volAccBG_B);cp.dispatchWorkgroups(VWG,1,1);
+    for(const lv of volRedLevels){cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,lv.bg);cp.dispatchWorkgroups(lv.wgCount,1,1);}
+    cp.setPipeline(volApPipe.pipe);cp.setBindGroup(0,isA?volApBG_AB:volApBG_BA);cp.dispatchWorkgroups(WG,1,1);
+    if(isLast){
+      const outA=!isA;
+      const dU=new ArrayBuffer(16);new Uint32Array(dU)[0]=proxyVertexCount;new Uint32Array(dU)[1]=DELTA_BUCKETS;new Float32Array(dU,8)[0]=modelMinY;new Float32Array(dU,12)[0]=modelMaxY-modelMinY;
+      queue.writeBuffer(buildDeltaUB,0,dU);
+      cp.setPipeline(buildDeltaPipe.pipe);cp.setBindGroup(0,outA?buildDeltaBG_A:buildDeltaBG_B);cp.dispatchWorkgroups(DELTA_BUCKETS,1,1);
+      if(bands.length>0){queue.writeBuffer(bandRadUB,0,new Uint32Array([proxyVertexCount,bands.length]));cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,outA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bands.length,1,1);}
+    }
+    cp.end();if(isLast)cmd.copyBufferToBuffer(volTotalB,0,staging,0,4);
+    device.queue.submit([cmd.finish()]);swap();
+  }
+  await staging.mapAsync(GPUMapMode.READ);lastVol=Math.abs(new Float32Array(staging.getMappedRange(0,4))[0]);staging.unmap();
+
+  // Smooth delta table on CPU (3-tap blur) to remove sampling noise between buckets
+  {const cmd=device.createCommandEncoder();cmd.copyBufferToBuffer(deltaBuf,0,staging,0,DELTA_BUCKETS*4);device.queue.submit([cmd.finish()]);}
+  await staging.mapAsync(GPUMapMode.READ);
+  const raw=new Float32Array(staging.getMappedRange(0,DELTA_BUCKETS*4));
+  const smooth=new Float32Array(DELTA_BUCKETS);
+  for(let i=0;i<DELTA_BUCKETS;i++){
+    let s=raw[i]*2;if(i>0)s+=raw[i-1];if(i<DELTA_BUCKETS-1)s+=raw[i+1];
+    smooth[i]=s/(i>0&&i<DELTA_BUCKETS-1?4:3);
+  }
+  staging.unmap();
+  queue.writeBuffer(deltaBuf,0,smooth);
+
+  // Apply delta + unpack → GPU→GPU copy to Three.js
+  {const aU=new ArrayBuffer(16);new Uint32Array(aU)[0]=highResCount;new Uint32Array(aU)[1]=DELTA_BUCKETS;new Float32Array(aU,8)[0]=modelMinY;new Float32Array(aU,12)[0]=modelMaxY-modelMinY;
+  queue.writeBuffer(applyDeltaUB,0,aU);const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();
+  cp.setPipeline(applyDeltaPipe.pipe);cp.setBindGroup(0,applyDeltaBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,highResUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,hrNormBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,hrNormUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.end();device.queue.submit([cmd.finish()]);}
+  if(pineappleMesh){
+    const posAttr=pineappleMesh.geometry.attributes.position;
+    const normAttr=pineappleMesh.geometry.attributes.normal;
+    const posData=renderer.backend.get(posAttr);
+    const normData=renderer.backend.get(normAttr);
+    if(posData&&posData.buffer&&normData&&normData.buffer){
+      const cmd=device.createCommandEncoder();
+      cmd.copyBufferToBuffer(hrPos3B,0,posData.buffer,0,highResCount*3*4);
+      cmd.copyBufferToBuffer(hrNorm3B,0,normData.buffer,0,highResCount*3*4);
+      device.queue.submit([cmd.finish()]);
+    }
+  }
+
+  H.vratio.textContent=(lastVol/restVolume*100).toFixed(1);return performance.now()-t0;
+}
+
+async function runRestore_GPU(){
+  const sp=new ArrayBuffer(8);new Float32Array(sp)[0]=SHAPE_STIFF;new Uint32Array(sp)[1]=proxyVertexCount;
+  srcPos=posA;dstPos=posB;
+  for(let iter=0;iter<30;iter++){queue.writeBuffer(shapeUB,0,sp);const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,srcPos===posA?shapeBG_AB:shapeBG_BA);cp.dispatchWorkgroups(WG,1,1);cp.end();device.queue.submit([cmd.finish()]);swap();}
+  lastVol=restVolume;needsRestore=false;H.vratio.textContent='100.0';
+  // Restore high-res to rest positions
+  if(pineappleMesh){pineappleMesh.geometry.attributes.position.array.set(highResRestPositions);pineappleMesh.geometry.attributes.position.needsUpdate=true;pineappleMesh.geometry.computeVertexNormals();pineappleMesh.geometry.attributes.normal.needsUpdate=true;}
+}
+
+// ═══════ Preview ring state ═══════
+let ringVisible=false,ringY=0,ringR=0.4;
+
+// ═══════ Ray-march against radius profile (for band placement) ═══════
+function rayMarchPineapple(ex,ey,ez,Dx,Dy,Dz){
+  let tMin=0,tMax=Infinity;
+  if(Math.abs(Dy)>1e-9){
+    const t0=(modelMinY-ey)/Dy,t1=(modelMaxY-ey)/Dy;
+    tMin=Math.max(0,Math.min(t0,t1));
+    tMax=Math.min(tMax,Math.max(t0,t1));
+  }
+  if(tMin>=tMax)return null;
+  const steps=200;
+  const dt=(tMax-tMin)/steps;
+  for(let i=0;i<=steps;i++){
+    const t=tMin+i*dt;
+    const y=ey+t*Dy;
+    const rx=ex+t*Dx,rz=ez+t*Dz;
+    const hr=Math.sqrt(rx*rx+rz*rz);
+    const sr=getRadiusAtY(y);
+    if(hr<=sr)return y;
+  }
+  return null;
+}
+
+// ═══════ Mouse interaction ═══════
+let mdx=0,mdy=0,dragging=false,prevCamYaw=0,prevCamPitch=0;
+
+canvas.onmousedown=e=>{
+  mdx=e.clientX;mdy=e.clientY;dragging=true;
+  const p=camera.position;
+  prevCamYaw=Math.atan2(p.x,p.z);
+  prevCamPitch=Math.asin(p.y/p.length());
+};
+window.onmouseup=e=>{
+  if(!dragging)return;dragging=false;
+  const dx=e.clientX-mdx,dy=e.clientY-mdy;
+  if(Math.sqrt(dx*dx+dy*dy)>3)return;
+  // Raycast for band placement
+  const rect=canvas.getBoundingClientRect();
+  const ndcX=((mdx-rect.left)/rect.width)*2-1,ndcY=-((mdy-rect.top)/rect.height)*2+1;
+  
+  const camPos = camera.position;
+  const asp=canvas.width/canvas.height;
+  const f=1/Math.tan(Math.PI*40/360);
+  const dirX=ndcX*asp/f,dirY=ndcY/f,dirZ=-1;
+  const fx=-camPos.x,fy=-camPos.y,fz=-camPos.z;const fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const fdx=fx/fl,fdy=fy/fl,fdz=fz/fl;
+  const rtx=1*fdz,rtz=-1*fdx;const rl=Math.sqrt(rtx*rtx+rtz*rtz);
+  const rnx=rtx/rl,rny=0,rnz=rtz/rl;
+  const ux=fdy*rnz-fdz*rny,uy=fdz*rnx-fdx*rnz,uz=fdx*rny-fdy*rnx;
+  const wx=dirX*rnx+dirY*ux+dirZ*(-fdx),wy=dirX*rny+dirY*uy+dirZ*(-fdy),wz=dirX*rnz+dirY*uz+dirZ*(-fdz);
+  const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
+  const Dx=wx/wl,Dy=wy/wl,Dz=wz/wl;
+  const hitY=rayMarchPineapple(camPos.x,camPos.y,camPos.z,Dx,Dy,Dz);
+  if(hitY!==null)addBand(hitY);
+};
+canvas.onmousemove=e=>{
+  if(dragging){
+    const dx=e.clientX-mdx,dy=e.clientY-mdy;
+    const dist=camera.position.length();
+    const yaw=prevCamYaw-dx*0.005;
+    const pitch=Math.max(-1.4,Math.min(1.4,prevCamPitch+dy*0.005));
+    camera.position.set(
+      dist*Math.cos(pitch)*Math.sin(yaw),
+      dist*Math.sin(pitch),
+      dist*Math.cos(pitch)*Math.cos(yaw)
+    );
+    camera.lookAt(0,0,0);
+    return;
+  }
+  // Preview ring when hovering over pineapple
+  if(!restVolume){return;}
+  const rect=canvas.getBoundingClientRect();
+  const ndcX=((e.clientX-rect.left)/rect.width)*2-1,ndcY=-((e.clientY-rect.top)/rect.height)*2+1;
+  const camPos=camera.position;
+  const asp=canvas.width/canvas.height,f=1/Math.tan(Math.PI*40/360);
+  const dirX=ndcX*asp/f,dirY=ndcY/f,dirZ=-1;
+  const fx=-camPos.x,fy=-camPos.y,fz=-camPos.z;const fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const fdx=fx/fl,fdy=fy/fl,fdz=fz/fl;
+  const rtx=1*fdz,rtz=-1*fdx;const rl=Math.sqrt(rtx*rtx+rtz*rtz);
+  const rnx=rtx/rl,rny=0,rnz=rtz/rl;
+  const ux=fdy*rnz-fdz*rny,uy=fdz*rnx-fdx*rnz,uz=fdx*rny-fdy*rnx;
+  const wx=dirX*rnx+dirY*ux+dirZ*(-fdx),wy=dirX*rny+dirY*uy+dirZ*(-fdy),wz=dirX*rnz+dirY*uz+dirZ*(-fdz);
+  const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
+  const Dx=wx/wl,Dy=wy/wl,Dz=wz/wl;
+  const hitY=rayMarchPineapple(camPos.x,camPos.y,camPos.z,Dx,Dy,Dz);
+  if(hitY!==null){
+    ringY=hitY;
+    ringR=getRadiusAtY(Math.max(modelMinY+0.1,Math.min(modelMaxY-0.1,hitY)));
+    ringVisible=true;
+  }else{
+    ringVisible=false;
+  }
+};
+
+canvas.onwheel=e=>{e.preventDefault();let d=e.deltaY;if(e.deltaMode===1)d*=40;if(e.deltaMode===2)d*=800;camera.position.multiplyScalar(1+d*0.001);camera.position.clampLength(1.5,15);},{passive:false};
+
+window.onkeydown=e=>{if(e.key.toLowerCase()==='r')removeBand();};
+
+window.onresize=()=>{
+  canvas.width=window.innerWidth;canvas.height=window.innerHeight;
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+};
+
+// ═══════ Animation loop ═══════
+const clock={last:performance.now()};
+
+async function animate(){
+  const now=performance.now(),dt=Math.min((now-clock.last)/1000,0.1);clock.last=now;
+
+  if(!restVolume){requestAnimationFrame(animate);return;}
+
+  // --- PBD ---
+  if(bands.length>0&&!pbdConverged){
+    const ms=await runPBD_GPU();
+    pbdAccumTime+=ms;
+    H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms';
+    convergeFrames++;
+    if(convergeFrames>=CONVERGE_FRAMES){pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';}
+    
+    // GPU-to-GPU copy already done inside runPBD_GPU (positions + normals)
+    if(pineappleMesh){
+      // band radii already updated in runPBD_GPU
+    }
+  }else if(bands.length>0&&pbdConverged){
+    H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';
+  }else if(needsRestore){
+    await runRestore_GPU();
+    H.pbdtime.textContent='已恢复 ✓';
+    if(pineappleMesh){
+      // Restore Three.js buffers from CPU rest data
+      pineappleMesh.geometry.attributes.position.array.set(highResRestPositions);
+      pineappleMesh.geometry.attributes.position.needsUpdate = true;
+      pineappleMesh.geometry.computeVertexNormals();
+    }
+  }else{
+    H.pbdtime.textContent='空闲';
+  }
+
+  // --- Render with Three.js ---
+  renderer.render(scene, camera);
+
+  // --- Our own WebGPU ring rendering (zero CPU readback for band radii) ---
+  if(restVolume&&previewUB&&torusSinglePipeline){
+    // Build MVP from Three.js camera
+    const m=new THREE.Matrix4();
+    m.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    const mvp=new Float32Array(m.elements);
+    const mvpData=new Float32Array(24);
+    mvpData.set(mvp,0);
+
+    const tv=renderer.backend.context.getCurrentTexture().createView();
+    const cmd=device.createCommandEncoder();
+    const rp=cmd.beginRenderPass({colorAttachments:[{view:tv,loadOp:'load',storeOp:'store'}]});
+
+    // Band rings (instanced)
+    if(bands.length>0){
+      rp.setPipeline(torusPipeline);
+      queue.writeBuffer(previewUB,0,mvpData);
+      rp.setBindGroup(0,torusInstBG_actual);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT,bands.length);
+      rp.setBindGroup(0,torusInstBG_target);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT,bands.length);
+    }
+
+    // Preview ring (single yellow)
+    if(ringVisible){
+      const ru=new Float32Array(24);ru.set(mvp,0);ru[16]=ringY;ru[17]=ringR;ru[20]=1;ru[21]=1;ru[22]=0;ru[23]=0.6;
+      queue.writeBuffer(previewUB,0,ru);
+      rp.setPipeline(torusSinglePipeline);rp.setBindGroup(0,torusBG);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT);
+    }
+
+    rp.end();device.queue.submit([cmd.finish()]);
+  }
+
+  H.fps.textContent=Math.round(1/dt);
+  H.framems.textContent=(performance.now()-now).toFixed(1);
+  requestAnimationFrame(animate);
+}
+
+console.log('🔧 PBD 菠萝 — Three.js WebGPU 版 (共享 device) — 加载模型中...');
+animate();
+</script>
+</body>
+</html>
