@@ -360,7 +360,7 @@ struct P{vc:u32}
 
 // GPU band radius scanner — writes actual radius to bandInstBuf (used by rendering)
 const bandRadCS=device.createShaderModule({label:'bandRad',code:`
-struct B{cy:f32,inf:f32}
+struct B{cy:f32,tr:f32,stiff:f32,inf:f32}
 struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
 struct P{vc:u32,bc:u32}
 @group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
@@ -634,13 +634,15 @@ async function runPBD_GPU(){
     for(const lv of volRedLevels){cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,lv.bg);cp.dispatchWorkgroups(lv.wgCount,1,1);}
     cp.setPipeline(volApPipe.pipe);cp.setBindGroup(0,isA?volApBG_AB:volApBG_BA);cp.dispatchWorkgroups(WG,1,1);
     // On last iteration: also run norm recompute, unpack, band radius scan, and copy volume to staging
+    // IMPORTANT: these must read from the OUTPUT buffer (!isA), not the input buffer (isA)
     if(isLast){
-      cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,isA?normBG_A:normBG_B);cp.dispatchWorkgroups(WG,1,1);
-      cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,isA?normUnpackBG_A:normUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
-      cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,isA?posUnpackBG_A:posUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
+      const outA=!isA;
+      cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,outA?normBG_A:normBG_B);cp.dispatchWorkgroups(WG,1,1);
+      cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,outA?normUnpackBG_A:normUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
+      cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,outA?posUnpackBG_A:posUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
       if(bands.length>0){
         queue.writeBuffer(bandRadUB,0,new Uint32Array([vertexCount,bands.length]));
-        cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,isA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bands.length,1,1);
+        cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,outA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bands.length,1,1);
       }
     }
     cp.end();
