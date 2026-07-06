@@ -116,7 +116,7 @@ $('sl_ss').oninput=e=>{SHAPE_STIFF=+e.target.value;$('sv_ss').textContent=SHAPE_
 $('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(3);for(const b of bands)b.stiff=BAND_STIFF;markPbdDirty();};
 $('sl_vs').oninput=e=>{VOL_STIFF=+e.target.value;$('sv_vs').textContent=VOL_STIFF.toFixed(2);markPbdDirty();};
 $('sl_bi').oninput=e=>{BAND_INF=+e.target.value;$('sv_bi').textContent=BAND_INF.toFixed(2);for(const b of bands)b.inf=BAND_INF;markPbdDirty();};
-$('sl_tr').oninput=e=>{BAND_TARGET=+e.target.value;$('sv_tr').textContent=BAND_TARGET.toFixed(2);for(const b of bands)b.targetRadius=BAND_TARGET;markPbdDirty();updateTargetRingScales();};
+$('sl_tr').oninput=e=>{BAND_TARGET=+e.target.value;$('sv_tr').textContent=BAND_TARGET.toFixed(2);for(const b of bands)b.targetRadius=BAND_TARGET;markPbdDirty();writeBandInstances();};
 $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
 
@@ -159,90 +159,68 @@ function addBand(centerY){
   bands.push({centerY,targetRadius:BAND_TARGET,stiff:BAND_STIFF,inf:BAND_INF});
   H.bcount.textContent=bands.length;
   markPbdDirty();
-  updateBandRings();
+  writeBandInstances();
   console.log('皮筋 #'+bands.length,'y='+centerY.toFixed(3),'target='+BAND_TARGET.toFixed(3));
 }
 
 function removeBand(){
-  if(bands.length>0){bands.pop();H.bcount.textContent=bands.length;needsRestore=true;markPbdDirty();updateBandRings();}
+  if(bands.length>0){bands.pop();H.bcount.textContent=bands.length;needsRestore=true;markPbdDirty();writeBandInstances();}
 }
 
-// ═══════ Band ring visualization (Three.js TorusGeometry) ═══════
-let bandRingGroup = new THREE.Group();
-scene.add(bandRingGroup);
-let targetRingGroup = new THREE.Group();
-scene.add(targetRingGroup);
-
-function updateBandRings(){
-  // Clear existing rings
-  while(bandRingGroup.children.length>0) bandRingGroup.remove(bandRingGroup.children[0]);
-  while(targetRingGroup.children.length>0) targetRingGroup.remove(targetRingGroup.children[0]);
-  
-  const torusGeo = new THREE.TorusGeometry(1, 0.025, 16, 48);
-  torusGeo.rotateX(Math.PI / 2);
-  const actualMat = new THREE.MeshBasicMaterial({ color: '#cc0000', transparent: true, opacity: 0.85, depthTest: false, depthWrite: false });
-  const targetMat = new THREE.MeshBasicMaterial({ color: '#00cc44', transparent: true, opacity: 0.6, depthTest: false, depthWrite: false });
-  
-  for(const b of bands){
-    const actualRing = new THREE.Mesh(torusGeo.clone(), actualMat);
-    actualRing.position.y = b.centerY;
-    actualRing.scale.setScalar(getRadiusAtY(b.centerY));
-    bandRingGroup.add(actualRing);
-    
-    const targetRing = new THREE.Mesh(torusGeo.clone(), targetMat);
-    targetRing.position.y = b.centerY;
-    targetRing.scale.setScalar(b.targetRadius);
-    targetRingGroup.add(targetRing);
+// Write band offset + color to GPU instance buffers (scale is written by bandRadCS)
+function writeBandInstances(){
+  for(let b=0;b<bands.length;b++){
+    // Actual ring (red): offset+color, scale computed by bandRadCS on GPU
+    const d=new Float32Array([bands[b].centerY,0,1,0.2,0.2,0.8]);
+    queue.writeBuffer(bandInstBuf,b*24,d);
+    // Target ring (green): fixed target radius
+    const td=new Float32Array([bands[b].centerY,bands[b].targetRadius,0,1,0,0.6]);
+    queue.writeBuffer(targetInstBuf,b*24,td);
   }
 }
 
-// Update actual band ring scales from deformed positions (called after PBD)
-// Uses a small GPU→CPU readback for band radius data only (~1KB)
-async function updateBandActualRadii(){
-  if(bands.length===0||!srcPos)return;
-  // Sample vertices near each band's Y for radius computation
-  // Read ~1000 vertices (16KB) to compute band radii
-  const SAMPLE_COUNT = Math.min(vertexCount, 1000);
-  const sampleStride = Math.max(1, Math.floor(vertexCount / SAMPLE_COUNT));
-  const sampleSize = SAMPLE_COUNT * 4 * 4; // vec4 = 16 bytes each
-  const bandStaging = mkBuf(sampleSize, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, 'bandStaging');
-  
-  const cmd = device.createCommandEncoder();
-  // Copy strided samples from srcPos to staging
-  for(let s = 0; s < SAMPLE_COUNT; s++){
-    const vi = Math.min(s * sampleStride, vertexCount - 1);
-    cmd.copyBufferToBuffer(srcPos, vi * 4 * 4, bandStaging, s * 4 * 4, 4 * 4);
-  }
-  device.queue.submit([cmd.finish()]);
-  await bandStaging.mapAsync(GPUMapMode.READ);
-  const samples = new Float32Array(bandStaging.getMappedRange(0, sampleSize));
-  
-  for(let i=0;i<bands.length;i++){
-    if(i>=bandRingGroup.children.length)break;
-    const b=bands[i];
-    const thresh=b.inf*0.3;
-    let sumR=0,cnt=0;
-    for(let s=0;s<SAMPLE_COUNT;s++){
-      const y=samples[s*4+1];
-      if(Math.abs(y-b.centerY)<thresh){
-        sumR+=Math.sqrt(samples[s*4]**2+samples[s*4+2]**2);
-        cnt++;
-      }
-    }
-    const actualR=cnt>1?sumR/cnt:getRadiusAtY(b.centerY);
-    bandRingGroup.children[i].scale.setScalar(actualR);
-  }
-  bandStaging.unmap();
-  bandStaging.destroy();
+// ═══════ Band ring visualization (our own WebGPU, zero CPU readback) ═══════
+function buildTorus(majorR,minorR,tubeSegs,radSegs){
+  const p=[],idx=[];
+  for(let i=0;i<=tubeSegs;i++){const u=i/tubeSegs*Math.PI*2,cu=Math.cos(u),su=Math.sin(u);for(let j=0;j<=radSegs;j++){const v=j/radSegs*Math.PI*2,cv=Math.cos(v),sv=Math.sin(v);p.push((majorR+minorR*cv)*cu,minorR*sv,(majorR+minorR*cv)*su);}}
+  const rv=radSegs+1;
+  for(let i=0;i<tubeSegs;i++)for(let j=0;j<radSegs;j++){const a=i*rv+j,b=a+rv,c=a+1,d=b+1;idx.push(a,c,b,b,c,d);}
+  return{positions:new Float32Array(p),indices:new Uint32Array(idx)};
 }
+const torus=buildTorus(1.0,0.025,48,16);
+const TORUS_I_COUNT=torus.indices.length;
+let torusVBuf,torusIBuf;
 
-// Update target (green) ring scales when target radius slider changes
-function updateTargetRingScales(){
-  for(let i=0;i<bands.length;i++){
-    if(i>=targetRingGroup.children.length)break;
-    targetRingGroup.children[i].scale.setScalar(bands[i].targetRadius);
-  }
+// Instanced torus shader for band rings
+const torusInstShader=device.createShaderModule({label:'torusInst',code:`
+struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct U{mvp:mat4x4<f32>}
+struct VOut{@builtin(position)pos:vec4<f32>,@location(0)col:vec4<f32>}
+@group(0)@binding(0)var<storage,read>instances:array<Inst>;
+@group(0)@binding(1)var<uniform>u:U;
+@vertex fn vs(@location(0)p:vec3<f32>,@builtin(instance_index)ii:u32)->VOut{
+  let inst=instances[ii];
+  var o:VOut;
+  o.pos=u.mvp*vec4(p.x*inst.scale,inst.offset+p.y,p.z*inst.scale,1.0);
+  o.col=vec4(inst.r,inst.g,inst.b,inst.a);
+  return o;
 }
+@fragment fn fs(in:VOut)->@location(0)vec4<f32>{return in.col;}
+`});
+
+// Single torus shader for preview ring
+const torusSingleShader=device.createShaderModule({label:'torusSingle',code:`
+struct U{mvp:mat4x4<f32>,offset:f32,scale:f32,color:vec4<f32>}
+@group(0)@binding(0)var<uniform>u:U;
+@vertex fn vs(@location(0)p:vec4<f32>)->@builtin(position)vec4<f32>{
+  return u.mvp*vec4(p.x*u.scale,u.offset+p.y,p.z*u.scale,1.0);
+}
+@fragment fn fs()->@location(0)vec4<f32>{return u.color;}
+`});
+
+let torusBG,torusPipeline,torusSinglePipeline;
+let bandInstBuf,targetInstBuf,previewUB;
+const INST_BYTE=MAX_BANDS*24; // 6 floats per band: offset,scale,r,g,b,a
 
 // ═══════ Utility ═══════
 function mkBuf(size,usage,label){return device.createBuffer({size,usage,label});}
@@ -380,6 +358,32 @@ struct P{vc:u32}
 }
 `});
 
+// GPU band radius scanner — writes actual radius to bandInstBuf (used by rendering)
+const bandRadCS=device.createShaderModule({label:'bandRad',code:`
+struct B{cy:f32,inf:f32}
+struct Inst{offset:f32,scale:f32,r:f32,g:f32,b:f32,a:f32}
+struct P{vc:u32,bc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>bands:array<B>;
+@group(0)@binding(2)var<storage,read_write>inst:array<Inst>;
+@group(0)@binding(3)var<uniform>p:P;
+var<workgroup>sSum:array<f32,256>;
+var<workgroup>sCnt:array<u32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
+  let bandY=bands[b].cy;let thresh=bands[b].inf*0.3;
+  var sumR=f32(0);var cnt=u32(0);var vi=lid.x;
+  while(vi<p.vc){
+    let y=pos[vi].y;
+    if(abs(y-bandY)<thresh){sumR+=length(pos[vi].xz);cnt++;}
+    vi+=256u;
+  }
+  sSum[lid.x]=sumR;sCnt[lid.x]=cnt;workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sSum[lid.x]+=sSum[lid.x+s];sCnt[lid.x]+=sCnt[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){inst[b].scale=select(0.0,sSum[0]/f32(sCnt[0]),sCnt[0]>1u);}
+}
+`});
+
 // ── Compute Pipelines ──
 function cpPipe(shader,entry,bgEntries,label){
   const bgl=device.createBindGroupLayout({entries:bgEntries});
@@ -399,6 +403,7 @@ const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)
 const normPipe=cpPipe(normCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'norm');
 const normUnpackPipe=cpPipe(normUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'normUnpack');
 const posUnpackPipe=cpPipe(posUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'posUnpack');
+const bandRadPipe=cpPipe(bandRadCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'bandRad');
 
 const shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
 const bandUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandU');
@@ -484,6 +489,8 @@ loadModel().catch(e=>console.error('加载失败:',e));
 let shapeBG_AB,shapeBG_BA,bandBG_AB,bandBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B;
 let normBG_A,normBG_B,normUnpackBG_A,normUnpackBG_B,normB,norm3B,normUB;
 let pos3B,posUnpackBG_A,posUnpackBG_B;
+let bandRadBG_A,bandRadBG_B,bandRadUB;
+let torusInstBG_actual,torusInstBG_target;
 
 function initPBD(posArr,idxArr,adjOffsets,adjData){
   WG=Math.ceil(vertexCount/256);VWG=Math.ceil(triCount/256);
@@ -513,8 +520,8 @@ function initPBD(posArr,idxArr,adjOffsets,adjData){
       lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:db}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);srcCount=dc;srcBuf=db;}
   }
 
-  // Staging buffer for volume readback only (positions go GPU→GPU to Three.js)
-  staging=mkBuf(4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+  // Staging buffer for volume + band radii readback (tiny, ~1KB max)
+  staging=mkBuf(Math.max(4,MAX_BANDS*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
 
   // Adjacency buffers for GPU normal recomputation
   const adjOffB=mkBuf(adjOffsets.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'adjOff');
@@ -543,6 +550,31 @@ function initPBD(posArr,idxArr,adjOffsets,adjData){
     {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:pos3B}},{binding:2,resource:{buffer:normUB}}]});
   posUnpackBG_B=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
     {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:pos3B}},{binding:2,resource:{buffer:normUB}}]});
+
+  // Band instance buffers for rendering (GPU writes scale, CPU writes offset+color)
+  bandInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandInst');
+  targetInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'targetInst');
+  bandRadUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandRadU');
+  bandRadBG_A=device.createBindGroup({layout:bandRadPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
+  bandRadBG_B=device.createBindGroup({layout:bandRadPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:bandB}},{binding:2,resource:{buffer:bandInstBuf}},{binding:3,resource:{buffer:bandRadUB}}]});
+
+  // Torus geometry buffers for ring rendering
+  torusVBuf=mkBuf(torus.positions.length*4,GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST,'torusV');
+  torusIBuf=mkBuf(torus.indices.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST,'torusI');
+  queue.writeBuffer(torusVBuf,0,torus.positions);queue.writeBuffer(torusIBuf,0,torus.indices);
+  previewUB=mkBuf(96,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'previewU');
+  const torusBGL=device.createBindGroupLayout({entries:[
+    {binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'uniform'}}]});
+  torusBG=device.createBindGroup({layout:torusBGL,entries:[{binding:0,resource:{buffer:previewUB}}]});
+  torusSinglePipeline=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusBGL]}),vertex:{module:torusSingleShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}]}]},fragment:{module:torusSingleShader,entryPoint:'fs',targets:[{format:navigator.gpu.getPreferredCanvasFormat(),blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'}});
+  const torusInstBGL=device.createBindGroupLayout({entries:[
+    {binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{type:'read-only-storage'}},
+    {binding:1,visibility:GPUShaderStage.VERTEX,buffer:{type:'uniform'}}]});
+  torusInstBG_actual=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:bandInstBuf}},{binding:1,resource:{buffer:previewUB}}]});
+  torusInstBG_target=device.createBindGroup({layout:torusInstBGL,entries:[{binding:0,resource:{buffer:targetInstBuf}},{binding:1,resource:{buffer:previewUB}}]});
+  torusPipeline=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[torusInstBGL]}),vertex:{module:torusInstShader,entryPoint:'vs',buffers:[{arrayStride:12,attributes:[{shaderLocation:0,offset:0,format:'float32x3'}],stepMode:'vertex'}]},fragment:{module:torusInstShader,entryPoint:'fs',targets:[{format:navigator.gpu.getPreferredCanvasFormat(),blend:{color:{srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha',operation:'add'},alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'}}}]},primitive:{topology:'triangle-list',cullMode:'none'}});
 
   // Compute bind groups
   const mkBG2=(bgl,fAB,fBA)=>({AB:device.createBindGroup({layout:bgl,entries:fAB(posA,posB)}),BA:device.createBindGroup({layout:bgl,entries:fBA(posA,posB)})});
@@ -607,13 +639,17 @@ async function runPBD_GPU(){
   lastVol=Math.abs(new Float32Array(staging.getMappedRange(0,4))[0]);
   staging.unmap();
 
-  // GPU normal + position unpack for Three.js
+  // GPU normal + position unpack + band radius scan for Three.js
   {
     const cmd=device.createCommandEncoder();
     const cp=cmd.beginComputePass();
     cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,srcPos===posA?normBG_A:normBG_B);cp.dispatchWorkgroups(WG,1,1);
     cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,srcPos===posA?normUnpackBG_A:normUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
     cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,srcPos===posA?posUnpackBG_A:posUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
+    if(bands.length>0){
+      queue.writeBuffer(bandRadUB,0,new Uint32Array([vertexCount,bands.length]));
+      cp.setPipeline(bandRadPipe.pipe);cp.setBindGroup(0,srcPos===posA?bandRadBG_A:bandRadBG_B);cp.dispatchWorkgroups(bands.length,1,1);
+    }
     cp.end();device.queue.submit([cmd.finish()]);
   }
 
@@ -656,12 +692,8 @@ async function runRestore_GPU(){
   lastVol=restVolume;needsRestore=false;H.vratio.textContent='100.0';
 }
 
-// ═══════ Preview ring (yellow) ═══════
-const previewGeo = new THREE.TorusGeometry(1, 0.025, 16, 48);
-previewGeo.rotateX(Math.PI / 2);
-const previewRing = new THREE.Mesh(previewGeo, new THREE.MeshBasicMaterial({ color: '#ffff00', transparent: true, opacity: 0.6, depthTest: false, depthWrite: false }));
-previewRing.visible = false;
-scene.add(previewRing);
+// ═══════ Preview ring state ═══════
+let ringVisible=false,ringY=0,ringR=0.4;
 
 // ═══════ Ray-march against radius profile (for band placement) ═══════
 function rayMarchPineapple(ex,ey,ez,Dx,Dy,Dz){
@@ -748,12 +780,11 @@ canvas.onmousemove=e=>{
   const Dx=wx/wl,Dy=wy/wl,Dz=wz/wl;
   const hitY=rayMarchPineapple(camPos.x,camPos.y,camPos.z,Dx,Dy,Dz);
   if(hitY!==null){
-    const r=getRadiusAtY(Math.max(modelMinY+0.1,Math.min(modelMaxY-0.1,hitY)));
-    previewRing.position.y=hitY;
-    previewRing.scale.setScalar(r);
-    previewRing.visible=true;
+    ringY=hitY;
+    ringR=getRadiusAtY(Math.max(modelMinY+0.1,Math.min(modelMaxY-0.1,hitY)));
+    ringVisible=true;
   }else{
-    previewRing.visible=false;
+    ringVisible=false;
   }
 };
 
@@ -785,9 +816,8 @@ async function animate(){
     if(convergeFrames>=CONVERGE_FRAMES){pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';}
     
     // GPU-to-GPU copy already done inside runPBD_GPU (positions + normals)
-    // Do NOT set needsUpdate=true — that would overwrite our GPU data with stale CPU array
     if(pineappleMesh){
-      await updateBandActualRadii();
+      // band radii already updated in runPBD_GPU
     }
   }else if(bands.length>0&&pbdConverged){
     H.pbdtime.textContent=pbdAccumTime.toFixed(0)+' ms ✓';
@@ -806,6 +836,37 @@ async function animate(){
 
   // --- Render with Three.js ---
   renderer.render(scene, camera);
+
+  // --- Our own WebGPU ring rendering (zero CPU readback for band radii) ---
+  if(restVolume){
+    // Build MVP from Three.js camera
+    const m=new THREE.Matrix4();
+    m.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    const mvp=new Float32Array(m.elements);
+    const mvpData=new Float32Array(24);
+    mvpData.set(mvp,0);
+
+    const tv=renderer.backend.context.getCurrentTexture().createView();
+    const cmd=device.createCommandEncoder();
+    const rp=cmd.beginRenderPass({colorAttachments:[{view:tv,loadOp:'load',storeOp:'store'}]});
+
+    // Band rings (instanced)
+    if(bands.length>0){
+      rp.setPipeline(torusPipeline);
+      queue.writeBuffer(previewUB,0,mvpData);
+      rp.setBindGroup(0,torusInstBG_actual);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT,bands.length);
+      rp.setBindGroup(0,torusInstBG_target);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT,bands.length);
+    }
+
+    // Preview ring (single yellow)
+    if(ringVisible){
+      const ru=new Float32Array(24);ru.set(mvp,0);ru[16]=ringY;ru[17]=ringR;ru[20]=1;ru[21]=1;ru[22]=0;ru[23]=0.6;
+      queue.writeBuffer(previewUB,0,ru);
+      rp.setPipeline(torusSinglePipeline);rp.setBindGroup(0,torusBG);rp.setVertexBuffer(0,torusVBuf);rp.setIndexBuffer(torusIBuf,'uint32');rp.drawIndexed(TORUS_I_COUNT);
+    }
+
+    rp.end();device.queue.submit([cmd.finish()]);
+  }
 
   H.fps.textContent=Math.round(1/dt);
   H.framems.textContent=(performance.now()-now).toFixed(1);
