@@ -539,7 +539,7 @@ async function loadModels(){
   pineappleMesh=new THREE.Mesh(geo,mat);
   scene.add(pineappleMesh);
 
-  // Compute high-res volume + surface area (used for proxy PBD volume constraint)
+  // Compute high-res volume + surface area (for logging only; PBD uses proxy's own rest volume)
   let hrVol=0,hrArea=0;
   for(let t=0;t<idxArr.length;t+=3){
     const ai=idxArr[t]*3,bi=idxArr[t+1]*3,ci=idxArr[t+2]*3;
@@ -548,8 +548,9 @@ async function loadModels(){
     const abx=bx-ax,aby=by-ay,abz=bz-az,acx=cx-ax,acy=cy-ay,acz=cz-az;
     hrArea+=0.5*Math.sqrt((aby*acz-abz*acy)**2+(abz*acx-abx*acz)**2+(abx*acy-aby*acx)**2);
   }
-  restVolume=Math.abs(hrVol);restSurfaceArea=hrArea;
-  console.log('🖼️ 高模渲染:',hvc.toLocaleString(),'顶点, 高模体积:',restVolume.toFixed(4),'(覆盖代理体积)');
+  // NOTE: restVolume/restSurfaceArea stay as proxy values (set in loadModel).
+  // PBD volume constraint must use the proxy's own rest volume, not the high-res volume.
+  console.log('🖼️ 高模渲染:',hvc.toLocaleString(),'顶点, 高模体积:',Math.abs(hrVol).toFixed(4),' 代理体积:',restVolume.toFixed(4));
 
   initPBD(proxyPositions,proxyIdxArr,adjOffsets,adjData,hr.idxArr);
 }
