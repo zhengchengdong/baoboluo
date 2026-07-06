@@ -30,6 +30,7 @@ canvas { display:block; cursor:crosshair; }
  <div>体积: <span class="val" id="vratio">100</span>%</div>
  <div>PBD迭代: <span class="val" id="pbditer">10</span></div>
  <div>PBD耗时: <span class="val" id="pbdtime">--</span> ms</div>
+ <div>叶子分界: <span class="val" id="leafcut">--</span></div>
 </div>
 <div id="info">🖱️ 点击菠萝表面绑皮筋 &nbsp; R 键割一根 &nbsp; 拖拽旋转/滚轮缩放 &nbsp; <span style="color:#cc44ff">⚡ GPU PBD + Three.js WebGPU</span></div>
 
@@ -51,6 +52,9 @@ canvas { display:block; cursor:crosshair; }
 <input type="range" id="sl_cf" min="1" max="20" step="1" value="5">
  <label>delta平滑宽度 <span class="val" id="sv_sm">4.0</span></label>
 <input type="range" id="sl_sm" min="1.0" max="12.0" step="0.5" value="4.0">
+ <label>叶子分界Y <span class="val" id="sv_lc">1.20</span></label>
+<input type="range" id="sl_lc" min="-1.5" max="1.5" step="0.01" value="1.20">
+ <button id="btn_wire" style="margin-top:10px;width:100%;padding:4px 0;background:#333;color:#ff44ff;border:1px solid #ff44ff;border-radius:4px;cursor:pointer;font-size:12px;">🔍 代理线框: OFF</button>
 </div>
 <canvas id="canvas"></canvas>
 
@@ -64,7 +68,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // ═══════ DOM ═══════
 const $=id=>document.getElementById(id);
-const H={fps:$('fps'),framems:$('framems'),vcount:$('vcount'),tcount:$('tcount'),bcount:$('bcount'),vratio:$('vratio'),pbditer:$('pbditer'),pbdtime:$('pbdtime')};
+const H={fps:$('fps'),framems:$('framems'),vcount:$('vcount'),tcount:$('tcount'),bcount:$('bcount'),vratio:$('vratio'),pbditer:$('pbditer'),pbdtime:$('pbdtime'),leafcut:$('leafcut')};
 const canvas=$('canvas');
 
 // ═══════ WebGPU adapter (shared between PBD and Three.js) ═══════
@@ -99,6 +103,7 @@ scene.add(new THREE.DirectionalLight('#fff', 1.5).translateY(5));
 // ═══════ State ═══════
 let vertexCount=0,triCount=0,restVolume=0,restSurfaceArea=0;
 let modelMinY=-1.5,modelMaxY=1.5;
+let leafCutoffY=1.5; // Y above which vertices are excluded from PBD (leaves)
 let posA,posB,restB,idxB,bandB,volB,volTotalB,staging;
 let volRedLevels=[];
 let srcPos,dstPos;
@@ -110,6 +115,7 @@ let SHAPE_STIFF=0.30,BAND_STIFF=0.50,VOL_STIFF=0.40,BAND_INF=0.60,BAND_TARGET=0.
 let lastVol=0,pbdConverged=false,convergeFrames=0,needsRestore=false;
 let pbdAccumTime=0;
 let CONVERGE_FRAMES=5;
+let showProxyWire=false;
 
 function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
 
@@ -123,6 +129,21 @@ $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
 let SIGMA_MUL=4.0;
 $('sl_sm').oninput=e=>{SIGMA_MUL=+e.target.value;$('sv_sm').textContent=SIGMA_MUL.toFixed(1);markPbdDirty();};
+$('sl_lc').oninput=e=>{leafCutoffY=+e.target.value;$('sv_lc').textContent=leafCutoffY.toFixed(2);H.leafcut.textContent=leafCutoffY.toFixed(2);resetProxyAndDelta();};
+$('btn_wire').onclick=()=>{showProxyWire=!showProxyWire;$('btn_wire').textContent='🔍 代理线框: '+(showProxyWire?'ON':'OFF');if(proxyWireMesh)proxyWireMesh.visible=showProxyWire;};
+
+// Force-reset proxy positions to rest + clear delta table (for leaf cutoff changes)
+function resetProxyAndDelta(){
+  if(!restB||!posA||!posB||!deltaBuf)return;
+  const cmd=device.createCommandEncoder();
+  cmd.copyBufferToBuffer(restB,0,posA,0,proxyVertexCount*4*4);
+  cmd.copyBufferToBuffer(restB,0,posB,0,proxyVertexCount*4*4);
+  device.queue.submit([cmd.finish()]);
+  const one=new Float32Array(DELTA_BUCKETS);for(let i=0;i<DELTA_BUCKETS;i++)one[i]=1.0;
+  queue.writeBuffer(deltaBuf,0,one);
+  lastVol=restVolume;
+  markPbdDirty();
+}
 
 // ═══════ Bands ═══════
 const MAX_BANDS=256;
@@ -141,6 +162,12 @@ function buildRadiusProfile(positions){
     const idx=Math.min(RADIUS_BUCKETS-1,Math.floor((y-minY)/range*RADIUS_BUCKETS));
     buckets[idx]+=r;cnts[idx]++;
   }
+  // Set leaf cutoff slider range to match model; default to 85% height (estimate)
+  $('sl_lc').min=minY;$('sl_lc').max=maxY;
+  leafCutoffY=minY+(maxY-minY)*0.85;
+  $('sl_lc').value=leafCutoffY;$('sv_lc').textContent=leafCutoffY.toFixed(2);
+  H.leafcut.textContent=leafCutoffY.toFixed(2);
+  console.log('🌿 叶子分界 Y =',leafCutoffY.toFixed(3),'(范围:',minY.toFixed(2),'~',maxY.toFixed(2),') 拖动滑块可调');
   radiusProfile={minY,maxY,buckets,counts:cnts};
 }
 
@@ -159,7 +186,8 @@ function addBand(centerY){
   if(!restVolume)return;
   if(bands.length>=MAX_BANDS){console.warn('达到最大皮筋数:',MAX_BANDS);return;}
   const margin=BAND_INF*0.3;
-  centerY=Math.max(modelMinY+margin,Math.min(modelMaxY-margin,centerY));
+  // Clamp to fruit body only (exclude leaves above leafCutoffY)
+  centerY=Math.max(modelMinY+margin,Math.min(leafCutoffY-margin,centerY));
   bands.push({centerY,targetRadius:BAND_TARGET,stiff:BAND_STIFF,inf:BAND_INF});
   H.bcount.textContent=bands.length;
   markPbdDirty();
@@ -232,21 +260,22 @@ function mkBuf(size,usage,label){return device.createBuffer({size,usage,label});
 
 // ═══════ WGSL Compute Shaders (identical to pineapple_WebGPU.html) ═══════
 const shapeCS=device.createShaderModule({label:'shape',code:`
-struct P{stiffness:f32,vc:u32}
+struct P{stiffness:f32,vc:u32,cutoff:f32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
 @group(0)@binding(3)var<uniform>p:P;
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
-  let cur=src[i];let r=rest[i];let d=r.xyz-cur.xyz;
+  let cur=src[i];if(cur.y>p.cutoff){dst[i]=cur;return;}
+  let r=rest[i];let d=r.xyz-cur.xyz;
   dst[i]=vec4(cur.xyz+d*p.stiffness,1.0);
 }
 `});
 
 const bandCS=device.createShaderModule({label:'band',code:`
 struct Band{cy:f32,tr:f32,stiff:f32,inf:f32}
-struct P{bc:u32,vc:u32}
+struct P{bc:u32,vc:u32,cutoff:f32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
@@ -254,7 +283,7 @@ struct P{bc:u32,vc:u32}
 @group(0)@binding(4)var<uniform>p:P;
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
-  var cur=src[i];
+  var cur=src[i];if(cur.y>p.cutoff){dst[i]=cur;return;}
   for(var b=0u;b<256u;b++){if(b>=p.bc){break;}
     let bd=bands[b];let dy=abs(cur.y-bd.cy);if(dy>=bd.inf){continue;}
     let r=length(cur.xz);if(r<1e-6){continue;}
@@ -293,14 +322,15 @@ var<workgroup>sdata:array<f32,256>;
 `});
 
 const volApCS=device.createShaderModule({label:'volAp',code:`
-struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
+struct P{vc:u32,rest:f32,stiff:f32,surface:f32,cutoff:f32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read>volTotal:array<f32>;
 @group(0)@binding(3)var<uniform>p:P;
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
-  let cur=src[i];let r=length(cur.xz);
+  let cur=src[i];if(cur.y>p.cutoff){dst[i]=cur;return;}
+  let r=length(cur.xz);
   if(r<1e-6){dst[i]=cur;return;}
   let curVol=abs(volTotal[0]);let deficit=p.rest-curVol;
   let push=select(p.stiff*deficit/p.surface,0.0,abs(deficit)<1e-9);
@@ -422,7 +452,8 @@ var<workgroup>sWeight:array<f32,256>;
 }
 `});
 
-// Apply delta field to high-res mesh: linear interpolation on smooth kernel-weighted table
+// Apply delta field to high-res mesh: linear interpolation on smooth kernel-weighted table.
+// Vertices outside proxy Y range (e.g. leaf tips beyond proxy) get scale=1.0.
 const applyDeltaCS=device.createShaderModule({label:'applyDelta',code:`
 struct P{vc:u32,buckets:u32,minY:f32,range:f32}
 @group(0)@binding(0)var<storage,read>rest:array<vec4<f32>>;
@@ -432,11 +463,13 @@ struct P{vc:u32,buckets:u32,minY:f32,range:f32}
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   let rp=rest[i];let y=rp.y;
-  let tf=(y-p.minY)/p.range*f32(p.buckets);
+  let inRange=y>=p.minY&&y<=p.minY+p.range;
+  let tf=select(0.0,(y-p.minY)/p.range*f32(p.buckets),inRange);
   let bidx0=u32(floor(tf));
   let bidx1=min(bidx0+1u,p.buckets-1u);
   let frac=tf-f32(bidx0);
-  let scale=mix(delta[bidx0],delta[bidx1],frac);
+  let rawScale=mix(delta[bidx0],delta[bidx1],frac);
+  let scale=select(1.0,rawScale,inRange);
   outPos[i]=vec4(rp.x*scale,y,rp.z*scale,1.0);
 }
 `});
@@ -464,10 +497,10 @@ const bandRadPipe=cpPipe(bandRadCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3
 const buildDeltaPipe=cpPipe(buildDeltaCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(4,CS)],'buildDelta');
 const applyDeltaPipe=cpPipe(applyDeltaCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'applyDelta');
 
-const shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
-const bandUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandU');
+const shapeUB=mkBuf(12,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
+const bandUB=mkBuf(12,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandU');
 const volAccUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volAccU');
-const volApUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volApU');
+const volApUB=mkBuf(20,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volApU');
 
 // ═══════ Dual model loading (proxy for PBD, high-res for Three.js rendering) ═══════
 let pineappleMesh;         // Three.js high-res mesh for rendering
@@ -475,7 +508,7 @@ let proxyVertexCount=0, proxyTriCount=0;  // proxy mesh dimensions (PBD compute)
 let proxyPositions, proxyIdxArr;          // CPU copies of proxy data
 const DELTA_BUCKETS=256;                  // 1D lookup table resolution
 
-async function loadModel(name, doProcess){
+async function loadModel(name, doProcess, refTransform=null){
   const loader=new GLTFLoader();
   const gltf=await new Promise((res,rej)=>loader.load(name,res,undefined,rej));
   let srcMesh=null;gltf.scene.traverse(c=>{if(c.isMesh&&!srcMesh)srcMesh=c;});
@@ -484,11 +517,15 @@ async function loadModel(name, doProcess){
   srcGeo.computeBoundingBox();
   const cen=new THREE.Vector3();srcGeo.boundingBox.getCenter(cen);
   const siz=new THREE.Vector3();srcGeo.boundingBox.getSize(siz);
-  const sc=3.0/siz.y;
+  // Use reference transform from proxy model for alignment, otherwise compute own
+  const sc=refTransform?refTransform.sc:(3.0/siz.y);
+  const offX=refTransform?refTransform.cen.x:cen.x;
+  const offY=refTransform?refTransform.cen.y:cen.y;
+  const offZ=refTransform?refTransform.cen.z:cen.z;
   const pa=srcGeo.attributes.position.array;
   const vc=srcGeo.attributes.position.count;
   const pos=new Float32Array(vc*3);
-  for(let i=0;i<vc;i++){pos[i*3]=(pa[i*3]-cen.x)*sc;pos[i*3+1]=(pa[i*3+1]-cen.y)*sc;pos[i*3+2]=(pa[i*3+2]-cen.z)*sc;}
+  for(let i=0;i<vc;i++){pos[i*3]=(pa[i*3]-offX)*sc;pos[i*3+1]=(pa[i*3+1]-offY)*sc;pos[i*3+2]=(pa[i*3+2]-offZ)*sc;}
   const idxArr=srcGeo.index?new Uint32Array(srcGeo.index.array):(()=>{const a=new Uint32Array(vc);for(let i=0;i<vc;i++)a[i]=i;return a;})();
   if(doProcess){
     // Proxy model: run PBD on this
@@ -511,16 +548,17 @@ async function loadModel(name, doProcess){
     console.log('   restVolume:',restVolume.toFixed(4),'restSurfaceArea:',restSurfaceArea.toFixed(2));
     buildRadiusProfile(pos);
   }
-  return{pos,idxArr,srcGeo,srcMesh};
+  return{pos,idxArr,srcGeo,srcMesh,transform:{cen:{x:offX,y:offY,z:offZ},sc}};
 }
 
 let highResRestPositions;  // CPU copy of high-res rest positions
+let proxyWireMesh=null;    // wireframe overlay of proxy model
 
 async function loadModels(){
   // Load proxy first (small mesh, used for PBD)
-  await loadModel('pineapple_py.glb', true);
-  // Load high-res (display mesh, receives delta field)
-  const hr=await loadModel('pineapple.glb', false);
+  const proxyResult=await loadModel('pineapple_py.glb?t='+Date.now(), true);
+  // Load high-res (display mesh, receives delta field) — use proxy's transform for alignment
+  const hr=await loadModel('pineapple.glb', false, proxyResult.transform);
   const srcGeo=hr.srcGeo;const pos=hr.pos;const idxArr=hr.idxArr;
   const srcMesh=hr.srcMesh;
   const hvc=pos.length/3;
@@ -558,6 +596,26 @@ async function loadModels(){
   console.log('🖼️ 高模渲染:',hvc.toLocaleString(),'顶点, 高模体积:',Math.abs(hrVol).toFixed(4),' 代理体积:',restVolume.toFixed(4));
 
   initPBD(proxyPositions,proxyIdxArr,adjOffsets,adjData,hr.idxArr);
+
+  // Create proxy wireframe overlay using LineSegments (manually build edge indices)
+  const edgeMap=new Map();
+  for(let t=0;t<proxyIdxArr.length;t+=3){
+    for(let e=0;e<3;e++){
+      const a=proxyIdxArr[t+e],b=proxyIdxArr[t+(e+1)%3];
+      const key=Math.min(a,b)*proxyVertexCount+Math.max(a,b);
+      if(!edgeMap.has(key))edgeMap.set(key,[a,b]);
+    }
+  }
+  const edgeIdx=new Uint32Array(edgeMap.size*2);let ei=0;
+  for(const[a,b]of edgeMap.values()){edgeIdx[ei++]=a;edgeIdx[ei++]=b;}
+  const wireGeo=new THREE.BufferGeometry();
+  wireGeo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(proxyPositions),3));
+  wireGeo.setIndex(new THREE.BufferAttribute(edgeIdx,1));
+  proxyWireMesh=new THREE.LineSegments(wireGeo,new THREE.LineBasicMaterial({color:'#ff44ff',transparent:true,opacity:0.7,depthTest:false,depthWrite:false}));
+  proxyWireMesh.visible=showProxyWire;
+  proxyWireMesh.renderOrder=999;
+  scene.add(proxyWireMesh);
+  $('btn_wire').textContent='🔍 代理线框: '+(showProxyWire?'ON':'OFF');
 }
 loadModels().catch(e=>console.error('加载失败:',e));
 
@@ -569,13 +627,14 @@ let deltaBuf,buildDeltaBG_A,buildDeltaBG_B,buildDeltaUB;
 let highResRestB,highResOutB,applyDeltaBG,applyDeltaUB,hrPos3B;
 let highResUnpackBG,highResCount=0;
 let hrNormBG,hrNormUnpackBG,hrNorm3B;
+let proxyPos3B,proxyUnpackBG_A,proxyUnpackBG_B;
 
 function initPBD(posArr,idxArr,adjOffsets,adjData,hrIdxArr){
   WG=Math.ceil(proxyVertexCount/256);VWG=Math.ceil(proxyTriCount/256);
   const VB=proxyVertexCount*4*4;
   posA=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posA');
   posB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posB');
-  restB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'rest');
+  restB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'rest');
   idxB=mkBuf(idxArr.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'idx');
   bandB=mkBuf(MAX_BANDS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'band');
 
@@ -643,6 +702,15 @@ function initPBD(posArr,idxArr,adjOffsets,adjData,hrIdxArr){
   highResUnpackBG=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
     {binding:0,resource:{buffer:highResOutB}},{binding:1,resource:{buffer:hrPos3B}},{binding:2,resource:{buffer:hrUnpackUB}}]});
 
+  // Proxy position unpack (for wireframe overlay)
+  proxyPos3B=mkBuf(proxyVertexCount*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'proxyPos3');
+  const proxyUnpackUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'proxyUnpackU');
+  queue.writeBuffer(proxyUnpackUB,0,new Uint32Array([proxyVertexCount]));
+  proxyUnpackBG_A=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:proxyPos3B}},{binding:2,resource:{buffer:proxyUnpackUB}}]});
+  proxyUnpackBG_B=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:proxyPos3B}},{binding:2,resource:{buffer:proxyUnpackUB}}]});
+
   // Band instance buffers (unchanged, but uses proxy positions for radius scan)
   bandInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandInst');
   targetInstBuf=mkBuf(INST_BYTE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'targetInst');
@@ -693,12 +761,12 @@ const _zeroRedLv=[];
 
 async function runPBD_GPU(){
   const t0=performance.now();
-  const sp=new ArrayBuffer(8);new Float32Array(sp)[0]=SHAPE_STIFF;new Uint32Array(sp)[1]=proxyVertexCount;
-  const bp=new Uint32Array([bands.length,proxyVertexCount]);
+  const sp=new ArrayBuffer(12);new Float32Array(sp)[0]=SHAPE_STIFF;new Uint32Array(sp)[1]=proxyVertexCount;new Float32Array(sp,8)[0]=leafCutoffY;
+  const bp=new ArrayBuffer(12);new Uint32Array(bp)[0]=bands.length;new Uint32Array(bp)[1]=proxyVertexCount;new Float32Array(bp,8)[0]=leafCutoffY;
   const bd=new Float32Array(bands.length*4);
   for(let b=0;b<bands.length;b++){bd[b*4]=bands[b].centerY;bd[b*4+1]=bands[b].targetRadius;bd[b*4+2]=bands[b].stiff;bd[b*4+3]=bands[b].inf;}
   const vacU=new Uint32Array([proxyTriCount]);
-  const vapU=new ArrayBuffer(16);new Uint32Array(vapU)[0]=proxyVertexCount;new Float32Array(vapU)[1]=restVolume;new Float32Array(vapU)[2]=VOL_STIFF;new Float32Array(vapU)[3]=restSurfaceArea;
+  const vapU=new ArrayBuffer(20);new Uint32Array(vapU)[0]=proxyVertexCount;new Float32Array(vapU)[1]=restVolume;new Float32Array(vapU)[2]=VOL_STIFF;new Float32Array(vapU)[3]=restSurfaceArea;new Float32Array(vapU,16)[0]=leafCutoffY;
   if(_zeroTriP.length<proxyTriCount){_zeroTriP=new Float32Array(proxyTriCount);for(let i=0;i<proxyTriCount;i++)_zeroTriP[i]=0;}
   if(_zeroRedLv.length===0){for(const lv of volRedLevels){if(lv.dstBuf!==volTotalB)_zeroRedLv.push(new Float32Array(lv.wgCount));}}
 
@@ -706,7 +774,7 @@ async function runPBD_GPU(){
   const lastIter=PBD_ITER-1;
   for(let iter=0;iter<PBD_ITER;iter++){
     const isA=srcPos===posA,isLast=iter===lastIter;
-    queue.writeBuffer(shapeUB,0,sp);if(bands.length>0){queue.writeBuffer(bandB,0,bd);queue.writeBuffer(bandUB,0,bp);}
+    queue.writeBuffer(shapeUB,0,sp);if(bands.length>0){queue.writeBuffer(bandB,0,bd);queue.writeBuffer(bandUB,0,new Uint8Array(bp));}
     queue.writeBuffer(volAccUB,0,vacU);queue.writeBuffer(volTotalB,0,_zero1);queue.writeBuffer(volB,0,_zeroTriP);
     for(let li=0;li<volRedLevels.length;li++){const lv=volRedLevels[li];if(lv.dstBuf!==volTotalB)queue.writeBuffer(lv.dstBuf,0,_zeroRedLv[li]);}
     queue.writeBuffer(volApUB,0,vapU);
@@ -738,6 +806,8 @@ async function runPBD_GPU(){
   cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,highResUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
   cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,hrNormBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
   cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,hrNormUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  // Unpack proxy positions for wireframe overlay
+  cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,srcPos===posA?proxyUnpackBG_A:proxyUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
   cp.end();device.queue.submit([cmd.finish()]);}
   if(pineappleMesh){
     const posAttr=pineappleMesh.geometry.attributes.position;
@@ -751,12 +821,22 @@ async function runPBD_GPU(){
       device.queue.submit([cmd.finish()]);
     }
   }
+  // Copy proxy positions to wireframe mesh (independent of high-res mesh)
+  if(proxyWireMesh&&proxyWireMesh.visible){
+    const proxyAttr=proxyWireMesh.geometry.attributes.position;
+    const proxyData=renderer.backend.get(proxyAttr);
+    if(proxyData&&proxyData.buffer){
+      const cmd2=device.createCommandEncoder();
+      cmd2.copyBufferToBuffer(proxyPos3B,0,proxyData.buffer,0,proxyVertexCount*3*4);
+      device.queue.submit([cmd2.finish()]);
+    }
+  }
 
   H.vratio.textContent=(lastVol/restVolume*100).toFixed(1);return performance.now()-t0;
 }
 
 async function runRestore_GPU(){
-  const sp=new ArrayBuffer(8);new Float32Array(sp)[0]=SHAPE_STIFF;new Uint32Array(sp)[1]=proxyVertexCount;
+  const sp=new ArrayBuffer(12);new Float32Array(sp)[0]=SHAPE_STIFF;new Uint32Array(sp)[1]=proxyVertexCount;new Float32Array(sp,8)[0]=leafCutoffY;
   srcPos=posA;dstPos=posB;
   for(let iter=0;iter<30;iter++){queue.writeBuffer(shapeUB,0,sp);const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,srcPos===posA?shapeBG_AB:shapeBG_BA);cp.dispatchWorkgroups(WG,1,1);cp.end();device.queue.submit([cmd.finish()]);swap();}
   lastVol=restVolume;needsRestore=false;H.vratio.textContent='100.0';
@@ -771,7 +851,7 @@ let ringVisible=false,ringY=0,ringR=0.4;
 function rayMarchPineapple(ex,ey,ez,Dx,Dy,Dz){
   let tMin=0,tMax=Infinity;
   if(Math.abs(Dy)>1e-9){
-    const t0=(modelMinY-ey)/Dy,t1=(modelMaxY-ey)/Dy;
+    const t0=(modelMinY-ey)/Dy,t1=(leafCutoffY-ey)/Dy;
     tMin=Math.max(0,Math.min(t0,t1));
     tMax=Math.min(tMax,Math.max(t0,t1));
   }
@@ -853,8 +933,8 @@ canvas.onmousemove=e=>{
   const hitY=rayMarchPineapple(camPos.x,camPos.y,camPos.z,Dx,Dy,Dz);
   if(hitY!==null){
     ringY=hitY;
-    ringR=getRadiusAtY(Math.max(modelMinY+0.1,Math.min(modelMaxY-0.1,hitY)));
-    ringVisible=true;
+    ringR=getRadiusAtY(Math.max(modelMinY+0.1,Math.min(leafCutoffY-0.1,hitY)));
+    ringVisible=hitY<=leafCutoffY;
   }else{
     ringVisible=false;
   }
