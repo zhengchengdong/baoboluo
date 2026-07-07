@@ -200,7 +200,7 @@ scene.add(wireframe);
 // ═══════════════════════════════════════
 let restPositions=null;
 let restVolume=0, restSurfaceArea=0;
-let restGradDirs=null; // precomputed unit volume-gradient directions (rest config)
+let restGradDir=null;    // precomputed unit volume-gradient directions (rest config)
 
 function initRestState(){
     const p=elliGeo.attributes.position;
@@ -208,7 +208,6 @@ function initRestState(){
     const idx=elliGeo.index.array;
     const vc=p.count;
     let vol=0,area=0;
-    const a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();
 
     // Accumulate volume + surface area + per-vertex rest gradient
     const grad=new Float32Array(vc*3);
@@ -218,10 +217,11 @@ function initRestState(){
         const bx=p.array[bi],by=p.array[bi+1],bz=p.array[bi+2];
         const cx=p.array[ci],cy=p.array[ci+1],cz=p.array[ci+2];
         vol+=(ax*(by*cz-bz*cy)+ay*(bz*cx-bx*cz)+az*(bx*cy-by*cx))/6;
-        area+=0.5*new THREE.Vector3().crossVectors(
-            new THREE.Vector3().subVectors(b,a),
-            new THREE.Vector3().subVectors(c,a)
-        ).length();
+        // Triangle area = 0.5 * |(B-A)×(C-A)|
+        const abx=bx-ax,aby=by-ay,abz=bz-az;
+        const acx=cx-ax,acy=cy-ay,acz=cz-az;
+        const crx=aby*acz-abz*acy, cry=abz*acx-abx*acz, crz=abx*acy-aby*acx;
+        area+=0.5*Math.sqrt(crx*crx+cry*cry+crz*crz);
         // Rest volume gradient: ∇V_A = (B×C)/6
         grad[ai]  +=(by*cz-bz*cy)/6; grad[ai+1]+=(bz*cx-bx*cz)/6; grad[ai+2]+=(bx*cy-by*cx)/6;
         grad[bi]  +=(cy*az-cz*ay)/6; grad[bi+1]+=(cz*ax-cx*az)/6; grad[bi+2]+=(cx*ay-cy*ax)/6;
@@ -230,18 +230,34 @@ function initRestState(){
     restVolume=Math.abs(vol);
     restSurfaceArea=area;
 
-    // Normalize rest gradient directions (unit vectors, stable forever)
-    restGradDirs=new Float32Array(vc*3);
+    // Store unit gradient directions (normalized, outward-facing)
+    // Using uniform magnitude avoids pole-vs-equator disparity from mesh discretization
+    restGradDir=new Float32Array(vc*3);
     const gradSign=vol<0?-1:1; // flip if CW wound
     for(let i=0;i<vc;i++){
         const i3=i*3;
-        const gx=grad[i3]*gradSign,gy=grad[i3+1]*gradSign,gz=grad[i3+2]*gradSign;
+        let gx=grad[i3]*gradSign, gy=grad[i3+1]*gradSign, gz=grad[i3+2]*gradSign;
+        // Per-vertex outward check: dot(position, gradient) must be > 0
+        const px=restPositions[i3], py=restPositions[i3+1], pz=restPositions[i3+2];
+        if(px*gx+py*gy+pz*gz<0){gx=-gx;gy=-gy;gz=-gz;}
         const gm=Math.sqrt(gx*gx+gy*gy+gz*gz);
-        if(gm>1e-9){restGradDirs[i3]=gx/gm;restGradDirs[i3+1]=gy/gm;restGradDirs[i3+2]=gz/gm;}
+        if(gm>1e-9){restGradDir[i3]=gx/gm;restGradDir[i3+1]=gy/gm;restGradDir[i3+2]=gz/gm;}
     }
 
     H.vcount.textContent=p.count;
     console.log('椭球:',p.count,'顶点',idx.length/3,'三角形 restVol:',restVolume.toFixed(4));
+    // ── diagnostic: gradient distribution ──
+    const topPole=0, bottomPole=TOTAL_V-1;
+    const eqRing=1+Math.floor(RINGS/2)*SEGS; // equator-ish ring start
+    const nearPole=1; // first ring vertex below top pole
+    function gradMag(i){const i3=i*3;const gx=restGradDir[i3],gy=restGradDir[i3+1],gz=restGradDir[i3+2];return{mag:Math.sqrt(gx*gx+gy*gy+gz*gz),dir:[gx,gy,gz]};}
+    function logGrad(label,i){const g=gradMag(i);console.log('  ∇V['+label+' #'+i+'] mag='+g.mag.toExponential(4)+' dir=('+g.dir[0].toFixed(2)+','+g.dir[1].toFixed(2)+','+g.dir[2].toFixed(2)+')');}
+    logGrad('topPole',topPole);
+    logGrad('botPole',bottomPole);
+    logGrad('nearPole',nearPole);
+    logGrad('eqRing0',eqRing);
+    logGrad('eqRing1',eqRing+1);
+    console.log('  restSurfaceArea =',restSurfaceArea.toFixed(4));
 }
 
 // ═══════════════════════════════════════
@@ -571,6 +587,7 @@ function pbdApplyBand(band,posArr,idxArr){
     const exact=getExactCrossSectionPolyline(posArr,idxArr,oo,no);
     if(exact.points3D.length<9)return; // not enough for a closed loop
     const currPerim=exact.perimeter;
+    if(!isFinite(currPerim)){console.error('BAND perim NaN! exact.points3D len='+exact.points3D.length);return;}
     if(currPerim<1e-6)return;
     if(currPerim<=L0)return; // band is loose
 
@@ -591,8 +608,8 @@ function pbdApplyBand(band,posArr,idxArr){
     }
 }
 
-// Volume constraint: XZ radial uniform scale.
-// Multiplicative (stable), pushes in the same plane band compresses in.
+// Volume constraint: gradient-based PBD correction.
+// Each vertex is pushed along its rest volume-gradient direction.
 let _volDeficitSmooth=0;
 function pbdApplyVolume(posArr,idxArr){
     let currVol=0;
@@ -609,17 +626,18 @@ function pbdApplyVolume(posArr,idxArr){
     if(Math.abs(deficit)<1e-9){_volDeficitSmooth*=0.5;return currVol;}
     _volDeficitSmooth=_volDeficitSmooth*0.8+deficit*0.2;
 
-    // Volume scales as r² in XZ (for rotationally-symmetric shapes)
-    // target scale: r_new/r = √(V_rest/V)
-    const targetS=Math.sqrt(restVolume/Math.max(currVol,1e-9));
-    const effS=1.0+(targetS-1.0)*VOL_STIFF;
-    const clampedS=Math.max(0.97,Math.min(1.03,effS));
-
+    // PBD volume correction: uniform shell-thickness displacement along surface normals
+    // dV ≈ SurfaceArea × dr  →  dr = stiffness × deficit / SurfaceArea
+    const step=VOL_STIFF*_volDeficitSmooth/Math.max(restSurfaceArea,1e-9);
+    if(!isFinite(step)){console.error('VOL STEP NaN! deficit_smooth='+_volDeficitSmooth+' area='+restSurfaceArea);return currVol;}
     const vc=elliGeo.attributes.position.count;
     for(let i=0;i<vc;i++){
         const i3=i*3;
-        posArr[i3]  *=clampedS;
-        posArr[i3+2]*=clampedS;
+        const dx=step*restGradDir[i3], dy=step*restGradDir[i3+1], dz=step*restGradDir[i3+2];
+        if(!isFinite(dx)||!isFinite(dy)||!isFinite(dz)){console.error('VOL DISP NaN at vtx '+i+' dir=('+restGradDir[i3]+','+restGradDir[i3+1]+','+restGradDir[i3+2]+') step='+step);continue;}
+        posArr[i3]  +=dx;
+        posArr[i3+1]+=dy;
+        posArr[i3+2]+=dz;
     }
     return currVol;
 }
