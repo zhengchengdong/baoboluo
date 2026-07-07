@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>皮筋系统试验场 — 周长约束 + 截面质心缩放</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#111; overflow:hidden; font-family:monospace; }
+canvas { display:block; cursor:crosshair; }
+
+#hud {
+    position:fixed; top:12px; left:12px; z-index:10;
+    color:#ccc; font-size:13px; line-height:1.7; pointer-events:none;
+}
+#hud .val { color:#0f0; }
+
+#info {
+    position:fixed; bottom:16px; left:50%; transform:translateX(-50%);
+    color:#888; font-size:12px; z-index:10; pointer-events:none;
+}
+
+#panel {
+    position:fixed; top:12px; right:12px; z-index:20;
+    background:rgba(0,0,0,0.85); border:1px solid #555;
+    border-radius:8px; padding:14px 18px; color:#ccc;
+    font-size:12px; min-width:240px; pointer-events:all; user-select:none;
+    max-height:90vh; overflow-y:auto;
+}
+#panel label { display:block; margin:6px 0 2px; color:#aaa; }
+#panel input[type=range] { width:100%; margin:0; accent-color:#ff44cc; }
+#panel .val { color:#ff44cc; float:right; }
+#panel h3 { margin:8px 0 4px; color:#fff; font-size:13px; border-top:1px solid #444; padding-top:8px; }
+#panel h3:first-child { border-top:none; padding-top:0; }
+#panel .row { display:flex; gap:8px; align-items:center; }
+#panel .row span { flex:0 0 auto; color:#aaa; font-size:11px; }
+#panel .row input { flex:1; }
+#panel .btn { margin-top:6px; width:100%; padding:4px 0; background:#333; color:#ff44cc;
+    border:1px solid #ff44cc; border-radius:4px; cursor:pointer; font-size:11px; }
+#panel .btn:hover { background:#444; }
+#panel .kb { display:inline-block; background:#333; color:#ff4; padding:1px 5px;
+    border-radius:3px; font-size:10px; margin:0 2px; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+ <div>FPS: <span class="val" id="fps">--</span></div>
+ <div>帧耗时: <span class="val" id="framems">--</span> ms</div>
+ <div>顶点: <span class="val" id="vcount">--</span></div>
+ <div>皮筋: <span class="val" id="bcount">0</span></div>
+ <div>体积: <span class="val" id="vratio">100</span>%</div>
+ <div>当前周长比: <span class="val" id="cratio">--</span></div>
+ <div>PBD迭代: <span class="val" id="pbditer">10</span></div>
+ <div>放置模式: <span class="val" id="placemode">水平(Y)</span></div>
+</div>
+<div id="info">
+ 🖱️ 点击表面绑皮筋(水平) &nbsp;
+ <span class="kb">R</span>=割一根 &nbsp;
+ <span class="kb">C</span>=全部割掉
+</div>
+
+<div id="panel">
+ <h3>🔧 PBD 参数</h3>
+ <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
+ <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
+ <label>皮筋刚度 <span class="val" id="sv_bs">0.50</span></label>
+ <input type="range" id="sl_bs" min="0.01" max="1.0" step="0.01" value="0.50">
+ <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
+ <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
+ <label>影响范围 <span class="val" id="sv_bi">0.60</span></label>
+ <input type="range" id="sl_bi" min="0.2" max="2.0" step="0.05" value="0.60">
+ <label>皮筋周长 L₀<span style="color:#888">(全局)</span> <span class="val" id="sv_rc">2.51</span></label>
+ <input type="range" id="sl_rc" min="0.3" max="6.0" step="0.01" value="2.51">
+ <label>PBD迭代 <span class="val" id="sv_pi">15</span></label>
+ <input type="range" id="sl_pi" min="1" max="50" step="1" value="15">
+
+ <h3>🎯 最后放置的皮筋 <span class="val" id="lb_info">(空)</span></h3>
+ <label>rest周长 <span class="val" id="sv_lr">--</span></label>
+ <input type="range" id="sl_lr" min="0.3" max="6.0" step="0.01" value="2.51">
+ <div class="row"><span>法向X</span><input type="range" id="sl_nx" min="-1" max="1" step="0.01" value="0"><span class="val" id="sv_nx">0</span></div>
+ <div class="row"><span>法向Y</span><input type="range" id="sl_ny" min="-1" max="1" step="0.01" value="1"><span class="val" id="sv_ny">1</span></div>
+ <div class="row"><span>法向Z</span><input type="range" id="sl_nz" min="-1" max="1" step="0.01" value="0"><span class="val" id="sv_nz">0</span></div>
+ <div class="row"><span>刚度</span><input type="range" id="sl_bk" min="0.01" max="1" step="0.01" value="0.5"><span class="val" id="sv_bk">0.5</span></div>
+ <button class="btn" id="btn_normalize">归一化法向量</button>
+ <button class="btn" id="btn_horiz">设为水平</button>
+ <button class="btn" id="btn_vert">设为竖直(X)</button>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ═══════════════════════════════════════
+// DOM refs
+// ═══════════════════════════════════════
+const $=id=>document.getElementById(id);
+const H={
+    fps:$('fps'),framems:$('framems'),vcount:$('vcount'),
+    bcount:$('bcount'),vratio:$('vratio'),cratio:$('cratio'),
+    pbditer:$('pbditer'),placemode:$('placemode'),
+};
+
+// ═══════════════════════════════════════
+// Three.js setup
+// ═══════════════════════════════════════
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+renderer.setSize(window.innerWidth,window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene=new THREE.Scene();
+scene.background=new THREE.Color('#111122');
+
+const camera=new THREE.PerspectiveCamera(45,window.innerWidth/window.innerHeight,0.1,50);
+camera.position.set(2,2,4);
+camera.lookAt(0,0,0);
+
+const controls=new OrbitControls(camera,renderer.domElement);
+controls.target.set(0,0,0);
+controls.enableDamping=true;
+controls.update();
+
+scene.add(new THREE.AmbientLight('#fff',0.5));
+const dLight=new THREE.DirectionalLight('#fff',1.5);
+dLight.position.set(0,5,0);
+scene.add(dLight);
+
+// ═══════════════════════════════════════
+// Ellipsoid geometry
+// ═══════════════════════════════════════
+const ELLI_RX=0.5, ELLI_RY=1.5, ELLI_RZ=0.5;
+const RINGS=50, SEGS=56;  // decent resolution for CPU PBD
+const TOTAL_V=1+RINGS*SEGS+1;
+
+function buildEllipsoid(rx,ry,rz,rings,segs){
+    const pos=[], norms=[];
+    // top pole
+    pos.push(0,ry,0); norms.push(0,1,0);
+    // rings
+    for(let ring=0;ring<rings;ring++){
+        const phi=Math.PI*(ring+1)/(rings+1);
+        const sinPhi=Math.sin(phi), cosPhi=Math.cos(phi);
+        for(let seg=0;seg<segs;seg++){
+            const th=2*Math.PI*seg/segs;
+            const x=rx*sinPhi*Math.cos(th);
+            const y=ry*cosPhi;
+            const z=rz*sinPhi*Math.sin(th);
+            pos.push(x,y,z);
+            const nx=x/(rx*rx), ny=y/(ry*ry), nz=z/(rz*rz);
+            const nl=Math.sqrt(nx*nx+ny*ny+nz*nz);
+            norms.push(nx/nl,ny/nl,nz/nl);
+        }
+    }
+    // bottom pole
+    pos.push(0,-ry,0); norms.push(0,-1,0);
+
+    const idx=[];
+    const top=0, bottom=TOTAL_V-1;
+    for(let s=0;s<segs;s++){const c=1+s,n=1+(s+1)%segs; idx.push(top,c,n);}
+    for(let r=0;r<rings-1;r++){
+        const rs=1+r*segs, ns=1+(r+1)*segs;
+        for(let s=0;s<segs;s++){
+            const a=rs+s,b=rs+(s+1)%segs,c=ns+s,d=ns+(s+1)%segs;
+            idx.push(a,c,b); idx.push(b,c,d);
+        }
+    }
+    const lrs=1+(rings-1)*segs;
+    for(let s=0;s<segs;s++){const c=lrs+s,n=lrs+(s+1)%segs; idx.push(c,bottom,n);}
+
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+    geo.setAttribute('normal',new THREE.Float32BufferAttribute(norms,3));
+    geo.setIndex(idx);
+    return geo;
+}
+
+const elliGeo=buildEllipsoid(ELLI_RX,ELLI_RY,ELLI_RZ,RINGS,SEGS);
+
+// Mesh
+const surfMat=new THREE.MeshPhongMaterial({
+    color:'#ffaa00',transparent:true,opacity:0.35,
+    side:THREE.DoubleSide,depthWrite:false,
+});
+const elliMesh=new THREE.Mesh(elliGeo,surfMat);
+scene.add(elliMesh);
+
+const wireMat=new THREE.MeshBasicMaterial({
+    color:'#ffffff',wireframe:true,transparent:true,opacity:0.4,
+});
+const wireframe=new THREE.Mesh(elliGeo,wireMat);
+scene.add(wireframe);
+
+// ═══════════════════════════════════════
+// PBD State
+// ═══════════════════════════════════════
+let restPositions=null;
+let restVolume=0, restSurfaceArea=0;
+
+function initRestState(){
+    const p=elliGeo.attributes.position;
+    restPositions=new Float32Array(p.array);
+    const idx=elliGeo.index.array;
+    let vol=0,area=0;
+    const a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();
+    for(let i=0;i<idx.length;i+=3){
+        const ai=idx[i]*3,bi=idx[i+1]*3,ci=idx[i+2]*3;
+        a.set(p.array[ai],p.array[ai+1],p.array[ai+2]);
+        b.set(p.array[bi],p.array[bi+1],p.array[bi+2]);
+        c.set(p.array[ci],p.array[ci+1],p.array[ci+2]);
+        vol+=(a.x*(b.y*c.z-b.z*c.y)+a.y*(b.z*c.x-b.x*c.z)+a.z*(b.x*c.y-b.y*c.x))/6;
+        area+=0.5*new THREE.Vector3().crossVectors(
+            new THREE.Vector3().subVectors(b,a),
+            new THREE.Vector3().subVectors(c,a)
+        ).length();
+    }
+    restVolume=Math.abs(vol);
+    restSurfaceArea=area;
+    H.vcount.textContent=p.count;
+    console.log('椭球:',p.count,'顶点',idx.length/3,'三角形 restVol:',restVolume.toFixed(4));
+}
+
+// ═══════════════════════════════════════
+// PBD Params (must be before initRestState)
+// ═══════════════════════════════════════
+let SHAPE_STIFF=0.30, BAND_STIFF=0.50, VOL_STIFF=0.40;
+let BAND_INFLU=0.60, BAND_REST_CIRCUM=2.51, PBD_ITER=15;
+
+initRestState();
+
+// ═══════════════════════════════════════
+// Band System (NEW)
+// ═══════════════════════════════════════
+// Each band:
+//   planeOrigin: [x,y,z]   — point on the band plane
+//   planeNormal: [nx,ny,nz] — unit normal of the band plane
+//   restCircum: float       — natural circumference L₀
+//   stiffness:  float       — compression stiffness
+//   influRadius: float      — influence half-width along normal
+
+const bands=[];
+const bandVisuals=[];  // {lineActual:THREE.Line, lineTarget:THREE.Line}
+
+// ═══════════════════════════════════════
+// Helper: get cross-section polygon (shared by PBD, visuals, preview)
+// ═══════════════════════════════════════
+function getCrossSectionPolygon(posArr,vertexCount,origin,normal,influRadius,numBuckets=0){
+    // Collect affected vertices, project to plane, compute weighted centroid
+    const projPts=[];
+    for(let i=0;i<vertexCount;i++){
+        const i3=i*3;
+        const dx=posArr[i3]-origin[0],dy=posArr[i3+1]-origin[1],dz=posArr[i3+2]-origin[2];
+        const signedD=dx*normal[0]+dy*normal[1]+dz*normal[2];
+        const absD=Math.abs(signedD);
+        if(absD>=influRadius)continue;
+        const w=smoothstep(influRadius,0,absD);
+        const px=posArr[i3]-signedD*normal[0];
+        const py=posArr[i3+1]-signedD*normal[1];
+        const pz=posArr[i3+2]-signedD*normal[2];
+        projPts.push({px,py,pz,w});
+    }
+    if(projPts.length<3)return{centroid:origin.slice(),perimeter:0,count:0,points3D:[]};
+
+    // Weighted centroid
+    let sumW=0,cx=0,cy=0,cz=0;
+    for(const p of projPts){sumW+=p.w;cx+=p.w*p.px;cy+=p.w*p.py;cz+=p.w*p.pz;}
+    cx/=sumW;cy/=sumW;cz/=sumW;
+    const centroid=[cx,cy,cz];
+
+    // Build local 2D basis on the plane
+    let ux,uy,uz;
+    if(Math.abs(normal[0])<0.9){ux=1;uy=0;uz=0;}else{ux=0;uy=0;uz=1;}
+    {const dot=ux*normal[0]+uy*normal[1]+uz*normal[2];ux-=dot*normal[0];uy-=dot*normal[1];uz-=dot*normal[2];}
+    {const ul=Math.sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;}
+    const vx=normal[1]*uz-normal[2]*uy, vy=normal[2]*ux-normal[0]*uz, vz=normal[0]*uy-normal[1]*ux;
+
+    const polar=[];
+    for(const p of projPts){
+        const rx=p.px-cx,ry=p.py-cy,rz=p.pz-cz;
+        const ru=rx*ux+ry*uy+rz*uz;
+        const rv=rx*vx+ry*vy+rz*vz;
+        polar.push({ang:Math.atan2(rv,ru), rad:Math.sqrt(ru*ru+rv*rv), w:p.w, px:p.px, py:p.py, pz:p.pz});
+    }
+    polar.sort((a,b)=>a.ang-b.ang);
+
+    // ---- Build output points (raw or bucketed) ----
+    let perim=0;
+    const points3D=[];
+
+    if(numBuckets>0){
+        // Angular bucketing: average position + radius per bucket → smooth outline
+        const buckets=[];
+        for(let b=0;b<numBuckets;b++)buckets.push({sumX:0,sumY:0,sumZ:0,sumR:0,sumW:0});
+        for(const p of polar){
+            const bin=Math.min(numBuckets-1,Math.floor(((p.ang+Math.PI)/(2*Math.PI))*numBuckets));
+            buckets[bin].sumX+=p.w*p.px;buckets[bin].sumY+=p.w*p.py;buckets[bin].sumZ+=p.w*p.pz;
+            buckets[bin].sumR+=p.w*p.rad;buckets[bin].sumW+=p.w;
+        }
+        const bucketPts=[];
+        for(const bk of buckets){
+            if(bk.sumW<1e-6)continue;
+            const bx=bk.sumX/bk.sumW, by=bk.sumY/bk.sumW, bz=bk.sumZ/bk.sumW;
+            const br=bk.sumR/bk.sumW;
+            const rx=bx-cx,ry=by-cy,rz=bz-cz;
+            const ru=rx*ux+ry*uy+rz*uz, rv=rx*vx+ry*vy+rz*vz;
+            bucketPts.push({ang:Math.atan2(rv,ru), rad:br, bx,by,bz});
+        }
+        bucketPts.sort((a,b)=>a.ang-b.ang);
+        // Perimeter from bucketed points
+        for(let i=0;i<bucketPts.length;i++){
+            const a=bucketPts[i], b=bucketPts[(i+1)%bucketPts.length];
+            const da=b.ang-a.ang+(i===bucketPts.length-1?2*Math.PI:0);
+            perim+=((a.rad+b.rad)/2)*da;
+            points3D.push(a.bx,a.by,a.bz);
+        }
+    }else{
+        // Raw points (for accurate constraint computation)
+        for(let i=0;i<polar.length;i++){
+            const a=polar[i], b=polar[(i+1)%polar.length];
+            const da=b.ang-a.ang+(i===polar.length-1?2*Math.PI:0);
+            perim+=((a.rad+b.rad)/2)*da;
+            points3D.push(a.px,a.py,a.pz);
+        }
+    }
+    return{centroid,perimeter:perim,count:projPts.length,points3D,polar};
+}
+
+// Legacy wrapper (used by HUD display)
+function computeSectionPerimeter(posArr,vertexCount,origin,normal,influRadius){
+    const r=getCrossSectionPolygon(posArr,vertexCount,origin,normal,influRadius);
+    return{centroid:r.centroid, avgR:0, perimeter:r.perimeter, count:r.count};
+}
+
+// ── Band visual helpers (polyline, not torus) ──
+function makeBandLine(color,opacity){
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute([],3));
+    const mat=new THREE.LineBasicMaterial({color,transparent:true,opacity,depthTest:false,depthWrite:false});
+    const line=new THREE.LineLoop(geo,mat);
+    line.renderOrder=1;
+    line.frustumCulled=false;
+    scene.add(line);
+    return line;
+}
+
+function updateBandLine(line,points3D){
+    const posAttr=line.geometry.attributes.position;
+    if(points3D.length===0){line.visible=false;return;}
+    line.visible=true;
+    if(posAttr.count!==points3D.length/3){
+        line.geometry.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(points3D),3));
+    }else{
+        posAttr.array.set(points3D);
+        posAttr.needsUpdate=true;
+    }
+}
+
+// ── Exact triangle-plane intersection polyline ──
+function getExactCrossSectionPolyline(posArr,idxArr,origin,normal){
+    const EPS=1e-7;
+    const pts=[];
+    for(let t=0;t<idxArr.length;t+=3){
+        const ai=idxArr[t]*3,bi=idxArr[t+1]*3,ci=idxArr[t+2]*3;
+        const ax=posArr[ai],ay=posArr[ai+1],az=posArr[ai+2];
+        const bx=posArr[bi],by=posArr[bi+1],bz=posArr[bi+2];
+        const cx=posArr[ci],cy=posArr[ci+1],cz=posArr[ci+2];
+        const dA=(ax-origin[0])*normal[0]+(ay-origin[1])*normal[1]+(az-origin[2])*normal[2];
+        const dB=(bx-origin[0])*normal[0]+(by-origin[1])*normal[1]+(bz-origin[2])*normal[2];
+        const dC=(cx-origin[0])*normal[0]+(cy-origin[1])*normal[1]+(cz-origin[2])*normal[2];
+        const sA=dA>EPS?1:(dA<-EPS?-1:0);
+        const sB=dB>EPS?1:(dB<-EPS?-1:0);
+        const sC=dC>EPS?1:(dC<-EPS?-1:0);
+        if(sA===sB&&sB===sC&&sA!==0)continue;
+        if(sA===0)pts.push([ax,ay,az]);
+        if(sB===0)pts.push([bx,by,bz]);
+        if(sC===0)pts.push([cx,cy,cz]);
+        const edges=[
+            {a:[ax,ay,az],b:[bx,by,bz],da:dA,db:dB},
+            {a:[bx,by,bz],b:[cx,cy,cz],da:dB,db:dC},
+            {a:[cx,cy,cz],b:[ax,ay,az],da:dC,db:dA},
+        ];
+        for(const e of edges){
+            if((e.da>EPS&&e.db<-EPS)||(e.da<-EPS&&e.db>EPS)){
+                const t=e.da/(e.da-e.db);
+                pts.push([e.a[0]+t*(e.b[0]-e.a[0]),e.a[1]+t*(e.b[1]-e.a[1]),e.a[2]+t*(e.b[2]-e.a[2])]);
+            }
+        }
+    }
+    if(pts.length<3)return{points3D:[],centroid:origin.slice(),perimeter:0};
+
+    let cx=0,cy=0,cz=0;
+    for(const p of pts){cx+=p[0];cy+=p[1];cz+=p[2];}
+    cx/=pts.length;cy/=pts.length;cz/=pts.length;
+
+    let ux,uy,uz;
+    if(Math.abs(normal[0])<0.9){ux=1;uy=0;uz=0;}else{ux=0;uy=0;uz=1;}
+    {const dot=ux*normal[0]+uy*normal[1]+uz*normal[2];ux-=dot*normal[0];uy-=dot*normal[1];uz-=dot*normal[2];}
+    {const ul=Math.sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;}
+    const vx=normal[1]*uz-normal[2]*uy,vy=normal[2]*ux-normal[0]*uz,vz=normal[0]*uy-normal[1]*ux;
+
+    const polar=[];
+    for(const p of pts){
+        const rx=p[0]-cx,ry=p[1]-cy,rz=p[2]-cz;
+        const ru=rx*ux+ry*uy+rz*uz,rv=rx*vx+ry*vy+rz*vz;
+        polar.push({ang:Math.atan2(rv,ru),p});
+    }
+    polar.sort((a,b)=>a.ang-b.ang);
+
+    const pts3D=[];
+    const DEDUP=1e-6;
+    for(const{ang,p}of polar){
+        if(pts3D.length>=3){
+            const l=pts3D.length-3;
+            const dx=p[0]-pts3D[l],dy=p[1]-pts3D[l+1],dz=p[2]-pts3D[l+2];
+            if(Math.sqrt(dx*dx+dy*dy+dz*dz)<DEDUP)continue;
+        }
+        pts3D.push(p[0],p[1],p[2]);
+    }
+
+    let perim=0;
+    for(let i=0;i<pts3D.length/3;i++){
+        const i3=i*3,j3=((i+1)%(pts3D.length/3))*3;
+        const dx=pts3D[j3]-pts3D[i3],dy=pts3D[j3+1]-pts3D[i3+1],dz=pts3D[j3+2]-pts3D[i3+2];
+        perim+=Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    return{points3D:pts3D,centroid:[cx,cy,cz],perimeter:perim};
+}
+
+// ── Update band visual from live deformed positions ──
+function updateBandVisual(idx){
+    const b=bands[idx];
+    const vis=bandVisuals[idx];
+    if(!vis||!b)return;
+    const pos=elliGeo.attributes.position;
+    const idxArr=elliGeo.index.array;
+    const exact=getExactCrossSectionPolyline(pos.array,idxArr,b.planeOrigin,b.planeNormal);
+    if(exact.points3D.length<9){vis.lineActual.visible=false;vis.lineTarget.visible=false;return;}
+
+    // Actual cross-section: exact triangle-plane intersection
+    updateBandLine(vis.lineActual,exact.points3D);
+
+    // Target: scale exact polyline toward centroid by L₀/perimeter
+    if(exact.perimeter>b.restCircum){
+        const s=b.restCircum/exact.perimeter;
+        const cx=exact.centroid[0],cy=exact.centroid[1],cz=exact.centroid[2];
+        const targetPts=[];
+        for(let i=0;i<exact.points3D.length;i+=3){
+            const dx=exact.points3D[i]-cx,dy=exact.points3D[i+1]-cy,dz=exact.points3D[i+2]-cz;
+            targetPts.push(cx+dx*s,cy+dy*s,cz+dz*s);
+        }
+        updateBandLine(vis.lineTarget,targetPts);
+        vis.lineTarget.visible=true;
+    }else{
+        vis.lineTarget.visible=false;
+    }
+}
+
+function smoothstep(e0,e1,x){
+    const t=Math.max(0,Math.min(1,(x-e0)/(e1-e0)));
+    return t*t*(3-2*t);
+}
+
+// ═══════════════════════════════════════
+// Band add/remove
+// ═══════════════════════════════════════
+function addBand(origin,normal){
+    const margin=0.05;
+    // Clamp origin to be within ellipsoid-ish range
+    const dist=Math.sqrt(
+        (origin[0]/ELLI_RX)**2+(origin[1]/ELLI_RY)**2+(origin[2]/ELLI_RZ)**2
+    );
+    if(dist<0.2||dist>1.2)return; // not near surface
+
+    // Normalize normal
+    const nl=Math.sqrt(normal[0]**2+normal[1]**2+normal[2]**2);
+    const nn=[normal[0]/nl,normal[1]/nl,normal[2]/nl];
+
+    // Compute current cross-section perimeter
+    const posArr=elliGeo.attributes.position.array;
+    const vc=elliGeo.attributes.position.count;
+    const sec=computeSectionPerimeter(posArr,vc,origin,nn,BAND_INFLU);
+
+    if(sec.count<3){console.warn('截面顶点不足,跳过');return;}
+
+    const restCircum=BAND_REST_CIRCUM;
+    const band={
+        planeOrigin:[...origin],
+        planeNormal:[...nn],
+        restCircum,
+        stiffness:BAND_STIFF,
+        influRadius:BAND_INFLU,
+    };
+    bands.push(band);
+
+    // Visuals: polyline rings (actual + target)
+    const visActual=makeBandLine('#ff3333',0.8);
+    const visTarget=makeBandLine('#33ff33',0.35);
+    bandVisuals.push({lineActual:visActual,lineTarget:visTarget});
+
+    H.bcount.textContent=bands.length;
+    updateLastBandPanel(bands.length-1);
+    console.log(`皮筋 #${bands.length} O=(${origin[0].toFixed(2)},${origin[1].toFixed(2)},${origin[2].toFixed(2)}) N=(${nn[0].toFixed(2)},${nn[1].toFixed(2)},${nn[2].toFixed(2)}) L₀=${restCircum.toFixed(3)} perim=${sec.perimeter.toFixed(3)}`);
+}
+
+function removeBand(){
+    if(bands.length===0)return;
+    bands.pop();
+    const vis=bandVisuals.pop();
+    if(vis){
+        vis.lineActual.geometry.dispose();vis.lineActual.material.dispose();scene.remove(vis.lineActual);
+        vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();scene.remove(vis.lineTarget);
+    }
+    H.bcount.textContent=bands.length;
+    if(bands.length>0)updateLastBandPanel(bands.length-1);
+    else{$('lb_info').textContent='(空)';}
+}
+
+function removeAllBands(){
+    while(bands.length>0)removeBand();
+}
+
+// ═══════════════════════════════════════
+// Last band panel controls
+// ═══════════════════════════════════════
+function updateLastBandPanel(idx){
+    if(idx<0||idx>=bands.length){$('lb_info').textContent='(空)';return;}
+    const b=bands[idx];
+    $('lb_info').textContent='#'+(idx+1);
+    $('sl_lr').value=b.restCircum;$('sv_lr').textContent=b.restCircum.toFixed(3);
+    $('sl_nx').value=b.planeNormal[0];$('sv_nx').textContent=b.planeNormal[0].toFixed(2);
+    $('sl_ny').value=b.planeNormal[1];$('sv_ny').textContent=b.planeNormal[1].toFixed(2);
+    $('sl_nz').value=b.planeNormal[2];$('sv_nz').textContent=b.planeNormal[2].toFixed(2);
+    $('sl_bk').value=b.stiffness;$('sv_bk').textContent=b.stiffness.toFixed(2);
+}
+
+// Panel event handlers
+$('sl_lr').addEventListener('input',()=>{
+    const v=parseFloat($('sl_lr').value);
+    $('sv_lr').textContent=v.toFixed(3);
+    if(bands.length>0)bands[bands.length-1].restCircum=v;
+});
+$('sl_nx').addEventListener('input',()=>{$('sv_nx').textContent=parseFloat($('sl_nx').value).toFixed(2);applyLastNormal();});
+$('sl_ny').addEventListener('input',()=>{$('sv_ny').textContent=parseFloat($('sl_ny').value).toFixed(2);applyLastNormal();});
+$('sl_nz').addEventListener('input',()=>{$('sv_nz').textContent=parseFloat($('sl_nz').value).toFixed(2);applyLastNormal();});
+$('sl_bk').addEventListener('input',()=>{
+    const v=parseFloat($('sl_bk').value);
+    $('sv_bk').textContent=v.toFixed(2);
+    if(bands.length>0)bands[bands.length-1].stiffness=v;
+});
+
+function applyLastNormal(){
+    if(bands.length===0)return;
+    const nx=parseFloat($('sl_nx').value);
+    const ny=parseFloat($('sl_ny').value);
+    const nz=parseFloat($('sl_nz').value);
+    const nl=Math.sqrt(nx*nx+ny*ny+nz*nz);
+    if(nl<1e-6)return;
+    bands[bands.length-1].planeNormal=[nx/nl,ny/nl,nz/nl];
+    // Don't auto-update sliders — wait for normalize button
+}
+
+$('btn_normalize').addEventListener('click',()=>{
+    if(bands.length===0)return;
+    const b=bands[bands.length-1];
+    const nl=Math.sqrt(b.planeNormal[0]**2+b.planeNormal[1]**2+b.planeNormal[2]**2);
+    b.planeNormal=[b.planeNormal[0]/nl,b.planeNormal[1]/nl,b.planeNormal[2]/nl];
+    updateLastBandPanel(bands.length-1);
+});
+
+$('btn_horiz').addEventListener('click',()=>{
+    if(bands.length===0)return;
+    bands[bands.length-1].planeNormal=[0,1,0];
+    updateLastBandPanel(bands.length-1);
+});
+
+$('btn_vert').addEventListener('click',()=>{
+    if(bands.length===0)return;
+    bands[bands.length-1].planeNormal=[1,0,0];
+    updateLastBandPanel(bands.length-1);
+});
+
+// ═══════════════════════════════════════
+// PBD Solver (CPU, NEW band constraint)
+// ═══════════════════════════════════════
+
+// Shape constraint (unchanged)
+function pbdApplyShape(posArr){
+    const vc=elliGeo.attributes.position.count;
+    let maxD=0;
+    for(let i=0;i<vc;i++){
+        const i3=i*3;
+        const dx=restPositions[i3]-posArr[i3];
+        const dy=restPositions[i3+1]-posArr[i3+1];
+        const dz=restPositions[i3+2]-posArr[i3+2];
+        const disp=Math.sqrt(dx*dx+dy*dy+dz*dz);
+        if(disp>maxD)maxD=disp;
+        posArr[i3]+=dx*SHAPE_STIFF;
+        posArr[i3+1]+=dy*SHAPE_STIFF;
+        posArr[i3+2]+=dz*SHAPE_STIFF;
+    }
+    return maxD;
+}
+
+// Band constraint (NEW: circumference-based + centroid-directed push)
+function pbdApplyBand(band,posArr){
+    const vc=elliGeo.attributes.position.count;
+    const oo=band.planeOrigin;
+    const no=band.planeNormal;
+    const L0=band.restCircum;
+    const k=band.stiffness;
+    const delta=band.influRadius;
+
+    // === Pass 1: Collect affected vertices & compute centroid ===
+    const affected=[];
+    let sumW=0,gx=0,gy=0,gz=0;
+
+    for(let i=0;i<vc;i++){
+        const i3=i*3;
+        const px=posArr[i3],py=posArr[i3+1],pz=posArr[i3+2];
+        const dx=px-oo[0],dy=py-oo[1],dz=pz-oo[2];
+        const signedD=dx*no[0]+dy*no[1]+dz*no[2];
+        const absD=Math.abs(signedD);
+        if(absD>=delta)continue;
+        const w=smoothstep(delta,0,absD);
+        // Project to plane
+        const projX=px-signedD*no[0];
+        const projY=py-signedD*no[1];
+        const projZ=pz-signedD*no[2];
+        affected.push({i,w,projX,projY,projZ,signedD});
+        sumW+=w;
+        gx+=w*projX;gy+=w*projY;gz+=w*projZ;
+    }
+    if(affected.length<3)return;
+
+    gx/=sumW;gy/=sumW;gz/=sumW;
+    const centroid=[gx,gy,gz];
+
+    // === Pass 2: Weighted average in-plane radius from centroid ===
+    // For convex cross-sections, perimeter ≈ 2π × avgR to within a few percent.
+    // Using avgR instead of full polygon perimeter gives smooth, stable convergence.
+    let sumR=0;
+    for(const v of affected){
+        const rx=v.projX-gx,ry=v.projY-gy,rz=v.projZ-gz;
+        const dotN=rx*no[0]+ry*no[1]+rz*no[2];
+        const ipx=rx-dotN*no[0],ipy=ry-dotN*no[1],ipz=rz-dotN*no[2];
+        sumR+=v.w*Math.sqrt(ipx*ipx+ipy*ipy+ipz*ipz);
+    }
+    const avgR=sumR/sumW;
+    if(avgR<1e-6)return;
+
+    // Estimate perimeter from avgR (stable, smooth)
+    const currPerim=2*Math.PI*avgR;
+    if(currPerim<=L0)return; // band is loose
+
+    // === Pass 3: Per-vertex in-plane scale about centroid, weighted by proximity ===
+    const s=L0/currPerim;
+    const baseScale=1.0-k*(1.0-s);  // full correction at w=1
+
+    for(const v of affected){
+        // Blend: w=1(on plane) → full compression; w=0(at edge) → no change
+        const effScale=1.0-v.w*(1.0-baseScale);
+        const i3=v.i*3;
+        const newProjX=gx+(v.projX-gx)*effScale;
+        const newProjY=gy+(v.projY-gy)*effScale;
+        const newProjZ=gz+(v.projZ-gz)*effScale;
+        posArr[i3]  =newProjX+v.signedD*no[0];
+        posArr[i3+1]=newProjY+v.signedD*no[1];
+        posArr[i3+2]=newProjZ+v.signedD*no[2];
+    }
+}
+
+// Volume constraint (unchanged: uniform XZ radial push)
+function pbdApplyVolume(posArr,idxArr){
+    let currVol=0;
+    const a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();
+    for(let i=0;i<idxArr.length;i+=3){
+        const ai=idxArr[i]*3,bi=idxArr[i+1]*3,ci=idxArr[i+2]*3;
+        a.set(posArr[ai],posArr[ai+1],posArr[ai+2]);
+        b.set(posArr[bi],posArr[bi+1],posArr[bi+2]);
+        c.set(posArr[ci],posArr[ci+1],posArr[ci+2]);
+        currVol+=(a.x*(b.y*c.z-b.z*c.y)+a.y*(b.z*c.x-b.x*c.z)+a.z*(b.x*c.y-b.y*c.x))/6;
+    }
+    currVol=Math.abs(currVol);
+    const deficit=restVolume-currVol;
+    if(Math.abs(deficit)<1e-9)return currVol;
+    const push=VOL_STIFF*deficit/restSurfaceArea;
+    const vc=elliGeo.attributes.position.count;
+    for(let i=0;i<vc;i++){
+        const i3=i*3;
+        const x=posArr[i3],z=posArr[i3+2];
+        const r=Math.sqrt(x*x+z*z);
+        if(r<1e-6)continue;
+        const scale=Math.max(0.7,Math.min(1.3,(r+push)/r));
+        posArr[i3]*=scale;
+        posArr[i3+2]*=scale;
+    }
+    return currVol;
+}
+
+// Main PBD loop
+function runPBD(){
+    const pos=elliGeo.attributes.position;
+    const posArr=pos.array;
+    const idxArr=elliGeo.index.array;
+    let finalVol=restVolume;
+
+    for(let iter=0;iter<PBD_ITER;iter++){
+        pbdApplyShape(posArr);
+        for(const band of bands){
+            pbdApplyBand(band,posArr);
+        }
+        finalVol=pbdApplyVolume(posArr,idxArr);
+    }
+
+    pos.needsUpdate=true;
+    elliGeo.computeVertexNormals();
+    H.vratio.textContent=(finalVol/restVolume*100).toFixed(1);
+
+    // Update band visuals
+    for(let b=0;b<bands.length;b++){
+        updateBandVisual(b);
+    }
+
+    // Show current perimeter ratio for last band
+    if(bands.length>0){
+        const lb=bands[bands.length-1];
+        const sec=computeSectionPerimeter(posArr,pos.count,lb.planeOrigin,lb.planeNormal,lb.influRadius);
+        if(sec.perimeter>0){
+            H.cratio.textContent=(sec.perimeter/lb.restCircum).toFixed(3);
+        }
+    }else{
+        H.cratio.textContent='--';
+    }
+}
+
+// Restore to rest shape
+function runRestore(){
+    const posArr=elliGeo.attributes.position.array;
+    for(let iter=0;iter<30;iter++){
+        pbdApplyShape(posArr);
+    }
+    elliGeo.attributes.position.needsUpdate=true;
+    elliGeo.computeVertexNormals();
+    H.vratio.textContent='100.0';
+    H.cratio.textContent='--';
+}
+
+// ═══════════════════════════════════════
+// Interaction: click to place band
+// ═══════════════════════════════════════
+const raycaster=new THREE.Raycaster();
+const mouse=new THREE.Vector2();
+const mouseDown=new THREE.Vector2();
+let previewLine=null;
+
+// Placement: horizontal bands (normal = Y axis)
+function getPlacementNormal(hitPoint){
+    return [0,1,0];
+}
+
+function ensurePreviewLine(){
+    if(previewLine)return;
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute([],3));
+    const mat=new THREE.LineBasicMaterial({color:'#ffff00',transparent:true,opacity:0.6,depthTest:false,depthWrite:false});
+    previewLine=new THREE.LineLoop(geo,mat);
+    previewLine.visible=false;
+    previewLine.renderOrder=2;
+    previewLine.frustumCulled=false;
+    scene.add(previewLine);
+}
+
+
+window.addEventListener('mousemove',(e)=>{
+    ensurePreviewLine();
+    mouse.x=(e.clientX/window.innerWidth)*2-1;
+    mouse.y=-(e.clientY/window.innerHeight)*2+1;
+    raycaster.setFromCamera(mouse,camera);
+    const hits=raycaster.intersectObject(elliMesh,false);
+    if(hits.length>0){
+        const pt=hits[0].point;
+        const normal=getPlacementNormal(pt);
+        const exact=getExactCrossSectionPolyline(
+            elliGeo.attributes.position.array,
+            elliGeo.index.array,
+            [pt.x,pt.y,pt.z],normal
+        );
+        if(exact.points3D.length>=9){
+            updateBandLine(previewLine,exact.points3D);
+            previewLine.visible=true;
+        }else{
+            previewLine.visible=false;
+        }
+    }else{
+        previewLine.visible=false;
+    }
+});
+
+window.addEventListener('mousedown',(e)=>{
+    mouseDown.set(e.clientX,e.clientY);
+});
+
+window.addEventListener('mouseup',(e)=>{
+    const dx=e.clientX-mouseDown.x;
+    const dy=e.clientY-mouseDown.y;
+    if(Math.sqrt(dx*dx+dy*dy)>3)return; // drag, not click
+
+    mouse.x=(e.clientX/window.innerWidth)*2-1;
+    mouse.y=-(e.clientY/window.innerHeight)*2+1;
+    raycaster.setFromCamera(mouse,camera);
+    const hits=raycaster.intersectObject(elliMesh,false);
+    if(hits.length>0){
+        const pt=hits[0].point;
+        const origin=[pt.x,pt.y,pt.z];
+        const normal=getPlacementNormal(pt);
+        addBand(origin,normal);
+    }
+});
+
+window.addEventListener('keydown',(e)=>{
+    const key=e.key.toLowerCase();
+    if(key==='r'){removeBand();return;}
+    if(key==='c'){removeAllBands();return;}
+});
+
+// ═══════════════════════════════════════
+// Slider wiring
+// ═══════════════════════════════════════
+$('sl_ss').addEventListener('input',e=>{SHAPE_STIFF=+e.target.value;$('sv_ss').textContent=SHAPE_STIFF.toFixed(2);});
+$('sl_bs').addEventListener('input',e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(2);for(const b of bands)b.stiffness=BAND_STIFF;});
+$('sl_vs').addEventListener('input',e=>{VOL_STIFF=+e.target.value;$('sv_vs').textContent=VOL_STIFF.toFixed(2);});
+$('sl_bi').addEventListener('input',e=>{BAND_INFLU=+e.target.value;$('sv_bi').textContent=BAND_INFLU.toFixed(2);for(const b of bands)b.influRadius=BAND_INFLU;});
+$('sl_rc').addEventListener('input',e=>{
+    BAND_REST_CIRCUM=+e.target.value;$('sv_rc').textContent=BAND_REST_CIRCUM.toFixed(2);
+    for(const b of bands)b.restCircum=BAND_REST_CIRCUM;
+});
+$('sl_pi').addEventListener('input',e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;});
+
+// ═══════════════════════════════════════
+// Resize
+// ═══════════════════════════════════════
+window.addEventListener('resize',()=>{
+    camera.aspect=window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth,window.innerHeight);
+});
+
+// ═══════════════════════════════════════
+// Animation loop
+// ═══════════════════════════════════════
+const clock=new THREE.Clock();
+let fpsFrames=0,fpsTime=0;
+
+function animate(){
+    requestAnimationFrame(animate);
+
+    const dt=Math.min(clock.getDelta(),0.1);
+    const t0=performance.now();
+    controls.update();
+
+    if(bands.length>0){
+        runPBD();
+    }else{
+        runRestore();
+    }
+
+    renderer.render(scene,camera);
+
+    const ms=performance.now()-t0;
+    fpsFrames++;fpsTime+=dt;
+    if(fpsTime>=1.0){
+        H.fps.textContent=Math.round(fpsFrames/fpsTime);
+        H.framems.textContent=ms.toFixed(1);
+        fpsFrames=0;fpsTime=0;
+    }
+}
+
+console.log('🔧 皮筋系统试验场就绪');
+console.log('   椭球:',TOTAL_V,'顶点');
+console.log('   皮筋模型: 周长约束 + 截面质心缩放');
+console.log('   🖱️ 点击 = 绑皮筋(表面法向)');
+console.log('   R = 割一根, C = 全部割掉');
+console.log('   📐 右侧面板可微调最后放置的皮筋参数');
+
+animate();
+</script>
+</body>
+</html>
