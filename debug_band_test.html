@@ -200,26 +200,46 @@ scene.add(wireframe);
 // ═══════════════════════════════════════
 let restPositions=null;
 let restVolume=0, restSurfaceArea=0;
+let restGradDirs=null; // precomputed unit volume-gradient directions (rest config)
 
 function initRestState(){
     const p=elliGeo.attributes.position;
     restPositions=new Float32Array(p.array);
     const idx=elliGeo.index.array;
+    const vc=p.count;
     let vol=0,area=0;
     const a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();
+
+    // Accumulate volume + surface area + per-vertex rest gradient
+    const grad=new Float32Array(vc*3);
     for(let i=0;i<idx.length;i+=3){
         const ai=idx[i]*3,bi=idx[i+1]*3,ci=idx[i+2]*3;
-        a.set(p.array[ai],p.array[ai+1],p.array[ai+2]);
-        b.set(p.array[bi],p.array[bi+1],p.array[bi+2]);
-        c.set(p.array[ci],p.array[ci+1],p.array[ci+2]);
-        vol+=(a.x*(b.y*c.z-b.z*c.y)+a.y*(b.z*c.x-b.x*c.z)+a.z*(b.x*c.y-b.y*c.x))/6;
+        const ax=p.array[ai],ay=p.array[ai+1],az=p.array[ai+2];
+        const bx=p.array[bi],by=p.array[bi+1],bz=p.array[bi+2];
+        const cx=p.array[ci],cy=p.array[ci+1],cz=p.array[ci+2];
+        vol+=(ax*(by*cz-bz*cy)+ay*(bz*cx-bx*cz)+az*(bx*cy-by*cx))/6;
         area+=0.5*new THREE.Vector3().crossVectors(
             new THREE.Vector3().subVectors(b,a),
             new THREE.Vector3().subVectors(c,a)
         ).length();
+        // Rest volume gradient: ∇V_A = (B×C)/6
+        grad[ai]  +=(by*cz-bz*cy)/6; grad[ai+1]+=(bz*cx-bx*cz)/6; grad[ai+2]+=(bx*cy-by*cx)/6;
+        grad[bi]  +=(cy*az-cz*ay)/6; grad[bi+1]+=(cz*ax-cx*az)/6; grad[bi+2]+=(cx*ay-cy*ax)/6;
+        grad[ci]  +=(ay*bz-az*by)/6; grad[ci+1]+=(az*bx-ax*bz)/6; grad[ci+2]+=(ax*by-ay*bx)/6;
     }
     restVolume=Math.abs(vol);
     restSurfaceArea=area;
+
+    // Normalize rest gradient directions (unit vectors, stable forever)
+    restGradDirs=new Float32Array(vc*3);
+    const gradSign=vol<0?-1:1; // flip if CW wound
+    for(let i=0;i<vc;i++){
+        const i3=i*3;
+        const gx=grad[i3]*gradSign,gy=grad[i3+1]*gradSign,gz=grad[i3+2]*gradSign;
+        const gm=Math.sqrt(gx*gx+gy*gy+gz*gz);
+        if(gm>1e-9){restGradDirs[i3]=gx/gm;restGradDirs[i3+1]=gy/gm;restGradDirs[i3+2]=gz/gm;}
+    }
+
     H.vcount.textContent=p.count;
     console.log('椭球:',p.count,'顶点',idx.length/3,'三角形 restVol:',restVolume.toFixed(4));
 }
@@ -673,7 +693,9 @@ function pbdApplyBand(band,posArr){
     }
 }
 
-// Volume constraint (unchanged: uniform XZ radial push)
+// Volume constraint: XZ radial uniform scale.
+// Multiplicative (stable), pushes in the same plane band compresses in.
+let _volDeficitSmooth=0;
 function pbdApplyVolume(posArr,idxArr){
     let currVol=0;
     const a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();
@@ -686,22 +708,26 @@ function pbdApplyVolume(posArr,idxArr){
     }
     currVol=Math.abs(currVol);
     const deficit=restVolume-currVol;
-    if(Math.abs(deficit)<1e-9)return currVol;
-    const push=VOL_STIFF*deficit/restSurfaceArea;
+    if(Math.abs(deficit)<1e-9){_volDeficitSmooth*=0.5;return currVol;}
+    _volDeficitSmooth=_volDeficitSmooth*0.8+deficit*0.2;
+
+    // Volume scales as r² in XZ (for rotationally-symmetric shapes)
+    // target scale: r_new/r = √(V_rest/V)
+    const targetS=Math.sqrt(restVolume/Math.max(currVol,1e-9));
+    const effS=1.0+(targetS-1.0)*VOL_STIFF;
+    const clampedS=Math.max(0.97,Math.min(1.03,effS));
+
     const vc=elliGeo.attributes.position.count;
     for(let i=0;i<vc;i++){
         const i3=i*3;
-        const x=posArr[i3],z=posArr[i3+2];
-        const r=Math.sqrt(x*x+z*z);
-        if(r<1e-6)continue;
-        const scale=Math.max(0.7,Math.min(1.3,(r+push)/r));
-        posArr[i3]*=scale;
-        posArr[i3+2]*=scale;
+        posArr[i3]  *=clampedS;
+        posArr[i3+2]*=clampedS;
     }
     return currVol;
 }
 
 // Main PBD loop
+let _frameVolLog=[]; // diagnostic: volume per frame
 function runPBD(){
     const pos=elliGeo.attributes.position;
     const posArr=pos.array;
@@ -714,6 +740,23 @@ function runPBD(){
             pbdApplyBand(band,posArr);
         }
         finalVol=pbdApplyVolume(posArr,idxArr);
+        if(_frameVolLog.length<3&&iter<5){
+            console.log('  iter '+iter+' vol='+finalVol.toFixed(4)+' ratio='+(finalVol/restVolume*100).toFixed(1)+'%');
+        }
+    }
+
+    // Diagnostic: track volume across frames
+    _frameVolLog.push(finalVol);
+    if(_frameVolLog.length>120)_frameVolLog.shift();
+    if(_frameVolLog.length>=3){
+        const last=_frameVolLog;
+        const d0=last[last.length-1]-last[last.length-2];
+        const d1=last[last.length-2]-last[last.length-3];
+        if(Math.abs(d0)>0.001&&d0*d1<0){
+            console.log('VOL OSC: frame vol='+finalVol.toFixed(4)+
+                ' d0='+d0.toFixed(4)+' d1='+d1.toFixed(4)+
+                ' ratio='+(finalVol/restVolume*100).toFixed(1)+'%');
+        }
     }
 
     pos.needsUpdate=true;
