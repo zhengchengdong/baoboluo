@@ -265,96 +265,6 @@ initRestState();
 const bands=[];
 const bandVisuals=[];  // {lineActual:THREE.Line, lineTarget:THREE.Line}
 
-// ═══════════════════════════════════════
-// Helper: get cross-section polygon (shared by PBD, visuals, preview)
-// ═══════════════════════════════════════
-function getCrossSectionPolygon(posArr,vertexCount,origin,normal,influRadius,numBuckets=0){
-    // Collect affected vertices, project to plane, compute weighted centroid
-    const projPts=[];
-    for(let i=0;i<vertexCount;i++){
-        const i3=i*3;
-        const dx=posArr[i3]-origin[0],dy=posArr[i3+1]-origin[1],dz=posArr[i3+2]-origin[2];
-        const signedD=dx*normal[0]+dy*normal[1]+dz*normal[2];
-        const absD=Math.abs(signedD);
-        if(absD>=influRadius)continue;
-        const w=smoothstep(influRadius,0,absD);
-        const px=posArr[i3]-signedD*normal[0];
-        const py=posArr[i3+1]-signedD*normal[1];
-        const pz=posArr[i3+2]-signedD*normal[2];
-        projPts.push({px,py,pz,w});
-    }
-    if(projPts.length<3)return{centroid:origin.slice(),perimeter:0,count:0,points3D:[]};
-
-    // Weighted centroid
-    let sumW=0,cx=0,cy=0,cz=0;
-    for(const p of projPts){sumW+=p.w;cx+=p.w*p.px;cy+=p.w*p.py;cz+=p.w*p.pz;}
-    cx/=sumW;cy/=sumW;cz/=sumW;
-    const centroid=[cx,cy,cz];
-
-    // Build local 2D basis on the plane
-    let ux,uy,uz;
-    if(Math.abs(normal[0])<0.9){ux=1;uy=0;uz=0;}else{ux=0;uy=0;uz=1;}
-    {const dot=ux*normal[0]+uy*normal[1]+uz*normal[2];ux-=dot*normal[0];uy-=dot*normal[1];uz-=dot*normal[2];}
-    {const ul=Math.sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;}
-    const vx=normal[1]*uz-normal[2]*uy, vy=normal[2]*ux-normal[0]*uz, vz=normal[0]*uy-normal[1]*ux;
-
-    const polar=[];
-    for(const p of projPts){
-        const rx=p.px-cx,ry=p.py-cy,rz=p.pz-cz;
-        const ru=rx*ux+ry*uy+rz*uz;
-        const rv=rx*vx+ry*vy+rz*vz;
-        polar.push({ang:Math.atan2(rv,ru), rad:Math.sqrt(ru*ru+rv*rv), w:p.w, px:p.px, py:p.py, pz:p.pz});
-    }
-    polar.sort((a,b)=>a.ang-b.ang);
-
-    // ---- Build output points (raw or bucketed) ----
-    let perim=0;
-    const points3D=[];
-
-    if(numBuckets>0){
-        // Angular bucketing: average position + radius per bucket → smooth outline
-        const buckets=[];
-        for(let b=0;b<numBuckets;b++)buckets.push({sumX:0,sumY:0,sumZ:0,sumR:0,sumW:0});
-        for(const p of polar){
-            const bin=Math.min(numBuckets-1,Math.floor(((p.ang+Math.PI)/(2*Math.PI))*numBuckets));
-            buckets[bin].sumX+=p.w*p.px;buckets[bin].sumY+=p.w*p.py;buckets[bin].sumZ+=p.w*p.pz;
-            buckets[bin].sumR+=p.w*p.rad;buckets[bin].sumW+=p.w;
-        }
-        const bucketPts=[];
-        for(const bk of buckets){
-            if(bk.sumW<1e-6)continue;
-            const bx=bk.sumX/bk.sumW, by=bk.sumY/bk.sumW, bz=bk.sumZ/bk.sumW;
-            const br=bk.sumR/bk.sumW;
-            const rx=bx-cx,ry=by-cy,rz=bz-cz;
-            const ru=rx*ux+ry*uy+rz*uz, rv=rx*vx+ry*vy+rz*vz;
-            bucketPts.push({ang:Math.atan2(rv,ru), rad:br, bx,by,bz});
-        }
-        bucketPts.sort((a,b)=>a.ang-b.ang);
-        // Perimeter from bucketed points
-        for(let i=0;i<bucketPts.length;i++){
-            const a=bucketPts[i], b=bucketPts[(i+1)%bucketPts.length];
-            const da=b.ang-a.ang+(i===bucketPts.length-1?2*Math.PI:0);
-            perim+=((a.rad+b.rad)/2)*da;
-            points3D.push(a.bx,a.by,a.bz);
-        }
-    }else{
-        // Raw points (for accurate constraint computation)
-        for(let i=0;i<polar.length;i++){
-            const a=polar[i], b=polar[(i+1)%polar.length];
-            const da=b.ang-a.ang+(i===polar.length-1?2*Math.PI:0);
-            perim+=((a.rad+b.rad)/2)*da;
-            points3D.push(a.px,a.py,a.pz);
-        }
-    }
-    return{centroid,perimeter:perim,count:projPts.length,points3D,polar};
-}
-
-// Legacy wrapper (used by HUD display)
-function computeSectionPerimeter(posArr,vertexCount,origin,normal,influRadius){
-    const r=getCrossSectionPolygon(posArr,vertexCount,origin,normal,influRadius);
-    return{centroid:r.centroid, avgR:0, perimeter:r.perimeter, count:r.count};
-}
-
 // ── Band visual helpers (polyline, not torus) ──
 function makeBandLine(color,opacity){
     const geo=new THREE.BufferGeometry();
@@ -499,12 +409,11 @@ function addBand(origin,normal){
     const nl=Math.sqrt(normal[0]**2+normal[1]**2+normal[2]**2);
     const nn=[normal[0]/nl,normal[1]/nl,normal[2]/nl];
 
-    // Compute current cross-section perimeter
+    // Verify cross-section is valid (exact triangle-plane intersection)
+    const idxArr=elliGeo.index.array;
     const posArr=elliGeo.attributes.position.array;
-    const vc=elliGeo.attributes.position.count;
-    const sec=computeSectionPerimeter(posArr,vc,origin,nn,BAND_INFLU);
-
-    if(sec.count<3){console.warn('截面顶点不足,跳过');return;}
+    const exact=getExactCrossSectionPolyline(posArr,idxArr,origin,nn);
+    if(exact.points3D.length<9){console.warn('截面不足,跳过');return;}
 
     const restCircum=BAND_REST_CIRCUM;
     const band={
@@ -523,7 +432,6 @@ function addBand(origin,normal){
 
     H.bcount.textContent=bands.length;
     updateLastBandPanel(bands.length-1);
-    console.log(`皮筋 #${bands.length} O=(${origin[0].toFixed(2)},${origin[1].toFixed(2)},${origin[2].toFixed(2)}) N=(${nn[0].toFixed(2)},${nn[1].toFixed(2)},${nn[2].toFixed(2)}) L₀=${restCircum.toFixed(3)} perim=${sec.perimeter.toFixed(3)}`);
 }
 
 function removeBand(){
@@ -626,7 +534,7 @@ function pbdApplyShape(posArr){
 }
 
 // Band constraint (NEW: circumference-based + centroid-directed push)
-function pbdApplyBand(band,posArr){
+function pbdApplyBand(band,posArr,idxArr){
     const vc=elliGeo.attributes.position.count;
     const oo=band.planeOrigin;
     const no=band.planeNormal;
@@ -659,21 +567,11 @@ function pbdApplyBand(band,posArr){
     gx/=sumW;gy/=sumW;gz/=sumW;
     const centroid=[gx,gy,gz];
 
-    // === Pass 2: Weighted average in-plane radius from centroid ===
-    // For convex cross-sections, perimeter ≈ 2π × avgR to within a few percent.
-    // Using avgR instead of full polygon perimeter gives smooth, stable convergence.
-    let sumR=0;
-    for(const v of affected){
-        const rx=v.projX-gx,ry=v.projY-gy,rz=v.projZ-gz;
-        const dotN=rx*no[0]+ry*no[1]+rz*no[2];
-        const ipx=rx-dotN*no[0],ipy=ry-dotN*no[1],ipz=rz-dotN*no[2];
-        sumR+=v.w*Math.sqrt(ipx*ipx+ipy*ipy+ipz*ipz);
-    }
-    const avgR=sumR/sumW;
-    if(avgR<1e-6)return;
-
-    // Estimate perimeter from avgR (stable, smooth)
-    const currPerim=2*Math.PI*avgR;
+    // === Pass 2: Use exact triangle-plane intersection for accurate perimeter ===
+    const exact=getExactCrossSectionPolyline(posArr,idxArr,oo,no);
+    if(exact.points3D.length<9)return; // not enough for a closed loop
+    const currPerim=exact.perimeter;
+    if(currPerim<1e-6)return;
     if(currPerim<=L0)return; // band is loose
 
     // === Pass 3: Per-vertex in-plane scale about centroid, weighted by proximity ===
@@ -737,7 +635,7 @@ function runPBD(){
     for(let iter=0;iter<PBD_ITER;iter++){
         pbdApplyShape(posArr);
         for(const band of bands){
-            pbdApplyBand(band,posArr);
+            pbdApplyBand(band,posArr,idxArr);
         }
         finalVol=pbdApplyVolume(posArr,idxArr);
         if(_frameVolLog.length<3&&iter<5){
@@ -768,12 +666,12 @@ function runPBD(){
         updateBandVisual(b);
     }
 
-    // Show current perimeter ratio for last band
+    // Show current perimeter ratio for last band (exact cross-section)
     if(bands.length>0){
         const lb=bands[bands.length-1];
-        const sec=computeSectionPerimeter(posArr,pos.count,lb.planeOrigin,lb.planeNormal,lb.influRadius);
-        if(sec.perimeter>0){
-            H.cratio.textContent=(sec.perimeter/lb.restCircum).toFixed(3);
+        const exact=getExactCrossSectionPolyline(posArr,idxArr,lb.planeOrigin,lb.planeNormal);
+        if(exact.perimeter>0){
+            H.cratio.textContent=(exact.perimeter/lb.restCircum).toFixed(3);
         }
     }else{
         H.cratio.textContent='--';
