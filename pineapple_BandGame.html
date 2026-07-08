@@ -989,7 +989,7 @@ var<workgroup>sOff:array<u32,64>;
   let cnt=binC[off];
   let hasPt=cnt>0u;
   let r=select(0.0,f32(binR[off])/1048576.0/f32(cnt),hasPt);
-  let ang=6.28318531*f32(lid.x)/64.0;
+  let ang=6.28318531*(f32(lid.x)/64.0-0.5);
   let ca=cos(ang);let sa=sin(ang);
   let px=st.gx+r*(ca*ux+sa*vx);
   let py=st.gy+r*(ca*uy+sa*vy);
