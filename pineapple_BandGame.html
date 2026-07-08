@@ -876,7 +876,7 @@ fn addBinPoint(px:f32,py:f32,pz:f32,Gx:f32,Gy:f32,Gz:f32,ux:f32,uy:f32,uz:f32,vx
 const bandPerimReduceCS=device.createShaderModule({label:'bandPerimReduce',code:`
 struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
 struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
-struct P{bc:u32}
+struct P{triCount:u32,bc:u32}
 @group(0)@binding(0)var<storage,read>binR:array<u32>;
 @group(0)@binding(1)var<storage,read>binC:array<u32>;
 @group(0)@binding(2)var<storage,read>params:array<BandParam>;
@@ -933,15 +933,25 @@ struct P{vc:u32,bc:u32}
   var cur=src[i];
   for(var b=0u;b<p.bc;b++){
     let param=params[b];let st=state[b];
-    if(st.scale>=1.0){continue;}
+    if(st.scale>=1.0){continue;} // L₀/P >= 1 → cross-section already ≤ L₀
     let signedD=(cur.x-param.ox)*param.nx+(cur.y-param.oy)*param.ny+(cur.z-param.oz)*param.nz;
     let absD=abs(signedD);
     if(absD>=param.influ_radius){continue;}
-    let t=absD/param.influ_radius;let w=1.0-t*t*(3.0-2.0*t);
+    let t=absD/param.influ_radius;
+    let blend=t*t*(3.0-2.0*t);
     let projX=cur.x-signedD*param.nx;let projY=cur.y-signedD*param.ny;let projZ=cur.z-signedD*param.nz;
-    let dx=st.gx-projX;let dy=st.gy-projY;let dz=st.gz-projZ;
-    let push=w*param.stiffness*(1.0-st.scale);
-    cur.x+=dx*push;cur.y+=dy*push;cur.z+=dz*push;
+    let dx=projX-st.gx;let dy=projY-st.gy;let dz=projZ-st.gz;
+    let r_cur=sqrt(dx*dx+dy*dy+dz*dz);
+    if(r_cur<1e-6){continue;}
+    // Exact scale from perimeter measurement: st.scale = L₀/P (<1 means too big)
+    // At plane (blend=0): full push by scale. At edge (blend=1): no push.
+    let eff_scale=st.scale+(1.0-st.scale)*blend;
+    if(eff_scale<1.0){
+      let s=1.0-param.stiffness*(1.0-eff_scale);
+    cur.x=st.gx+(projX-st.gx)*s+signedD*param.nx;
+    cur.y=st.gy+(projY-st.gy)*s+signedD*param.ny;
+    cur.z=st.gz+(projZ-st.gz)*s+signedD*param.nz;
+    }
   }
   dst[i]=cur;
 }
@@ -1308,6 +1318,14 @@ function updateAllBandVisuals(){
     const lb=bands[bands.length-1];
     const exact=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,lb.planeOrigin,lb.planeNormal);
     H.cratio.textContent=exact.perimeter>0?(exact.perimeter/lb.restCircum).toFixed(3):'--';
+    // Diagnostic: log perimeters of all bands
+    if(bands.length>=2&&convergeFrames===CONVERGE_FRAMES-1){
+      console.log('📏 PBD收敛后周长:');
+      for(let b=0;b<bands.length;b++){
+        const e=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,bands[b].planeOrigin,bands[b].planeNormal);
+        console.log('  band#'+(b+1)+' P='+e.perimeter.toFixed(4)+' L₀='+bands[b].restCircum.toFixed(4)+' ratio='+(e.perimeter/bands[b].restCircum).toFixed(4)+(e.perimeter<bands[b].restCircum?' ⚠️突破':' ✓'));
+      }
+    }
   }else{H.cratio.textContent='--';}
 }
 
@@ -1366,44 +1384,79 @@ async function runGPUPBD(){
 
     // Shape: src→dst
     cp.setPipeline(shapePipe.pipe);cp.setBindGroup(0,isA?shapeBG_AB:shapeBG_BA);cp.dispatchWorkgroups(WG,1,1);
-
-    // Band reduce: reads dst (output of shape), writes bandState (centroid only)
-    if(bc>0){
-      cp.setPipeline(bandReducePipe.pipe);cp.setBindGroup(0,isA?bandReduceBG_B:bandReduceBG_A);cp.dispatchWorkgroups(bc,1,1);
-      // Band exact perimeter: reads dst + triangles → angle bins → perimeter → bandState.scale
-      cp.setPipeline(bandPerimPipe.pipe);cp.setBindGroup(0,isA?bandPerimBG_B:bandPerimBG_A);cp.dispatchWorkgroups(Math.ceil(proxyTriCount/256),1,1);
-      cp.setPipeline(bandPerimReducePipe.pipe);cp.setBindGroup(0,bandPerimReduceBG);cp.dispatchWorkgroups(bc,1,1);
-      // Band apply: reads dst, writes src
-      cp.setPipeline(bandApplyPipe.pipe);cp.setBindGroup(0,isA?bandApplyBG_BA:bandApplyBG_AB);cp.dispatchWorkgroups(WG,1,1);
-    }
-
-    // Volume: reads src (output of band), writes dst
-    cp.setPipeline(volAccPipe.pipe);cp.setBindGroup(0,isA?volAccBG_A:volAccBG_B);cp.dispatchWorkgroups(VWG,1,1);
-    for(const lv of volRedLevels){cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,lv.bg);cp.dispatchWorkgroups(lv.wgCount,1,1);}
-    cp.setPipeline(volApPipe.pipe);cp.setBindGroup(0,isA?volApBG_AB:volApBG_BA);cp.dispatchWorkgroups(WG,1,1);
-
-    // Last iteration: scatter proxy displacement to voxel grid
-    if(isLast){
-      // Clear voxel accumulators
-      queue.writeBuffer(voxDxBuf,0,new Uint32Array(VOX_TOTAL));
-      queue.writeBuffer(voxDyBuf,0,new Uint32Array(VOX_TOTAL));
-      queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
-      queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
-      // Voxel grid params
-      const vu=new ArrayBuffer(32);
-      new Uint32Array(vu)[0]=proxyVertexCount;new Uint32Array(vu)[1]=64;
-      new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
-      new Float32Array(vu,20)[0]=voxGS[0];new Float32Array(vu,24)[0]=voxGS[1];new Float32Array(vu,28)[0]=voxGS[2];
-      queue.writeBuffer(voxelScatterUB,0,vu);
-      cp.setPipeline(voxelScatterPipe.pipe);cp.setBindGroup(0,voxelScatterBG);cp.dispatchWorkgroups(WG,1,1);
-    }
-
-    cp.end();
-    if(isLast)cmd.copyBufferToBuffer(volTotalB,0,staging,0,4);
-    device.queue.submit([cmd.finish()]);
-
-    // Ping-pong swap
+    cp.end();device.queue.submit([cmd.finish()]);
+    // Swap: shape output is now in dst
     [srcPos,dstPos]=[dstPos,srcPos];
+
+    // Per-band sequential constraints (matching CPU testbed algorithm)
+    for(let b=0;b<bc;b++){
+      const isA=srcPos===posA;
+      // Write single band param at index 0
+      const singleParam=new Float32Array(9);
+      const bn=bands[b];
+      singleParam[0]=bn.planeOrigin[0];singleParam[1]=bn.planeOrigin[1];singleParam[2]=bn.planeOrigin[2];
+      singleParam[3]=bn.planeNormal[0];singleParam[4]=bn.planeNormal[1];singleParam[5]=bn.planeNormal[2];
+      singleParam[6]=bn.restCircum;singleParam[7]=bn.stiffness;singleParam[8]=bn.influRadius;
+      queue.writeBuffer(bandParamsB,0,singleParam);
+      // Uniforms for single band
+      queue.writeBuffer(bandReduceUB,0,new Uint32Array([proxyVertexCount,1]));
+      queue.writeBuffer(bandPerimUB,0,new Uint32Array([proxyTriCount,1]));
+      queue.writeBuffer(bandApplyUB,0,new Uint32Array([proxyVertexCount,1]));
+      // Clear bin buffers
+      queue.writeBuffer(bandBinRB,0,new Uint32Array(64));
+      queue.writeBuffer(bandBinCB,0,new Uint32Array(64));
+
+      const bCmd=device.createCommandEncoder();const bCP=bCmd.beginComputePass();
+      // bandReduce: reads src (output of shape or previous band), writes bandState[0]
+      bCP.setPipeline(bandReducePipe.pipe);bCP.setBindGroup(0,isA?bandReduceBG_A:bandReduceBG_B);bCP.dispatchWorkgroups(1,1,1);
+      // bandPerim: reads src + triangles
+      bCP.setPipeline(bandPerimPipe.pipe);bCP.setBindGroup(0,isA?bandPerimBG_A:bandPerimBG_B);bCP.dispatchWorkgroups(Math.ceil(proxyTriCount/256),1,1);
+      // bandPerimReduce: computes scale → bandState[0].scale
+      bCP.setPipeline(bandPerimReducePipe.pipe);bCP.setBindGroup(0,bandPerimReduceBG);bCP.dispatchWorkgroups(1,1,1);
+      // bandApply: reads src, writes dst
+      bCP.setPipeline(bandApplyPipe.pipe);bCP.setBindGroup(0,isA?bandApplyBG_AB:bandApplyBG_BA);bCP.dispatchWorkgroups(WG,1,1);
+      bCP.end();
+      device.queue.submit([bCmd.finish()]);
+      // Swap: band output is in dst, next band reads from it
+      [srcPos,dstPos]=[dstPos,srcPos];
+    }
+
+    // Volume: reads src (output of last band), writes dst
+    {
+      const vacU=new Uint32Array([proxyTriCount]);
+      queue.writeBuffer(volAccUB,0,vacU);
+      queue.writeBuffer(volTotalB,0,new Float32Array([0]));
+      queue.writeBuffer(volB,0,_zeroTriP);
+      for(let li=0;li<volRedLevels.length;li++){
+        const lv=volRedLevels[li];if(lv.dstBuf!==volTotalB)queue.writeBuffer(lv.dstBuf,0,_zeroRedLv[li]);
+      }
+      const vapU=new ArrayBuffer(16);
+      new Uint32Array(vapU)[0]=proxyVertexCount;new Float32Array(vapU)[1]=restVolume;
+      new Float32Array(vapU)[2]=VOL_STIFF;new Float32Array(vapU)[3]=restSurfaceArea;
+      queue.writeBuffer(volApUB,0,vapU);
+      const isAVol=srcPos===posA;
+      const vCmd=device.createCommandEncoder();const vCP=vCmd.beginComputePass();
+      vCP.setPipeline(volAccPipe.pipe);vCP.setBindGroup(0,isAVol?volAccBG_A:volAccBG_B);vCP.dispatchWorkgroups(VWG,1,1);
+      for(const lv of volRedLevels){vCP.setPipeline(volReducePipe.pipe);vCP.setBindGroup(0,lv.bg);vCP.dispatchWorkgroups(lv.wgCount,1,1);}
+      vCP.setPipeline(volApPipe.pipe);vCP.setBindGroup(0,isAVol?volApBG_AB:volApBG_BA);vCP.dispatchWorkgroups(WG,1,1);
+      // Last iteration: scatter proxy displacement to voxel grid
+      if(isLast){
+        queue.writeBuffer(voxDxBuf,0,new Uint32Array(VOX_TOTAL));
+        queue.writeBuffer(voxDyBuf,0,new Uint32Array(VOX_TOTAL));
+        queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
+        queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
+        const vu=new ArrayBuffer(32);
+        new Uint32Array(vu)[0]=proxyVertexCount;new Uint32Array(vu)[1]=64;
+        new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
+        new Float32Array(vu,20)[0]=voxGS[0];new Float32Array(vu,24)[0]=voxGS[1];new Float32Array(vu,28)[0]=voxGS[2];
+        queue.writeBuffer(voxelScatterUB,0,vu);
+        vCP.setPipeline(voxelScatterPipe.pipe);vCP.setBindGroup(0,voxelScatterBG);vCP.dispatchWorkgroups(WG,1,1);
+      }
+      vCP.end();
+      if(isLast)vCmd.copyBufferToBuffer(volTotalB,0,staging,0,4);
+      device.queue.submit([vCmd.finish()]);
+      [srcPos,dstPos]=[dstPos,srcPos];
+    }
   }
   const finalSrc=srcPos; // after loop, srcPos holds the final output
 
