@@ -124,7 +124,7 @@ let pineappleMesh=null;
 let proxyWireMesh=null;
 let showProxyWire=false;
 let modelMinY=-1.5,modelMaxY=1.5; // Y range of proxy model (for delta field)
-let voxBMin=[0,0,0],voxGS=[0.1,0.1,0.1],VOX_TOTAL=32*32*32; // voxel grid params
+let voxBMin=[0,0,0],voxGS=[0.1,0.1,0.1],VOX_TOTAL=64*64*64; // 64³ voxel grid
 
 // PBD params
 let SHAPE_STIFF=0.30, BAND_STIFF=0.50, VOL_STIFF=0.40, BAND_INFLU=0.60;
@@ -147,7 +147,7 @@ $('sl_rc').oninput=e=>{
 $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
 
 // ═══════ Band System ═══════
-const MAX_BANDS=32;
+const MAX_BANDS=256;
 const bands=[];
 const bandVisuals=[];  // {lineActual: THREE.LineLoop, lineTarget: THREE.LineLoop}
 
@@ -460,7 +460,7 @@ async function loadModels(){
   const vpad=0.05;
   voxBMin=[Infinity,Infinity,Infinity];const vBMax=[-Infinity,-Infinity,-Infinity];
   for(let i=0;i<proxyVertexCount;i++){for(let k=0;k<3;k++){const v=proxyRestPositions[i*3+k];if(v<voxBMin[k])voxBMin[k]=v;if(v>vBMax[k])vBMax[k]=v;}}
-  for(let k=0;k<3;k++){const r=vBMax[k]-voxBMin[k];voxBMin[k]-=r*vpad;vBMax[k]+=r*vpad;voxGS[k]=(vBMax[k]-voxBMin[k])/32;}
+  for(let k=0;k<3;k++){const r=vBMax[k]-voxBMin[k];voxBMin[k]-=r*vpad;vBMax[k]+=r*vpad;voxGS[k]=(vBMax[k]-voxBMin[k])/64;}
   console.log('📦 体素网格: bmin=('+voxBMin.map(v=>v.toFixed(2)).join(',')+') gs=('+voxGS.map(v=>v.toFixed(3)).join(',')+')');
 
   // ── CPU nearest-proxy with spatial hash ──
@@ -635,17 +635,31 @@ struct P{vc:u32,grid:u32,bminX:f32,bminY:f32,bminZ:f32,gsX:f32,gsY:f32,gsZ:f32}
   let i=gid.x;if(i>=p.vc){return;}
   let disp=cur[i].xyz-rest[i].xyz;
   let rp=rest[i].xyz;
-  // Voxel coordinate (floating point, for trilinear interpolation)
+  // Voxel coordinate
   let vx=(rp.x-p.bminX)/p.gsX-0.5;let vy=(rp.y-p.bminY)/p.gsY-0.5;let vz=(rp.z-p.bminZ)/p.gsZ-0.5;
-  let ix0=clamp(i32(floor(vx)),0,i32(p.grid)-1);let iy0=clamp(i32(floor(vy)),0,i32(p.grid)-1);let iz0=clamp(i32(floor(vz)),0,i32(p.grid)-1);
-  let fx=vx-f32(ix0);let fy=vy-f32(iy0);let fz=vz-f32(iz0);
+  let ix0=clamp(i32(floor(vx))-1,0,i32(p.grid)-4);let iy0=clamp(i32(floor(vy))-1,0,i32(p.grid)-4);let iz0=clamp(i32(floor(vz))-1,0,i32(p.grid)-4);
+  let fx=vx-f32(ix0+1);let fy=vy-f32(iy0+1);let fz=vz-f32(iz0+1);
   let g=p.grid;
-  // Trilinear weights for 8 corners
-  for(var dx=0u;dx<2u;dx++){for(var dy=0u;dy<2u;dy++){for(var dz=0u;dz<2u;dz++){
-    let wx=select(1.0-fx,fx,dx==1u);let wy=select(1.0-fy,fy,dy==1u);let wz=select(1.0-fz,fz,dz==1u);
-    let w=wx*wy*wz;if(w<0.001){continue;}
+  // Quadratic B-spline kernel (4 points per dim, C1 continuous, 64 total)
+  for(var dx=0u;dx<4u;dx++){for(var dy=0u;dy<4u;dy++){for(var dz=0u;dz<4u;dz++){
+    // Quadratic B-spline basis: b(-1)=0.5*(0.5-f)², b(0)=0.75-f², b(1)=0.75-(1-f)², b(2)=0.5*(f-0.5)²
+    var wx=0.0;
+    if(dx==0u){wx=select(0.5*(0.5-fx)*(0.5-fx),0.0,fx<0.5);}
+    else if(dx==1u){wx=select(0.75-fx*fx,0.5*(1.5-fx)*(1.5-fx),fx<0.5);}
+    else if(dx==2u){wx=select(0.5*(0.5+fx)*(0.5+fx),0.75-(1.0-fx)*(1.0-fx),fx<0.5);}
+    else{wx=select(0.5*(fx-0.5)*(fx-0.5),0.0,fx>=0.5);}
+    var wy=0.0;
+    if(dy==0u){wy=select(0.5*(0.5-fy)*(0.5-fy),0.0,fy<0.5);}
+    else if(dy==1u){wy=select(0.75-fy*fy,0.5*(1.5-fy)*(1.5-fy),fy<0.5);}
+    else if(dy==2u){wy=select(0.5*(0.5+fy)*(0.5+fy),0.75-(1.0-fy)*(1.0-fy),fy<0.5);}
+    else{wy=select(0.5*(fy-0.5)*(fy-0.5),0.0,fy>=0.5);}
+    var wz=0.0;
+    if(dz==0u){wz=select(0.5*(0.5-fz)*(0.5-fz),0.0,fz<0.5);}
+    else if(dz==1u){wz=select(0.75-fz*fz,0.5*(1.5-fz)*(1.5-fz),fz<0.5);}
+    else if(dz==2u){wz=select(0.5*(0.5+fz)*(0.5+fz),0.75-(1.0-fz)*(1.0-fz),fz<0.5);}
+    else{wz=select(0.5*(fz-0.5)*(fz-0.5),0.0,fz>=0.5);}
+    let w=wx*wy*wz;if(w<0.0001){continue;}
     let ix=u32(ix0)+dx;let iy=u32(iy0)+dy;let iz=u32(iz0)+dz;
-    if(ix>=g||iy>=g||iz>=g){continue;}
     let vi=(ix*g+iy)*g+iz;
     let ws=u32(w*FIXED_SCALE);
     atomicAdd(&voxDx[vi],i32(disp.x*FIXED_SCALE*w));
@@ -1111,7 +1125,6 @@ async function initGPU(){
   }
 
   // Voxel grid buffers (32³ = 32768 cells, 4 u32 accumulators + 1 vec4 output)
-  const VOX_TOTAL=32*32*32;
   voxDxBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDx');
   voxDyBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDy');
   voxDzBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDz');
@@ -1378,7 +1391,7 @@ async function runGPUPBD(){
       queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
       // Voxel grid params
       const vu=new ArrayBuffer(32);
-      new Uint32Array(vu)[0]=proxyVertexCount;new Uint32Array(vu)[1]=32;
+      new Uint32Array(vu)[0]=proxyVertexCount;new Uint32Array(vu)[1]=64;
       new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
       new Float32Array(vu,20)[0]=voxGS[0];new Float32Array(vu,24)[0]=voxGS[1];new Float32Array(vu,28)[0]=voxGS[2];
       queue.writeBuffer(voxelScatterUB,0,vu);
@@ -1410,7 +1423,7 @@ async function runGPUPBD(){
 // ═══════ Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ═══════
 async function runGPUPostPBD(srcBuf){
   // Normalize voxel grid
-  queue.writeBuffer(voxelNormUB,0,new Uint32Array([32]));
+  queue.writeBuffer(voxelNormUB,0,new Uint32Array([64]));
   const cmd0=device.createCommandEncoder();const cp0=cmd0.beginComputePass();
   cp0.setPipeline(voxelNormPipe.pipe);cp0.setBindGroup(0,voxelNormBG);cp0.dispatchWorkgroups(Math.ceil(VOX_TOTAL/256),1,1);
   cp0.end();device.queue.submit([cmd0.finish()]);
@@ -1418,7 +1431,7 @@ async function runGPUPostPBD(srcBuf){
   // Apply voxel grid to high-res mesh
   await device.queue.onSubmittedWorkDone();
   const vu=new ArrayBuffer(32);
-  new Uint32Array(vu)[0]=highResCount;new Uint32Array(vu)[1]=32;
+  new Uint32Array(vu)[0]=highResCount;new Uint32Array(vu)[1]=64;
   new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
   new Float32Array(vu,20)[0]=voxGS[0];new Float32Array(vu,24)[0]=voxGS[1];new Float32Array(vu,28)[0]=voxGS[2];
   queue.writeBuffer(voxelApplyUB,0,vu);
