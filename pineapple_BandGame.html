@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>爆菠萝 — 任意皮筋 + GPU PBD + Three.js WebGPU</title>
+<title>皮筋游戏 — GPU PBD + Three.js WebGPU</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#111; overflow:hidden; font-family:monospace; }
@@ -23,7 +23,6 @@ canvas { display:block; cursor:crosshair; }
 #panel .btn { margin-top:6px; width:100%; padding:4px 0; background:#333; color:#ff44cc; border:1px solid #ff44cc; border-radius:4px; cursor:pointer; font-size:11px; }
 #panel .btn:hover { background:#444; }
 #panel .kb { display:inline-block; background:#333; color:#ff4; padding:1px 5px; border-radius:3px; font-size:10px; margin:0 2px; }
-#explosion { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:100; color:#ff0; font-size:64px; font-weight:bold; pointer-events:none; opacity:0; transition:opacity 0.3s; text-shadow:0 0 30px #f80; }
 </style>
 </head>
 <body>
@@ -33,7 +32,7 @@ canvas { display:block; cursor:crosshair; }
  <div>帧耗时: <span class="val" id="framems">--</span> ms</div>
  <div>代理顶点: <span class="val" id="vcount">--</span></div>
  <div>高模顶点: <span class="val" id="hcount">--</span></div>
- <div>皮筋: <span class="val" id="bcount">0</span> / <span class="val" id="btarget">8</span></div>
+ <div>皮筋: <span class="val" id="bcount">0</span></div>
  <div>体积: <span class="val" id="vratio">100</span>%</div>
  <div>周长比: <span class="val" id="cratio">--</span></div>
  <div>PBD迭代: <span class="val" id="pbditer">10</span></div>
@@ -42,8 +41,6 @@ canvas { display:block; cursor:crosshair; }
 <div id="info">
  🖱️ 点击表面绑皮筋(法向) &nbsp; <span class="kb">R</span>=割一根 &nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">⚡ GPU PBD + Three.js WebGPU</span>
 </div>
-<div id="explosion">💥 爆了！</div>
-
 <div id="panel">
  <h3>🔧 PBD 参数</h3>
  <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
@@ -58,10 +55,6 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="sl_rc" min="0.3" max="8.0" step="0.01" value="2.51">
  <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
  <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
- <label>爆裂阈值 <span class="val" id="sv_bt">8</span></label>
- <input type="range" id="sl_bt" min="1" max="20" step="1" value="8">
- <label>delta平滑 <span class="val" id="sv_sm">4.0</span></label>
- <input type="range" id="sl_sm" min="1.0" max="12.0" step="0.5" value="4.0">
 
  <h3>🎯 最后皮筋 <span class="val" id="lb_info">(空)</span></h3>
  <label>rest周长 <span class="val" id="sv_lr">--</span></label>
@@ -88,11 +81,10 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 const $=id=>document.getElementById(id);
 const H={
   fps:$('fps'),framems:$('framems'),vcount:$('vcount'),hcount:$('hcount'),
-  bcount:$('bcount'),btarget:$('btarget'),vratio:$('vratio'),cratio:$('cratio'),
+  bcount:$('bcount'),vratio:$('vratio'),cratio:$('cratio'),
   pbditer:$('pbditer'),pbdtime:$('pbdtime'),
 };
 const canvas=$('canvas');
-const explosionEl=$('explosion');
 
 // ═══════ WebGPU adapter ═══════
 if(!navigator.gpu){alert('需要WebGPU！Chrome 113+');throw new Error('No WebGPU');}
@@ -132,17 +124,15 @@ let pineappleMesh=null;
 let proxyWireMesh=null;
 let showProxyWire=false;
 let modelMinY=-1.5,modelMaxY=1.5; // Y range of proxy model (for delta field)
+let voxBMin=[0,0,0],voxGS=[0.1,0.1,0.1],VOX_TOTAL=32*32*32; // voxel grid params
 
 // PBD params
 let SHAPE_STIFF=0.30, BAND_STIFF=0.50, VOL_STIFF=0.40, BAND_INFLU=0.60;
-let BAND_REST_CIRCUM=2.51, PBD_ITER=10, BURST_THRESHOLD=8;
-let SIGMA_MUL=4.0; // delta kernel smoothing width
+let BAND_REST_CIRCUM=2.51, PBD_ITER=10;
 const DELTA_BUCKETS=256;
 let pbdAccumTime=0, pbdConverged=false, convergeFrames=0, needsRestore=false;
 let CONVERGE_FRAMES=5;
 let lastVol=0;
-let burstTriggered=false;
-
 function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
 
 // Slider wiring
@@ -155,8 +145,6 @@ $('sl_rc').oninput=e=>{
   for(const b of bands)b.restCircum=BAND_REST_CIRCUM;markPbdDirty();
 };
 $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
-$('sl_bt').oninput=e=>{BURST_THRESHOLD=+e.target.value;$('sv_bt').textContent=BURST_THRESHOLD;H.btarget.textContent=BURST_THRESHOLD;};
-$('sl_sm').oninput=e=>{SIGMA_MUL=+e.target.value;$('sv_sm').textContent=SIGMA_MUL.toFixed(1);markPbdDirty();};
 
 // ═══════ Band System ═══════
 const MAX_BANDS=32;
@@ -282,7 +270,6 @@ function addBand(origin,normal){
   H.bcount.textContent=bands.length;
   updateLastBandPanel(bands.length-1);
   markPbdDirty();
-  checkBurst();
 }
 function removeBand(){
   if(bands.length===0)return;
@@ -296,36 +283,9 @@ function removeBand(){
   needsRestore=true;markPbdDirty();
   if(bands.length>0)updateLastBandPanel(bands.length-1);
   else{$('lb_info').textContent='(空)';}
-  checkBurst();
 }
 function removeAllBands(){
   while(bands.length>0)removeBand();
-}
-function checkBurst(){
-  if(!burstTriggered&&bands.length>=BURST_THRESHOLD){
-    burstTriggered=true;
-    triggerExplosion();
-  }
-}
-
-// ═══════ Explosion animation ═══════
-function triggerExplosion(){
-  explosionEl.style.opacity='1';
-  setTimeout(()=>{explosionEl.style.opacity='0';},2000);
-  // Scatter high-res mesh pieces
-  if(pineappleMesh){
-    const pos=pineappleMesh.geometry.attributes.position;
-    const arr=pos.array;
-    for(let i=0;i<arr.length;i+=3){
-      const dist=Math.sqrt(arr[i]**2+arr[i+1]**2+arr[i+2]**2)+0.1;
-      arr[i]+=(Math.random()-0.5)*dist*3;
-      arr[i+1]+=(Math.random()-0.5)*dist*3+Math.random()*2;
-      arr[i+2]+=(Math.random()-0.5)*dist*3;
-    }
-    pos.needsUpdate=true;
-    pineappleMesh.geometry.computeVertexNormals();
-  }
-  console.log('💥 爆了！皮筋数:',bands.length);
 }
 
 // ═══════ Last band panel ═══════
@@ -496,6 +456,13 @@ async function loadModels(){
   if(!isFinite(modelMinY)){modelMinY=-1.5;modelMaxY=1.5;}
   console.log('📏 代理Y范围:',modelMinY.toFixed(3),'~',modelMaxY.toFixed(3));
 
+  // Compute voxel grid bounds (3D bounding box, expanded 5%)
+  const vpad=0.05;
+  voxBMin=[Infinity,Infinity,Infinity];const vBMax=[-Infinity,-Infinity,-Infinity];
+  for(let i=0;i<proxyVertexCount;i++){for(let k=0;k<3;k++){const v=proxyRestPositions[i*3+k];if(v<voxBMin[k])voxBMin[k]=v;if(v>vBMax[k])vBMax[k]=v;}}
+  for(let k=0;k<3;k++){const r=vBMax[k]-voxBMin[k];voxBMin[k]-=r*vpad;vBMax[k]+=r*vpad;voxGS[k]=(vBMax[k]-voxBMin[k])/32;}
+  console.log('📦 体素网格: bmin=('+voxBMin.map(v=>v.toFixed(2)).join(',')+') gs=('+voxGS.map(v=>v.toFixed(3)).join(',')+')');
+
   // ── CPU nearest-proxy with spatial hash ──
   nearestProxyIdx=new Uint32Array(highResCount);
   const tHash=performance.now();
@@ -649,36 +616,123 @@ struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
 }
 `});
 
-// Build per-vertex 3D displacement on proxy mesh
-const buildDispCS=device.createShaderModule({label:'buildDisp',code:`
-struct P{vc:u32}
+// ── 3D Voxel Delta Field ──
+// Voxel grid: 32³ cells, each stores accumulated displacement + weight (fixed-point u32)
+// WGSL constants VOX=32, FIXED_SCALE=1048576.0 are inlined in shader code below
+
+// Pass 1: scatter proxy displacement to 8 neighboring voxels via trilinear weights
+const voxelScatterCS=device.createShaderModule({label:'voxelScatter',code:`
+const FIXED_SCALE=1048576.0;
+struct P{vc:u32,grid:u32,bminX:f32,bminY:f32,bminZ:f32,gsX:f32,gsY:f32,gsZ:f32}
 @group(0)@binding(0)var<storage,read>cur:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read>rest:array<vec4<f32>>;
-@group(0)@binding(2)var<storage,read_write>disp:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read_write>voxDx:array<atomic<i32>>;
+@group(0)@binding(3)var<storage,read_write>voxDy:array<atomic<i32>>;
+@group(0)@binding(4)var<storage,read_write>voxDz:array<atomic<i32>>;
+@group(0)@binding(5)var<storage,read_write>voxW:array<atomic<u32>>;
+@group(0)@binding(6)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let disp=cur[i].xyz-rest[i].xyz;
+  let rp=rest[i].xyz;
+  // Voxel coordinate (floating point, for trilinear interpolation)
+  let vx=(rp.x-p.bminX)/p.gsX-0.5;let vy=(rp.y-p.bminY)/p.gsY-0.5;let vz=(rp.z-p.bminZ)/p.gsZ-0.5;
+  let ix0=clamp(i32(floor(vx)),0,i32(p.grid)-1);let iy0=clamp(i32(floor(vy)),0,i32(p.grid)-1);let iz0=clamp(i32(floor(vz)),0,i32(p.grid)-1);
+  let fx=vx-f32(ix0);let fy=vy-f32(iy0);let fz=vz-f32(iz0);
+  let g=p.grid;
+  // Trilinear weights for 8 corners
+  for(var dx=0u;dx<2u;dx++){for(var dy=0u;dy<2u;dy++){for(var dz=0u;dz<2u;dz++){
+    let wx=select(1.0-fx,fx,dx==1u);let wy=select(1.0-fy,fy,dy==1u);let wz=select(1.0-fz,fz,dz==1u);
+    let w=wx*wy*wz;if(w<0.001){continue;}
+    let ix=u32(ix0)+dx;let iy=u32(iy0)+dy;let iz=u32(iz0)+dz;
+    if(ix>=g||iy>=g||iz>=g){continue;}
+    let vi=(ix*g+iy)*g+iz;
+    let ws=u32(w*FIXED_SCALE);
+    atomicAdd(&voxDx[vi],i32(disp.x*FIXED_SCALE*w));
+    atomicAdd(&voxDy[vi],i32(disp.y*FIXED_SCALE*w));
+    atomicAdd(&voxDz[vi],i32(disp.z*FIXED_SCALE*w));
+    atomicAdd(&voxW[vi],ws);
+  }}}
+}
+`});
+
+// Pass 2: normalize voxel grid (divide accumulated displacement by weight)
+const voxelNormCS=device.createShaderModule({label:'voxelNorm',code:`
+const FIXED_SCALE=1048576.0;
+struct P{grid:u32}
+@group(0)@binding(0)var<storage,read>voxDx:array<i32>;
+@group(0)@binding(1)var<storage,read>voxDy:array<i32>;
+@group(0)@binding(2)var<storage,read>voxDz:array<i32>;
+@group(0)@binding(3)var<storage,read>voxW:array<u32>;
+@group(0)@binding(4)var<storage,read_write>voxOut:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;let total=p.grid*p.grid*p.grid;if(i>=total){return;}
+  let w=f32(voxW[i])/FIXED_SCALE;
+  if(w>0.001){
+    voxOut[i]=vec4(f32(voxDx[i])/FIXED_SCALE/w,f32(voxDy[i])/FIXED_SCALE/w,f32(voxDz[i])/FIXED_SCALE/w,1.0);
+  }else{
+    voxOut[i]=vec4(0.0,0.0,0.0,0.0);
+  }
+}
+`});
+
+// Pass 3: apply voxel displacement to high-res mesh via trilinear interpolation
+const voxelApplyCS=device.createShaderModule({label:'voxelApply',code:`
+struct P{vc:u32,grid:u32,bminX:f32,bminY:f32,bminZ:f32,gsX:f32,gsY:f32,gsZ:f32}
+@group(0)@binding(0)var<storage,read>restPos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>voxOut:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read_write>outPos:array<vec4<f32>>;
 @group(0)@binding(3)var<uniform>p:P;
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
-  disp[i]=vec4(cur[i].xyz-rest[i].xyz,0.0);
+  let rp=restPos[i].xyz;
+  let vx=(rp.x-p.bminX)/p.gsX-0.5;let vy=(rp.y-p.bminY)/p.gsY-0.5;let vz=(rp.z-p.bminZ)/p.gsZ-0.5;
+  let ix0=clamp(i32(floor(vx)),0,i32(p.grid)-1);let iy0=clamp(i32(floor(vy)),0,i32(p.grid)-1);let iz0=clamp(i32(floor(vz)),0,i32(p.grid)-1);
+  let fx=vx-f32(ix0);let fy=vy-f32(iy0);let fz=vz-f32(iz0);
+  let g=p.grid;
+  var interpD=vec3(0.0);var totalW=0.0;
+  for(var dx=0u;dx<2u;dx++){for(var dy=0u;dy<2u;dy++){for(var dz=0u;dz<2u;dz++){
+    let wx=select(1.0-fx,fx,dx==1u);let wy=select(1.0-fy,fy,dy==1u);let wz=select(1.0-fz,fz,dz==1u);
+    let w=wx*wy*wz;if(w<0.001){continue;}
+    let ix=u32(ix0)+dx;let iy=u32(iy0)+dy;let iz=u32(iz0)+dz;
+    if(ix>=g||iy>=g||iz>=g){continue;}
+    let vi=(ix*g+iy)*g+iz;
+    let vd=voxOut[vi];
+    if(vd.w>0.0){interpD+=vd.xyz*w;totalW+=w;}
+  }}}
+  let disp=select(vec3(0.0),interpD/totalW,totalW>0.001);
+  outPos[i]=vec4(rp+disp,1.0);
 }
 `});
 
-// Apply 3D displacement to high-res mesh via nearest-proxy lookup
-const applyDispCS=device.createShaderModule({label:'applyDisp',code:`
-struct P{vc:u32}
-@group(0)@binding(0)var<storage,read>restPos:array<vec4<f32>>;
-@group(0)@binding(1)var<storage,read>disp:array<vec4<f32>>;
-@group(0)@binding(2)var<storage,read>nearest:array<u32>;
-@group(0)@binding(3)var<storage,read_write>outPos:array<vec4<f32>>;
-@group(0)@binding(4)var<uniform>p:P;
+// 3D voxel smoothing: only fill empty voxels from neighbors, leave filled ones untouched
+const voxelSmoothCS=device.createShaderModule({label:'voxelSmooth',code:`
+struct P{grid:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<uniform>p:P;
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
-  let i=gid.x;if(i>=p.vc){return;}
-  let proxyIdx=nearest[i];
-  outPos[i]=vec4(restPos[i].xyz+disp[proxyIdx].xyz,1.0);
+  let i=gid.x;let g=p.grid;let total=g*g*g;if(i>=total){return;}
+  let sv=src[i];
+  if(sv.w>0.001){
+    // Filled voxel: preserve original displacement exactly
+    dst[i]=sv;
+  }else{
+    // Empty voxel: gather from 26 neighbors (distance-weighted)
+    let iz=i%g;let iy=(i/g)%g;let ix=i/(g*g);
+    var sumD=vec3(0.0);var sumW=0.0;
+    for(var dx=i32(-1);dx<=1;dx++){for(var dy=i32(-1);dy<=1;dy++){for(var dz=i32(-1);dz<=1;dz++){
+      if(dx==0&&dy==0&&dz==0){continue;}
+      let nx=i32(ix)+dx;let ny=i32(iy)+dy;let nz=i32(iz)+dz;
+      if(nx<0||nx>=i32(g)||ny<0||ny>=i32(g)||nz<0||nz>=i32(g)){continue;}
+      let nv=src[(u32(nx)*g+u32(ny))*g+u32(nz)];
+      if(nv.w>0.001){let w=1.0/(1.0+f32(abs(dx)+abs(dy)+abs(dz)));sumD+=nv.xyz*w;sumW+=w;}
+    }}}
+    dst[i]=select(vec4(0.0),vec4(sumD/sumW,1.0),sumW>0.001);
+  }
 }
 `});
-
-// GPU nearest-proxy search: for each high-res vertex, find closest proxy vertex
-// One-time dispatch at load time. Result stays on GPU for applyDispCS.
 const nearestCS=device.createShaderModule({label:'nearest',code:`
 struct P{proxyCount:u32,hrCount:u32}
 @group(0)@binding(0)var<storage,read>proxyPos:array<vec4<f32>>;
@@ -996,8 +1050,9 @@ const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)
 const normPipe=cpPipe(normCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'norm');
 const normUnpackPipe=cpPipe(normUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'normUnpack');
 const posUnpackPipe=cpPipe(posUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'posUnpack');
-const buildDispPipe=cpPipe(buildDispCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'buildDisp');
-const applyDispPipe=cpPipe(applyDispCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'applyDisp');
+const voxelScatterPipe=cpPipe(voxelScatterCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'voxelScatter');
+const voxelNormPipe=cpPipe(voxelNormCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'voxelNorm');
+const voxelApplyPipe=cpPipe(voxelApplyCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'voxelApply');
 const nearestPipe=cpPipe(nearestCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'nearest');
 const bandReducePipe=cpPipe(bandReduceCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'bandReduce');
 const bandPerimPipe=cpPipe(bandPerimCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandPerim');
@@ -1007,14 +1062,15 @@ const bandApplyPipe=cpPipe(bandApplyCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S
 // ═══════ GPU Buffers and Bind Groups ═══════
 let posA,posB,restB,idxB,volB,volTotalB;
 let volRedLevels=[],staging;
-let dispBuf,nearestProxyBuf;
+let voxDxBuf,voxDyBuf,voxDzBuf,voxWBuf,voxOutBuf;
 let highResRestB,highResOutB,highResOut3B;
 let highResIdxB,highResAdjOffB,highResAdjDataB,highResNormB,highResNorm3B;
 let proxyRestNormB,proxyPos3B;
+let voxelScatterBG,voxelNormBG,voxelApplyBG;
+let voxelScatterUB,voxelNormUB,voxelApplyUB;
 let shapeBG_AB,shapeBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B;
-let buildDispBG,applyDispBG,buildDispBG_B;
 let hrNormBG,hrNormUnpackBG,highResUnpackBG,proxyUnpackBG_A,proxyUnpackBG_B;
-let shapeUB,volAccUB,volApUB,buildDispUB,applyDispUB,bandReduceUB,bandApplyUB;
+let shapeUB,volAccUB,volApUB,bandReduceUB,bandApplyUB;
 let bandParamsB,bandStateB,bandBinRB,bandBinCB;
 let bandReduceBG_A,bandReduceBG_B,bandApplyBG_AB,bandApplyBG_BA;
 let bandPerimBG_A,bandPerimBG_B,bandPerimReduceBG;
@@ -1054,8 +1110,13 @@ async function initGPU(){
       lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:db}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);srcCount=dc;srcBuf=db;}
   }
 
-  // Per-vertex ratio buffer (proxy mesh)
-  dispBuf=mkBuf(proxyVertexCount*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'disp');
+  // Voxel grid buffers (32³ = 32768 cells, 4 u32 accumulators + 1 vec4 output)
+  const VOX_TOTAL=32*32*32;
+  voxDxBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDx');
+  voxDyBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDy');
+  voxDzBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDz');
+  voxWBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxW');
+  voxOutBuf=mkBuf(VOX_TOTAL*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'voxOut');
 
   // High-res mesh buffers
   const HRB=highResCount*4*4;
@@ -1068,10 +1129,6 @@ async function initGPU(){
     hr4[i*4]=highResRestPositions[i*3];hr4[i*4+1]=highResRestPositions[i*3+1];hr4[i*4+2]=highResRestPositions[i*3+2];hr4[i*4+3]=1;
   }
   queue.writeBuffer(highResRestB,0,hr4);
-
-  // Nearest-proxy index buffer (computed on CPU at load time, used by applyDispCS)
-  nearestProxyBuf=mkBuf(highResCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'nearestProxy');
-  queue.writeBuffer(nearestProxyBuf,0,nearestProxyIdx);
 
   // Band param + state buffers (GPU PBD)
   const BAND_PARAM_STRIDE=9; // 9 floats per band (matches WGSL BandParam struct)
@@ -1104,8 +1161,9 @@ async function initGPU(){
   shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
   volAccUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volAccU');
   volApUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volApU');
-  buildDispUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'buildDispU');
-  applyDispUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'applyDispU');
+  voxelScatterUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxScatterU');
+  voxelNormUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxNormU');
+  voxelApplyUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxApplyU');
   bandReduceUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandReduceU');
   bandApplyUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandApplyU');
   bandPerimUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandPerimU');
@@ -1131,15 +1189,15 @@ async function initGPU(){
   volAccBG_A=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
   volAccBG_B=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
 
-  // Build ratio BG (per proxy vertex: ratio along rest normal)
-  buildDispBG=device.createBindGroup({layout:buildDispPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:restB}},{binding:2,resource:{buffer:dispBuf}},{binding:3,resource:{buffer:buildDispUB}}]});
-  buildDispBG_B=device.createBindGroup({layout:buildDispPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:restB}},{binding:2,resource:{buffer:dispBuf}},{binding:3,resource:{buffer:buildDispUB}}]});
-
-  // Apply displacement BG (per HR vertex: disp from nearest proxy)
-  applyDispBG=device.createBindGroup({layout:applyDispPipe.bgl,entries:[
-    {binding:0,resource:{buffer:highResRestB}},{binding:1,resource:{buffer:dispBuf}},{binding:2,resource:{buffer:nearestProxyBuf}},{binding:3,resource:{buffer:highResOutB}},{binding:4,resource:{buffer:applyDispUB}}]});
+  // Voxel scatter BG (one for posA, one for posB)
+  voxelScatterBG=device.createBindGroup({layout:voxelScatterPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:restB}},{binding:2,resource:{buffer:voxDxBuf}},{binding:3,resource:{buffer:voxDyBuf}},{binding:4,resource:{buffer:voxDzBuf}},{binding:5,resource:{buffer:voxWBuf}},{binding:6,resource:{buffer:voxelScatterUB}}]});
+  // Voxel normalize BG
+  voxelNormBG=device.createBindGroup({layout:voxelNormPipe.bgl,entries:[
+    {binding:0,resource:{buffer:voxDxBuf}},{binding:1,resource:{buffer:voxDyBuf}},{binding:2,resource:{buffer:voxDzBuf}},{binding:3,resource:{buffer:voxWBuf}},{binding:4,resource:{buffer:voxOutBuf}},{binding:5,resource:{buffer:voxelNormUB}}]});
+  // Voxel apply BG
+  voxelApplyBG=device.createBindGroup({layout:voxelApplyPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResRestB}},{binding:1,resource:{buffer:voxOutBuf}},{binding:2,resource:{buffer:highResOutB}},{binding:3,resource:{buffer:voxelApplyUB}}]});
 
   // Band reduce BG (reads posA or posB, writes bandState)
   bandReduceBG_A=device.createBindGroup({layout:bandReducePipe.bgl,entries:[
@@ -1311,10 +1369,20 @@ async function runGPUPBD(){
     for(const lv of volRedLevels){cp.setPipeline(volReducePipe.pipe);cp.setBindGroup(0,lv.bg);cp.dispatchWorkgroups(lv.wgCount,1,1);}
     cp.setPipeline(volApPipe.pipe);cp.setBindGroup(0,isA?volApBG_AB:volApBG_BA);cp.dispatchWorkgroups(WG,1,1);
 
-    // Last iteration: build ratio
+    // Last iteration: scatter proxy displacement to voxel grid
     if(isLast){
-      queue.writeBuffer(buildDispUB,0,new Uint32Array([proxyVertexCount]));
-      cp.setPipeline(buildDispPipe.pipe);cp.setBindGroup(0,isA?buildDispBG_B:buildDispBG);cp.dispatchWorkgroups(WG,1,1);
+      // Clear voxel accumulators
+      queue.writeBuffer(voxDxBuf,0,new Uint32Array(VOX_TOTAL));
+      queue.writeBuffer(voxDyBuf,0,new Uint32Array(VOX_TOTAL));
+      queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
+      queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
+      // Voxel grid params
+      const vu=new ArrayBuffer(32);
+      new Uint32Array(vu)[0]=proxyVertexCount;new Uint32Array(vu)[1]=32;
+      new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
+      new Float32Array(vu,20)[0]=voxGS[0];new Float32Array(vu,24)[0]=voxGS[1];new Float32Array(vu,28)[0]=voxGS[2];
+      queue.writeBuffer(voxelScatterUB,0,vu);
+      cp.setPipeline(voxelScatterPipe.pipe);cp.setBindGroup(0,voxelScatterBG);cp.dispatchWorkgroups(WG,1,1);
     }
 
     cp.end();
@@ -1341,10 +1409,21 @@ async function runGPUPBD(){
 
 // ═══════ Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ═══════
 async function runGPUPostPBD(srcBuf){
-  // Apply 3D displacement to high-res mesh
-  queue.writeBuffer(applyDispUB,0,new Uint32Array([highResCount]));
+  // Normalize voxel grid
+  queue.writeBuffer(voxelNormUB,0,new Uint32Array([32]));
+  const cmd0=device.createCommandEncoder();const cp0=cmd0.beginComputePass();
+  cp0.setPipeline(voxelNormPipe.pipe);cp0.setBindGroup(0,voxelNormBG);cp0.dispatchWorkgroups(Math.ceil(VOX_TOTAL/256),1,1);
+  cp0.end();device.queue.submit([cmd0.finish()]);
+
+  // Apply voxel grid to high-res mesh
+  await device.queue.onSubmittedWorkDone();
+  const vu=new ArrayBuffer(32);
+  new Uint32Array(vu)[0]=highResCount;new Uint32Array(vu)[1]=32;
+  new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
+  new Float32Array(vu,20)[0]=voxGS[0];new Float32Array(vu,24)[0]=voxGS[1];new Float32Array(vu,28)[0]=voxGS[2];
+  queue.writeBuffer(voxelApplyUB,0,vu);
   const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();
-  cp.setPipeline(applyDispPipe.pipe);cp.setBindGroup(0,applyDispBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.setPipeline(voxelApplyPipe.pipe);cp.setBindGroup(0,voxelApplyBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
   cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,highResUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
   cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,hrNormBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
   cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,hrNormUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
@@ -1522,9 +1601,7 @@ async function animate(){
 
   const t0=performance.now();
 
-  if(burstTriggered){
-    // Post-explosion: just render
-  }else if(bands.length>0&&!pbdConverged){
+  if(bands.length>0&&!pbdConverged){
     const pbdT0=performance.now();
     const finalSrc=await runGPUPBD();
     await runGPUPostPBD(finalSrc);
@@ -1540,7 +1617,11 @@ async function animate(){
     for(let i=0;i<proxyVertexCount;i++){pos4r[i*4]=proxyRestPositions[i*3];pos4r[i*4+1]=proxyRestPositions[i*3+1];pos4r[i*4+2]=proxyRestPositions[i*3+2];pos4r[i*4+3]=1;}
     queue.writeBuffer(posA,0,pos4r);
     queue.writeBuffer(posB,0,pos4r);
-    queue.writeBuffer(dispBuf,0,new Float32Array(proxyVertexCount*4)); // zero displacement
+    // Clear all voxel buffers so voxelNorm produces zero displacement
+    queue.writeBuffer(voxDxBuf,0,new Uint32Array(VOX_TOTAL));
+    queue.writeBuffer(voxDyBuf,0,new Uint32Array(VOX_TOTAL));
+    queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
+    queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
     proxyCurPositions.set(proxyRestPositions);
     await runGPUPostPBD(posA);
     needsRestore=false;lastVol=restVolume;
@@ -1564,11 +1645,10 @@ async function animate(){
   requestAnimationFrame(animate);
 }
 
-console.log('🔧 爆菠萝 — 任意皮筋 + GPU PBD + Three.js WebGPU');
+console.log('🔧 皮筋游戏 — GPU PBD + Three.js WebGPU');
 console.log('   🖱️ 点击表面绑皮筋(表面法向)');
 console.log('   R = 割一根, C = 全部割掉');
 console.log('   📐 右侧面板调参数');
-H.btarget.textContent=BURST_THRESHOLD;
 animate();
 </script>
 </body>
