@@ -1009,6 +1009,29 @@ var<workgroup>sOff:array<u32,64>;
 }
 `});
 
+// Pass 5 (post-PBD): generate target (green) polyline by scaling red points toward centroid
+const bandVisTargetCS=device.createShaderModule({label:'bandVisTarget',code:`
+struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
+struct P{bc:u32}
+@group(0)@binding(0)var<storage,read>visPts:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>visCnt:array<u32>;
+@group(0)@binding(2)var<storage,read>state:array<BandState>;
+@group(0)@binding(3)var<storage,read_write>visTgt:array<vec4<f32>>;
+@group(0)@binding(4)var<uniform>p:P;
+@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
+  let cnt=visCnt[b];if(lid.x>=cnt){return;}
+  let pt=visPts[b*256u+lid.x];
+  if(pt.w<0.5){return;}
+  let st=state[b];
+  if(st.scale<1.0){
+    visTgt[b*256u+lid.x]=vec4(st.gx+(pt.x-st.gx)*st.scale,st.gy+(pt.y-st.gy)*st.scale,st.gz+(pt.z-st.gz)*st.scale,1.0);
+  }else{
+    visTgt[b*256u+lid.x]=vec4(0.0,0.0,0.0,0.0);
+  }
+}
+`});
+
 // Normals recompute (unchanged from original)
 const normCS=device.createShaderModule({label:'norm',code:`
 struct P{vc:u32}
@@ -1082,6 +1105,8 @@ const bandReducePipe=cpPipe(bandReduceCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS)
 const bandPerimPipe=cpPipe(bandPerimCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandPerim');
 const bandPerimReducePipe=cpPipe(bandPerimReduceCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandPerimReduce');
 const bandApplyPipe=cpPipe(bandApplyCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'bandApply');
+const bandVisPipe=cpPipe(bandVisCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandVis');
+const bandVisTargetPipe=cpPipe(bandVisTargetCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandVisTarget');
 
 // ═══════ GPU Buffers and Bind Groups ═══════
 let posA,posB,restB,idxB,volB,volTotalB;
@@ -1098,7 +1123,9 @@ let shapeUB,volAccUB,volApUB,bandReduceUB,bandApplyUB;
 let bandParamsB,bandStateB,bandBinRB,bandBinCB;
 let bandReduceBG_A,bandReduceBG_B,bandApplyBG_AB,bandApplyBG_BA;
 let bandPerimBG_A,bandPerimBG_B,bandPerimReduceBG;
-let bandPerimUB;
+let bandPerimUB,bandVisUB;
+let bandVisBG,visPtsBuf,visCntBuf,visPtsStaging,visCntStaging;
+let visTgtBuf,visTgtStaging,bandVisTargetBG;
 let WG,VWG;
 
 async function initGPU(){
@@ -1161,6 +1188,15 @@ async function initGPU(){
   const BIN_SIZE=MAX_BANDS*64*4; // u32 per entry
   bandBinRB=mkBuf(BIN_SIZE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bandBinR');
   bandBinCB=mkBuf(BIN_SIZE,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bandBinC');
+
+  // Band visualization buffers (GPU→CPU readback for polyline rendering)
+  visPtsBuf=mkBuf(MAX_BANDS*256*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'visPts');
+  visCntBuf=mkBuf(MAX_BANDS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'visCnt');
+  visTgtBuf=mkBuf(MAX_BANDS*256*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'visTgt');
+  visPtsStaging=mkBuf(MAX_BANDS*256*4*4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'visPtsStaging');
+  visCntStaging=mkBuf(MAX_BANDS*4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'visCntStaging');
+  visTgtStaging=mkBuf(MAX_BANDS*256*4*4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'visTgtStaging');
+  bandVisUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandVisU');
 
   // ⋯ (adjacency, idx, norms — same as before) ⋯
 
@@ -1243,6 +1279,14 @@ async function initGPU(){
   // Band perimeter reduce BG
   bandPerimReduceBG=device.createBindGroup({layout:bandPerimReducePipe.bgl,entries:[
     {binding:0,resource:{buffer:bandBinRB}},{binding:1,resource:{buffer:bandBinCB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandPerimUB}}]});
+
+  // Band visualization BG (reads bins → writes compacted polyline points)
+  bandVisBG=device.createBindGroup({layout:bandVisPipe.bgl,entries:[
+    {binding:0,resource:{buffer:bandBinRB}},{binding:1,resource:{buffer:bandBinCB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:visPtsBuf}},{binding:5,resource:{buffer:visCntBuf}},{binding:6,resource:{buffer:bandVisUB}}]});
+
+  // Band vis target BG (reads visPts + visCnt + state → writes visTgt)
+  bandVisTargetBG=device.createBindGroup({layout:bandVisTargetPipe.bgl,entries:[
+    {binding:0,resource:{buffer:visPtsBuf}},{binding:1,resource:{buffer:visCntBuf}},{binding:2,resource:{buffer:bandStateB}},{binding:3,resource:{buffer:visTgtBuf}},{binding:4,resource:{buffer:bandVisUB}}]});
 
   // High-res normal compute BG
   hrNormBG=device.createBindGroup({layout:normPipe.bgl,entries:[
@@ -1466,10 +1510,6 @@ async function runGPUPBD(){
   staging.unmap();
   H.vratio.textContent=(lastVol/restVolume*100).toFixed(1);
 
-  // Read back proxy positions for band visualization (CPU exact polyline)
-  await readbackProxyPositions(finalSrc);
-  updateAllBandVisuals();
-
   return finalSrc;
 }
 
@@ -1521,6 +1561,82 @@ async function runGPUPostPBD(srcBuf){
       device.queue.submit([cmd3.finish()]);
     }
   }
+}
+
+// ═══════ GPU Band Visualization (replaces CPU readback + polyline) ═══════
+async function runGPUBandVis(finalSrc){
+  const bc=bands.length;
+  if(bc===0)return;
+
+  writeBandParams();
+  queue.writeBuffer(bandReduceUB,0,new Uint32Array([proxyVertexCount,bc]));
+  queue.writeBuffer(bandPerimUB,0,new Uint32Array([proxyTriCount,bc]));
+  queue.writeBuffer(bandVisUB,0,new Uint32Array([bc]));
+  queue.writeBuffer(bandBinRB,0,new Uint32Array(MAX_BANDS*64));
+  queue.writeBuffer(bandBinCB,0,new Uint32Array(MAX_BANDS*64));
+
+  const isA=finalSrc===posA;
+  const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();
+  // 1. Centroids from final proxy positions (writes bandState)
+  cp.setPipeline(bandReducePipe.pipe);cp.setBindGroup(0,isA?bandReduceBG_A:bandReduceBG_B);cp.dispatchWorkgroups(bc,1,1);
+  // 2. Exact perimeter via triangle-plane intersection (writes bin buffers)
+  cp.setPipeline(bandPerimPipe.pipe);cp.setBindGroup(0,isA?bandPerimBG_A:bandPerimBG_B);cp.dispatchWorkgroups(Math.ceil(proxyTriCount/256),1,1);
+  // 3. Red polyline from bins (reads bins+state, writes visPts+visCnt)
+  cp.setPipeline(bandVisPipe.pipe);cp.setBindGroup(0,bandVisBG);cp.dispatchWorkgroups(bc,1,1);
+  // 4. Green target polyline = centroid + (red - centroid) * scale (reads visPts+visCnt+state, writes visTgt)
+  cp.setPipeline(bandVisTargetPipe.pipe);cp.setBindGroup(0,bandVisTargetBG);cp.dispatchWorkgroups(bc,1,1);
+  cp.end();
+  cmd.copyBufferToBuffer(visCntBuf,0,visCntStaging,0,bc*4);
+  cmd.copyBufferToBuffer(visPtsBuf,0,visPtsStaging,0,bc*256*4*4);
+  cmd.copyBufferToBuffer(visTgtBuf,0,visTgtStaging,0,bc*256*4*4);
+  device.queue.submit([cmd.finish()]);
+
+  // Read back counts
+  await visCntStaging.mapAsync(GPUMapMode.READ);
+  const visCntArr=new Uint32Array(visCntStaging.getMappedRange(0,bc*4));
+  const counts=new Uint32Array(bc);for(let b=0;b<bc;b++)counts[b]=visCntArr[b];
+  visCntStaging.unmap();
+
+  // Read back red polyline
+  await visPtsStaging.mapAsync(GPUMapMode.READ);
+  const redArr=new Float32Array(visPtsStaging.getMappedRange(0,bc*256*4*4));
+
+  // Read back green polyline
+  await visTgtStaging.mapAsync(GPUMapMode.READ);
+  const greenArr=new Float32Array(visTgtStaging.getMappedRange(0,bc*256*4*4));
+
+  // Update each band's line geometries (pure copy, no CPU computation)
+  for(let b=0;b<bc;b++){
+    const cnt=counts[b];
+    const vis=bandVisuals[b];if(!vis)continue;
+    if(cnt<3){vis.lineActual.visible=false;vis.lineTarget.visible=false;continue;}
+    const off=b*256*4;
+    // Red: actual cross-section polyline
+    const red=[];for(let j=0;j<cnt;j++){red.push(redArr[off+j*4],redArr[off+j*4+1],redArr[off+j*4+2]);}
+    updateBandLine(vis.lineActual,red);
+    // Green: target (GPU-computed centroid + scale, w=1 if compression needed, w=0 otherwise)
+    if(greenArr[off+3]>0.5){
+      const green=[];for(let j=0;j<cnt;j++){green.push(greenArr[off+j*4],greenArr[off+j*4+1],greenArr[off+j*4+2]);}
+      updateBandLine(vis.lineTarget,green);vis.lineTarget.visible=true;
+    }else{vis.lineTarget.visible=false;}
+  }
+
+  // HUD: perimeter ratio for last band (lightweight CPU: chord-length on ≤64 points)
+  if(bc>0){
+    const lb=bands[bc-1];const cnt=counts[bc-1];
+    if(cnt>=3&&lb){
+      const off=(bc-1)*256*4;let p=0;
+      for(let j=0;j<cnt;j++){
+        const j3=off+j*4,k3=off+((j+1)%cnt)*4;
+        const dx=redArr[k3]-redArr[j3],dy=redArr[k3+1]-redArr[j3+1],dz=redArr[k3+2]-redArr[j3+2];
+        p+=Math.sqrt(dx*dx+dy*dy+dz*dz);
+      }
+      H.cratio.textContent=lb.restCircum>0?(p/lb.restCircum).toFixed(3):'--';
+    }else{H.cratio.textContent='--';}
+  }
+
+  visPtsStaging.unmap();
+  visTgtStaging.unmap();
 }
 
 // ═══════ Interaction ═══════
@@ -1670,6 +1786,7 @@ async function animate(){
   if(bands.length>0&&!pbdConverged){
     const pbdT0=performance.now();
     const finalSrc=await runGPUPBD();
+    await runGPUBandVis(finalSrc);
     await runGPUPostPBD(finalSrc);
     pbdAccumTime+=performance.now()-pbdT0;
     convergeFrames++;
@@ -1689,6 +1806,7 @@ async function animate(){
     queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
     queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
     proxyCurPositions.set(proxyRestPositions);
+    await runGPUBandVis(posA);
     await runGPUPostPBD(posA);
     needsRestore=false;lastVol=restVolume;
     H.pbdtime.textContent='已恢复 ✓';
