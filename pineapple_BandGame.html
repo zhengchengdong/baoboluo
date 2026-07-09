@@ -1196,7 +1196,7 @@ const bandVisTargetPipe=cpPipe(bandVisTargetCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R
 
 // ═══════ GPU Buffers and Bind Groups ═══════
 let posA,posB,restB,idxB,volB,volTotalB;
-let volRedLevels=[],staging;
+let volRedLevels=[],staging,volStaging;
 let voxDxBuf,voxDyBuf,voxDzBuf,voxWBuf,voxOutBuf;
 let highResRestB,highResOutB,highResOut3B;
 let highResIdxB,highResAdjOffB,highResAdjDataB,highResNormB,highResNorm3B;
@@ -1304,6 +1304,7 @@ async function initGPU(){
 
   // Staging
   staging=mkBuf(Math.max(4,proxyVertexCount*4*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+  volStaging=mkBuf(4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'volStaging');
 
   // ── Bind groups ──
   // Shape (A→B and B→A)
@@ -1408,6 +1409,19 @@ async function readbackProxyPositions(srcBuf){
     proxyCurPositions[i*3+2]=arr[i*4+2];
   }
   staging.unmap();
+}
+
+// Read back current volume from GPU buffer for HUD display
+async function readbackVolume(){
+  if(!volTotalB||!volStaging||!restVolume)return;
+  const cmd=device.createCommandEncoder();
+  cmd.copyBufferToBuffer(volTotalB,0,volStaging,0,4);
+  device.queue.submit([cmd.finish()]);
+  await volStaging.mapAsync(GPUMapMode.READ);
+  const curVol=new Float32Array(volStaging.getMappedRange(0,4))[0];
+  volStaging.unmap();
+  const ratio=restVolume>0?Math.abs(curVol)/restVolume*100:100;
+  H.vratio.textContent=ratio.toFixed(1);
 }
 
 // Update band visuals from CPU proxy positions (exact polyline, proven in testbed)
@@ -1804,14 +1818,18 @@ async function animate(){
   if(bands.length>0&&!pbdConverged){
     const pbdT0=performance.now();
     const finalSrc=await runGPUPBD();
-    // [PERF] 注释: 皮筋可视化回传 CPU 仅用于渲染 LINE
-    // await runGPUBandVis(finalSrc);
     await runGPUPostPBD(finalSrc);
     const frameTime=performance.now()-pbdT0;
     pbdAccumTime+=frameTime;
     console.log('⏱️ frame#'+convergeFrames+' pbdTime='+frameTime.toFixed(1)+'ms accum='+pbdAccumTime.toFixed(1)+'ms');
     convergeFrames++;
-    if(convergeFrames>=CONVERGE_FRAMES){pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ✓';}
+    if(convergeFrames>=CONVERGE_FRAMES){
+      pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ✓';
+      // 最终帧: 回传代理顶点+体积并更新红/绿皮筋可视化 (仅此帧有pipeline stall)
+      await readbackVolume();
+      await readbackProxyPositions(finalSrc);
+      updateAllBandVisuals();
+    }
     else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
   }else if(bands.length>0&&pbdConverged){
     H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ✓';
@@ -1827,13 +1845,12 @@ async function animate(){
     queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
     queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
     proxyCurPositions.set(proxyRestPositions);
-    // [PERF] 注释: 皮筋可视化回传 CPU 仅用于渲染 LINE
-    // await runGPUBandVis(posA);
     await runGPUPostPBD(posA);
     needsRestore=false;lastVol=restVolume;
     H.pbdtime.textContent='已恢复 ✓';
     H.vratio.textContent='100.0';
-    H.cratio.textContent='--';
+    // 恢复后更新皮筋可视化(所有皮筋回到rest位置)
+    updateAllBandVisuals();
   }else{
     H.pbdtime.textContent='空闲';
   }
