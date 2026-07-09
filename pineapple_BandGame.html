@@ -770,20 +770,20 @@ struct P{proxyCount:u32,hrCount:u32}
 }
 `});
 
-// ── Band constraint GPU shaders ──
-// Pass 1: weighted centroid only (no perimeter)
-const bandReduceCS=device.createShaderModule({label:'bandReduce',code:`
+// ── Band constraint GPU shaders (merged: 1 dispatch per phase) ──
+// Phase A1: weighted centroid for ALL bands (bc workgroups, each handles one band)
+const bandReduceAllCS=device.createShaderModule({label:'bandReduceAll',code:`
 struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
 struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
-struct P{vc:u32,bc:u32,bandIdx:u32}
+struct P{vc:u32,bc:u32}
 @group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read>params:array<BandParam>;
 @group(0)@binding(2)var<storage,read_write>state:array<BandState>;
 @group(0)@binding(3)var<uniform>p:P;
 var<workgroup>sGx:array<f32,256>;var<workgroup>sGy:array<f32,256>;var<workgroup>sGz:array<f32,256>;
 var<workgroup>sW:array<f32,256>;
-@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>){
-  let b=p.bandIdx;if(b>=p.bc){return;}
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
   let param=params[b];
   var myGx=0.0;var myGy=0.0;var myGz=0.0;var myW=0.0;var vi=lid.x;
   while(vi<p.vc){
@@ -806,11 +806,11 @@ var<workgroup>sW:array<f32,256>;
 }
 `});
 
-// Pass 2: exact triangle-plane intersection → angle binning (storage atomics)
-const bandPerimCS=device.createShaderModule({label:'bandPerim',code:`
+// Phase A2: triangle-plane intersection for ALL bands (each triangle loops over all bands)
+const bandPerimAllCS=device.createShaderModule({label:'bandPerimAll',code:`
 struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
 struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
-struct P{triCount:u32,bc:u32,bandIdx:u32}
+struct P{triCount:u32,bc:u32}
 @group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read>idx:array<u32>;
 @group(0)@binding(2)var<storage,read>params:array<BandParam>;
@@ -833,7 +833,8 @@ fn addBinPoint(px:f32,py:f32,pz:f32,Gx:f32,Gy:f32,Gz:f32,ux:f32,uy:f32,uz:f32,vx
   let ti=gid.x;if(ti>=p.triCount){return;}
   let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
   let v0=pos[i0].xyz;let v1=pos[i1].xyz;let v2=pos[i2].xyz;
-  let b=p.bandIdx;if(b>=p.bc){return;}
+  for(var b=0u;b<256u;b++){
+    if(b>=p.bc){break;}
     let param=params[b];let st=state[b];
     let ox=param.ox;let oy=param.oy;let oz=param.oz;
     let nx=param.nx;let ny=param.ny;let nz=param.nz;
@@ -844,7 +845,7 @@ fn addBinPoint(px:f32,py:f32,pz:f32,Gx:f32,Gy:f32,Gz:f32,ux:f32,uy:f32,uz:f32,vx
     let s0=select(0,select(1,-1,d0>eps),abs(d0)>eps);
     let s1=select(0,select(1,-1,d1>eps),abs(d1)>eps);
     let s2=select(0,select(1,-1,d2>eps),abs(d2)>eps);
-    if(s0==s1&&s1==s2&&s0!=0){return;}
+    if(s0==s1&&s1==s2&&s0!=0){continue;}
     // Build 2D basis on plane
     var ux:f32;var uy:f32;var uz:f32;
     if(abs(nx)<0.9){ux=1.0;uy=0.0;uz=0.0;}else{ux=0.0;uy=0.0;uz=1.0;}
@@ -871,30 +872,28 @@ fn addBinPoint(px:f32,py:f32,pz:f32,Gx:f32,Gy:f32,Gz:f32,ux:f32,uy:f32,uz:f32,vx
     if(abs(d0)<=eps){addBinPoint(v0.x,v0.y,v0.z,Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);}
     if(abs(d1)<=eps){addBinPoint(v1.x,v1.y,v1.z,Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);}
     if(abs(d2)<=eps){addBinPoint(v2.x,v2.y,v2.z,Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);}
+  }
 }
 `});
 
-// Pass 3: reduce bins to exact perimeter → write scale factor
-const bandPerimReduceCS=device.createShaderModule({label:'bandPerimReduce',code:`
+// Phase A3: reduce bins → scale for ALL bands (bc workgroups of 64 threads)
+const bandPerimReduceAllCS=device.createShaderModule({label:'bandPerimReduceAll',code:`
 struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
 struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
-struct P{triCount:u32,bc:u32,bandIdx:u32}
+struct P{triCount:u32,bc:u32}
 @group(0)@binding(0)var<storage,read>binR:array<u32>;
 @group(0)@binding(1)var<storage,read>binC:array<u32>;
 @group(0)@binding(2)var<storage,read>params:array<BandParam>;
 @group(0)@binding(3)var<storage,read_write>state:array<BandState>;
 @group(0)@binding(4)var<uniform>p:P;
 var<workgroup>sR:array<f32,64>;
-@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>){
-  let b=p.bandIdx;if(b>=p.bc){return;}
-  // Read this bin's average radius
+@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
   let off=b*64u+lid.x;
   let cnt=binC[off];
   let r=select(0.0,f32(binR[off])/1048576.0/f32(cnt),cnt>0u);
   sR[lid.x]=r;
   workgroupBarrier();
-  // Compute perimeter as sum of chord lengths between adjacent non-empty bins
-  // Find first non-empty bin
   if(lid.x==0u){
     var firstI=64u;var prevR=0.0;var prevI=64u;
     for(var i=0u;i<64u;i++){if(sR[i]>0.0){firstI=i;prevR=sR[i];prevI=i;break;}}
@@ -903,12 +902,10 @@ var<workgroup>sR:array<f32,64>;
       for(var i=firstI+1u;i<64u;i++){
         if(sR[i]>0.0){
           let da=6.28318531*f32(i-prevI)/64.0;
-          // Chord length between two points at radii prevR and sR[i] separated by angle da
           perim+=sqrt(prevR*prevR+sR[i]*sR[i]-2.0*prevR*sR[i]*cos(da));
           prevR=sR[i];prevI=i;
         }
       }
-      // Close the loop: last bin back to first bin
       let da=6.28318531*f32(64u+firstI-prevI)/64.0;
       let firstR=sR[firstI];
       perim+=sqrt(prevR*prevR+firstR*firstR-2.0*prevR*firstR*cos(da));
@@ -921,10 +918,11 @@ var<workgroup>sR:array<f32,64>;
 }
 `});
 
-const bandApplyCS=device.createShaderModule({label:'bandApply',code:`
+// Phase B: apply ALL bands per vertex with internal Gauss-Seidel loop
+const bandApplyAllCS=device.createShaderModule({label:'bandApplyAll',code:`
 struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
 struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
-struct P{vc:u32,bc:u32,bandIdx:u32}
+struct P{vc:u32,bc:u32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read>params:array<BandParam>;
@@ -932,28 +930,28 @@ struct P{vc:u32,bc:u32,bandIdx:u32}
 @group(0)@binding(4)var<uniform>p:P;
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
-  let b=p.bandIdx;if(b>=p.bc){dst[i]=src[i];return;}
   var cur=src[i];
+  for(var b=0u;b<256u;b++){
+    if(b>=p.bc){break;}
     let param=params[b];let st=state[b];
-    if(st.scale>=1.0){dst[i]=cur;return;} // L₀/P >= 1 → cross-section already ≤ L₀
+    if(st.scale>=1.0){continue;} // L₀/P >= 1 → cross-section already ≤ L₀, skip this band
     let signedD=(cur.x-param.ox)*param.nx+(cur.y-param.oy)*param.ny+(cur.z-param.oz)*param.nz;
     let absD=abs(signedD);
-    if(absD>=param.influ_radius){dst[i]=cur;return;}
+    if(absD>=param.influ_radius){continue;}
     let t=absD/param.influ_radius;
     let blend=t*t*(3.0-2.0*t);
     let projX=cur.x-signedD*param.nx;let projY=cur.y-signedD*param.ny;let projZ=cur.z-signedD*param.nz;
     let dx=projX-st.gx;let dy=projY-st.gy;let dz=projZ-st.gz;
     let r_cur=sqrt(dx*dx+dy*dy+dz*dz);
-    if(r_cur<1e-6){dst[i]=cur;return;}
-    // Exact scale from perimeter measurement: st.scale = L₀/P (<1 means too big)
-    // At plane (blend=0): full push by scale. At edge (blend=1): no push.
+    if(r_cur<1e-6){continue;}
     let eff_scale=st.scale+(1.0-st.scale)*blend;
     if(eff_scale<1.0){
       let s=1.0-param.stiffness*(1.0-eff_scale);
-    cur.x=st.gx+(projX-st.gx)*s+signedD*param.nx;
-    cur.y=st.gy+(projY-st.gy)*s+signedD*param.ny;
-    cur.z=st.gz+(projZ-st.gz)*s+signedD*param.nz;
+      cur.x=st.gx+(projX-st.gx)*s+signedD*param.nx;
+      cur.y=st.gy+(projY-st.gy)*s+signedD*param.ny;
+      cur.z=st.gz+(projZ-st.gz)*s+signedD*param.nz;
     }
+  }
   dst[i]=cur;
 }
 `});
@@ -1102,10 +1100,10 @@ const voxelScatterPipe=cpPipe(voxelScatterCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2
 const voxelNormPipe=cpPipe(voxelNormCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'voxelNorm');
 const voxelApplyPipe=cpPipe(voxelApplyCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'voxelApply');
 const nearestPipe=cpPipe(nearestCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'nearest');
-const bandReducePipe=cpPipe(bandReduceCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'bandReduce');
-const bandPerimPipe=cpPipe(bandPerimCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandPerim');
-const bandPerimReducePipe=cpPipe(bandPerimReduceCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandPerimReduce');
-const bandApplyPipe=cpPipe(bandApplyCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'bandApply');
+const bandReduceAllPipe=cpPipe(bandReduceAllCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'bandReduceAll');
+const bandPerimAllPipe=cpPipe(bandPerimAllCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandPerimAll');
+const bandPerimReduceAllPipe=cpPipe(bandPerimReduceAllCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandPerimReduceAll');
+const bandApplyAllPipe=cpPipe(bandApplyAllCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'bandApplyAll');
 const bandVisPipe=cpPipe(bandVisCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandVis');
 const bandVisTargetPipe=cpPipe(bandVisTargetCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandVisTarget');
 
@@ -1120,11 +1118,11 @@ let voxelScatterBG,voxelNormBG,voxelApplyBG;
 let voxelScatterUB,voxelNormUB,voxelApplyUB;
 let shapeBG_AB,shapeBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B;
 let hrNormBG,hrNormUnpackBG,highResUnpackBG,proxyUnpackBG_A,proxyUnpackBG_B;
-let shapeUB,volAccUB,volApUB,bandReduceUB,bandApplyUB;
+let shapeUB,volAccUB,volApUB,bandReduceAllUB,bandApplyAllUB,bandPerimAllUB,bandPerimReduceAllUB;
 let bandParamsB,bandStateB,bandBinRB,bandBinCB;
-let bandReduceBG_A,bandReduceBG_B,bandApplyBG_AB,bandApplyBG_BA;
-let bandPerimBG_A,bandPerimBG_B,bandPerimReduceBG;
-let bandPerimUB,bandVisUB;
+let bandReduceAllBG_A,bandReduceAllBG_B,bandApplyAllBG_AB,bandApplyAllBG_BA;
+let bandPerimAllBG_A,bandPerimAllBG_B,bandPerimReduceAllBG;
+let bandVisUB;
 let bandVisBG,visPtsBuf,visCntBuf,visPtsStaging,visCntStaging;
 let visTgtBuf,visTgtStaging,bandVisTargetBG;
 let WG,VWG;
@@ -1224,20 +1222,11 @@ async function initGPU(){
   voxelScatterUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxScatterU');
   voxelNormUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxNormU');
   voxelApplyUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxApplyU');
-  // Band uniforms: MAX_BANDS slots at 256-byte alignment for dynamic offset
-  const BAND_U_ALIGN=256;
-  const BAND_U_SIZE=MAX_BANDS*BAND_U_ALIGN;
-  bandReduceUB=mkBuf(BAND_U_SIZE,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandReduceU');
-  bandApplyUB=mkBuf(BAND_U_SIZE,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandApplyU');
-  bandPerimUB=mkBuf(BAND_U_SIZE,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandPerimU');
-  // Pre-write all bands' uniform data (vc, bc=MAX_BANDS, bandIdx=b) into aligned slots
-  // bc is set to MAX_BANDS to avoid guard-clause skip; bandIdx selects which band to process
-  {const ud=new Uint32Array(BAND_U_SIZE/4);
-   for(let b=0;b<MAX_BANDS;b++){const off=b*BAND_U_ALIGN/4;ud[off]=proxyVertexCount;ud[off+1]=MAX_BANDS;ud[off+2]=b;}
-   queue.writeBuffer(bandReduceUB,0,ud);queue.writeBuffer(bandApplyUB,0,ud);}
-  {const pd=new Uint32Array(BAND_U_SIZE/4);
-   for(let b=0;b<MAX_BANDS;b++){const off=b*BAND_U_ALIGN/4;pd[off]=proxyTriCount;pd[off+1]=MAX_BANDS;pd[off+2]=b;}
-   queue.writeBuffer(bandPerimUB,0,pd);}
+  // Band uniforms: tiny 8-byte buffers (vc+bc or triCount+bc), bandIdx from workgroup_id
+  bandReduceAllUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandReduceAllU');
+  bandApplyAllUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandApplyAllU');
+  bandPerimAllUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandPerimAllU');
+  bandPerimReduceAllUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandPerimReduceAllU');
   const normUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'normU');
   queue.writeBuffer(normUB,0,new Uint32Array([highResCount]));
   const unpackUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'unpackU');
@@ -1270,12 +1259,24 @@ async function initGPU(){
   voxelApplyBG=device.createBindGroup({layout:voxelApplyPipe.bgl,entries:[
     {binding:0,resource:{buffer:highResRestB}},{binding:1,resource:{buffer:voxOutBuf}},{binding:2,resource:{buffer:highResOutB}},{binding:3,resource:{buffer:voxelApplyUB}}]});
 
-  // Band reduce BG (reads posA or posB, writes bandState) — per-band via buffer offset, no dynamic offset
-  // Replaced by lazy-created per-band BGs below (see ensureBandBGs)
-
-  // Band apply BG — see ensureBandBGs below
-  // Band exact perimeter BG — see ensureBandBGs below
-  // Band perimeter reduce BG — see ensureBandBGs below
+  // Band Phase A1: reduceAll (centroids) — ping-pong posA/posB
+  bandReduceAllBG_A=device.createBindGroup({layout:bandReduceAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:bandParamsB}},{binding:2,resource:{buffer:bandStateB}},{binding:3,resource:{buffer:bandReduceAllUB}}]});
+  bandReduceAllBG_B=device.createBindGroup({layout:bandReduceAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:bandParamsB}},{binding:2,resource:{buffer:bandStateB}},{binding:3,resource:{buffer:bandReduceAllUB}}]});
+  // Band Phase A2: perimAll (triangle intersection) — ping-pong posA/posB
+  bandPerimAllBG_A=device.createBindGroup({layout:bandPerimAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandBinRB}},{binding:5,resource:{buffer:bandBinCB}},{binding:6,resource:{buffer:bandPerimAllUB}}]});
+  bandPerimAllBG_B=device.createBindGroup({layout:bandPerimAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandBinRB}},{binding:5,resource:{buffer:bandBinCB}},{binding:6,resource:{buffer:bandPerimAllUB}}]});
+  // Band Phase A3: perimReduceAll — no position dependence
+  bandPerimReduceAllBG=device.createBindGroup({layout:bandPerimReduceAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:bandBinRB}},{binding:1,resource:{buffer:bandBinCB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandPerimReduceAllUB}}]});
+  // Band Phase B: applyAll — AB / BA ping-pong
+  bandApplyAllBG_AB=device.createBindGroup({layout:bandApplyAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:posB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandApplyAllUB}}]});
+  bandApplyAllBG_BA=device.createBindGroup({layout:bandApplyAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:posA}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandApplyAllUB}}]});
 
   // Band visualization BG (reads bins → writes compacted polyline points)
   bandVisBG=device.createBindGroup({layout:bandVisPipe.bgl,entries:[
@@ -1304,7 +1305,7 @@ async function initGPU(){
 
   console.log('⚡ GPU管线就绪. 代理:',proxyVertexCount.toLocaleString(),'顶点 高模:',highResCount.toLocaleString(),'顶点');
   // 🔍 Check shader compilation
-  for(const [name,shader] of [['bandReduce',bandReduceCS],['bandPerim',bandPerimCS],['bandPerimReduce',bandPerimReduceCS],['bandApply',bandApplyCS]]){
+  for(const [name,shader] of [['bandReduceAll',bandReduceAllCS],['bandPerimAll',bandPerimAllCS],['bandPerimReduceAll',bandPerimReduceAllCS],['bandApplyAll',bandApplyAllCS]]){
     const info=await shader.getCompilationInfo();
     for(const m of info.messages){console.log('⚠️ '+name+' shader:',m.type,m.lineNum+':'+m.linePos,m.message);}
   }
@@ -1325,34 +1326,7 @@ async function initGPU(){
   console.log('🔍 MINIMAL TEST: posA[0] after write = ('+tv[0].toFixed(1)+','+tv[1].toFixed(1)+','+tv[2].toFixed(1)+','+tv[3].toFixed(1)+') expect=(1.0,2.0,3.0,4.0)');
   testStg.unmap();testStg.destroy();
   queue.writeBuffer(posA,0,pos4);
-  // 🔍 Also read back bandReduceUB to verify pre-written data
-  const uStg=mkBuf(64,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'uStg');
-  const uCmd=device.createCommandEncoder();uCmd.copyBufferToBuffer(bandReduceUB,0,uStg,0,64);device.queue.submit([uCmd.finish()]);
-  await uStg.mapAsync(GPUMapMode.READ);
-  const uv=new Uint32Array(uStg.getMappedRange(0,64));
-  console.log('🔍 bandReduceUB first 16 u32: ['+Array.from(uv.slice(0,16)).join(',')+'] expect vc='+proxyVertexCount+' bc=256 bandIdx=0');
-  uStg.unmap();uStg.destroy();}
-}
-
-// ═══════ Per-band bind groups (lazy, offset-based, no dynamic offset) ═══════
-const _brA=[],_brB=[],_bpA=[],_bpB=[],_bpr=[],_baAB=[],_baBA=[];
-function ensureBandBGs(b){
-  if(_brA[b])return; // already created
-  const off=b*BAND_U_ALIGN;
-  _brA[b]=device.createBindGroup({layout:bandReducePipe.bgl,entries:[
-    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:bandParamsB}},{binding:2,resource:{buffer:bandStateB}},{binding:3,resource:{buffer:bandReduceUB,offset:off,size:12}}]});
-  _brB[b]=device.createBindGroup({layout:bandReducePipe.bgl,entries:[
-    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:bandParamsB}},{binding:2,resource:{buffer:bandStateB}},{binding:3,resource:{buffer:bandReduceUB,offset:off,size:12}}]});
-  _bpA[b]=device.createBindGroup({layout:bandPerimPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandBinRB}},{binding:5,resource:{buffer:bandBinCB}},{binding:6,resource:{buffer:bandPerimUB,offset:off,size:12}}]});
-  _bpB[b]=device.createBindGroup({layout:bandPerimPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandBinRB}},{binding:5,resource:{buffer:bandBinCB}},{binding:6,resource:{buffer:bandPerimUB,offset:off,size:12}}]});
-  _bpr[b]=device.createBindGroup({layout:bandPerimReducePipe.bgl,entries:[
-    {binding:0,resource:{buffer:bandBinRB}},{binding:1,resource:{buffer:bandBinCB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandPerimUB,offset:off,size:12}}]});
-  _baAB[b]=device.createBindGroup({layout:bandApplyPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:posB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandApplyUB,offset:off,size:12}}]});
-  _baBA[b]=device.createBindGroup({layout:bandApplyPipe.bgl,entries:[
-    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:posA}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandStateB}},{binding:4,resource:{buffer:bandApplyUB,offset:off,size:12}}]});
+  }
 }
 
 // ═══════ GPU PBD: write band params to GPU buffer ═══════
@@ -1428,9 +1402,8 @@ let _zeroMaxBins=null;              // MAX_BANDS*64 zeros, allocated once
 let _volU16=new ArrayBuffer(16);    // volume apply uniform
 let _voxU32=new ArrayBuffer(32);    // voxel scatter uniform
 let _zeroVox=null;                  // VOX_TOTAL zeros, allocated once
-let _zeroBin64=null;                // 64 zeros for single band bin clear
 let _zeroVolU=null,_zeroVolF=null;  // Pre-alloc for per-iteration vol writes
-const BAND_U_ALIGN=256;             // must match the alignment used in initGPU
+let _bandSmallU8=null;              // Pre-alloc for band uniform 8 bytes
 async function runGPUPBD(){
   const bc=bands.length;
   if(!bandParamsB||!bandStateB)return;
@@ -1443,7 +1416,6 @@ async function runGPUPBD(){
   if(!_zeroTriP||_zeroTriP.length<proxyTriCount){_zeroTriP=new Float32Array(proxyTriCount);}
   if(!_zeroRedLv){_zeroRedLv=volRedLevels.filter(lv=>lv.dstBuf!==volTotalB).map(lv=>new Float32Array(lv.wgCount));}
   if(!_zeroMaxBins||_zeroMaxBins.length<MAX_BANDS*64){_zeroMaxBins=new Uint32Array(MAX_BANDS*64);}
-  if(!_zeroBin64||_zeroBin64.length<64){_zeroBin64=new Uint32Array(64);}
   if(!_zeroVox||_zeroVox.length<VOX_TOTAL){_zeroVox=new Uint32Array(VOX_TOTAL);}
   if(!_zeroVolU||_zeroVolU.length<1){_zeroVolU=new Uint32Array(1);}
   if(!_zeroVolF||_zeroVolF.length<1){_zeroVolF=new Float32Array(1);}
@@ -1472,10 +1444,16 @@ async function runGPUPBD(){
   queue.writeBuffer(voxDxBuf,0,_zeroVox);
   queue.writeBuffer(voxDyBuf,0,_zeroVox);
   queue.writeBuffer(voxDzBuf,0,_zeroVox);
-  queue.writeBuffer(voxDxBuf,0,_zeroVox);
-  queue.writeBuffer(voxDyBuf,0,_zeroVox);
-  queue.writeBuffer(voxDzBuf,0,_zeroVox);
   queue.writeBuffer(voxWBuf,0,_zeroVox);
+
+  // Pre-write band uniform data (vc+bc, triCount+bc — constant across iterations)
+  if(!_bandSmallU8){_bandSmallU8=new Uint32Array(2);}
+  _bandSmallU8[0]=proxyVertexCount;_bandSmallU8[1]=bc;
+  queue.writeBuffer(bandReduceAllUB,0,_bandSmallU8);
+  queue.writeBuffer(bandApplyAllUB,0,_bandSmallU8);
+  _bandSmallU8[0]=proxyTriCount;_bandSmallU8[1]=bc;
+  queue.writeBuffer(bandPerimAllUB,0,_bandSmallU8);
+  queue.writeBuffer(bandPerimReduceAllUB,0,_bandSmallU8);
 
   // 🔍 Timing accumulators
   let tWrite=0,tShape=0,tBand=0,tVol=0,tSubmit=0;
@@ -1529,27 +1507,28 @@ async function runGPUPBD(){
     [srcPos,dstPos]=[dstPos,srcPos];
     tShape+=performance.now()-t0;
 
-    // ── Band pass (ONE pass, per-band dispatches — GPU-ordered sequential) ──
+    // ── Band pass: 4 dispatches (reduceAll → perimAll → perimReduceAll → applyAll) ──
     t0=performance.now();
     if(bc>0){
       const cp=cmd.beginComputePass();
-      for(let b=0;b<bc;b++){
-        ensureBandBGs(b);
-        const isAB=srcPos===posA;
-        cp.setPipeline(bandReducePipe.pipe);
-        cp.setBindGroup(0,isAB?_brA[b]:_brB[b]);
-        cp.dispatchWorkgroups(1,1,1);
-        cp.setPipeline(bandPerimPipe.pipe);
-        cp.setBindGroup(0,isAB?_bpA[b]:_bpB[b]);
-        cp.dispatchWorkgroups(Math.ceil(proxyTriCount/256),1,1);
-        cp.setPipeline(bandPerimReducePipe.pipe);
-        cp.setBindGroup(0,_bpr[b]);
-        cp.dispatchWorkgroups(1,1,1);
-        cp.setPipeline(bandApplyPipe.pipe);
-        cp.setBindGroup(0,isAB?_baAB[b]:_baBA[b]);
-        cp.dispatchWorkgroups(WG,1,1);
-        [srcPos,dstPos]=[dstPos,srcPos];
-      }
+      const isAB=srcPos===posA;
+      // Phase A1: centroid for ALL bands (bc WGs of 256 threads)
+      cp.setPipeline(bandReduceAllPipe.pipe);
+      cp.setBindGroup(0,isAB?bandReduceAllBG_A:bandReduceAllBG_B);
+      cp.dispatchWorkgroups(bc,1,1);
+      // Phase A2: triangle-plane intersection (each triangle loops over all bands internally)
+      cp.setPipeline(bandPerimAllPipe.pipe);
+      cp.setBindGroup(0,isAB?bandPerimAllBG_A:bandPerimAllBG_B);
+      cp.dispatchWorkgroups(Math.ceil(proxyTriCount/256),1,1);
+      // Phase A3: reduce bins → scale for ALL bands (bc WGs of 64 threads)
+      cp.setPipeline(bandPerimReduceAllPipe.pipe);
+      cp.setBindGroup(0,bandPerimReduceAllBG);
+      cp.dispatchWorkgroups(bc,1,1);
+      // Phase B: apply ALL bands per vertex with internal Gauss-Seidel loop
+      cp.setPipeline(bandApplyAllPipe.pipe);
+      cp.setBindGroup(0,isAB?bandApplyAllBG_AB:bandApplyAllBG_BA);
+      cp.dispatchWorkgroups(WG,1,1);
+      [srcPos,dstPos]=[dstPos,srcPos];
       cp.end();
     }
     tBand+=performance.now()-t0;
@@ -1649,8 +1628,8 @@ async function runGPUBandVis(finalSrc){
   if(bc===0)return;
 
   writeBandParams();
-  queue.writeBuffer(bandReduceUB,0,new Uint32Array([proxyVertexCount,bc]));
-  queue.writeBuffer(bandPerimUB,0,new Uint32Array([proxyTriCount,bc]));
+  queue.writeBuffer(bandReduceAllUB,0,new Uint32Array([proxyVertexCount,bc]));
+  queue.writeBuffer(bandPerimAllUB,0,new Uint32Array([proxyTriCount,bc]));
   queue.writeBuffer(bandVisUB,0,new Uint32Array([bc]));
   queue.writeBuffer(bandBinRB,0,new Uint32Array(MAX_BANDS*64));
   queue.writeBuffer(bandBinCB,0,new Uint32Array(MAX_BANDS*64));
@@ -1658,11 +1637,11 @@ async function runGPUBandVis(finalSrc){
   const isA=finalSrc===posA;
   const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();
   // 1. Centroids from final proxy positions (writes bandState)
-  cp.setPipeline(bandReducePipe.pipe);cp.setBindGroup(0,isA?bandReduceBG_A:bandReduceBG_B);cp.dispatchWorkgroups(bc,1,1);
+  cp.setPipeline(bandReduceAllPipe.pipe);cp.setBindGroup(0,isA?bandReduceAllBG_A:bandReduceAllBG_B);cp.dispatchWorkgroups(bc,1,1);
   // 2. Exact perimeter via triangle-plane intersection (writes bin buffers)
-  cp.setPipeline(bandPerimPipe.pipe);cp.setBindGroup(0,isA?bandPerimBG_A:bandPerimBG_B);cp.dispatchWorkgroups(Math.ceil(proxyTriCount/256),1,1);
+  cp.setPipeline(bandPerimAllPipe.pipe);cp.setBindGroup(0,isA?bandPerimAllBG_A:bandPerimAllBG_B);cp.dispatchWorkgroups(Math.ceil(proxyTriCount/256),1,1);
   // 2.5. Reduce perimeter bins → compute scale = L₀/P (writes bandState.scale)
-  cp.setPipeline(bandPerimReducePipe.pipe);cp.setBindGroup(0,bandPerimReduceBG);cp.dispatchWorkgroups(bc,1,1);
+  cp.setPipeline(bandPerimReduceAllPipe.pipe);cp.setBindGroup(0,bandPerimReduceAllBG);cp.dispatchWorkgroups(bc,1,1);
   // 3. Red polyline from bins (reads bins+state, writes visPts+visCnt)
   cp.setPipeline(bandVisPipe.pipe);cp.setBindGroup(0,bandVisBG);cp.dispatchWorkgroups(bc,1,1);
   // 4. Green target polyline = centroid + (red - centroid) * scale (reads visPts+visCnt+state, writes visTgt)
