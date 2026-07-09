@@ -1871,7 +1871,9 @@ async function animate(){
     // [PERF] 注释: 皮筋可视化回传 CPU 仅用于渲染 LINE
     // await runGPUBandVis(finalSrc);
     await runGPUPostPBD(finalSrc);
-    pbdAccumTime+=performance.now()-pbdT0;
+    const frameTime=performance.now()-pbdT0;
+    pbdAccumTime+=frameTime;
+    console.log('⏱️ frame#'+convergeFrames+' pbdTime='+frameTime.toFixed(1)+'ms accum='+pbdAccumTime.toFixed(1)+'ms');
     convergeFrames++;
     if(convergeFrames>=CONVERGE_FRAMES){pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ✓';}
     else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
