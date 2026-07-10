@@ -45,8 +45,8 @@ canvas { display:block; cursor:crosshair; }
  <h3>🔧 PBD 参数</h3>
  <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
  <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
- <label>皮筋刚度 <span class="val" id="sv_bs">0.50</span></label>
- <input type="range" id="sl_bs" min="0.01" max="1.0" step="0.01" value="0.50">
+ <label>皮筋刚度 <span class="val" id="sv_bs">0.500</span></label>
+ <input type="range" id="sl_bs" min="0.001" max="1.0" step="0.001" value="0.500">
  <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
  <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
  <label>影响范围 <span class="val" id="sv_bi">0.60</span></label>
@@ -64,7 +64,7 @@ canvas { display:block; cursor:crosshair; }
  <div class="row"><span>法向X</span><input type="range" id="sl_nx" min="-1" max="1" step="0.01" value="0"><span class="val" id="sv_nx">0</span></div>
  <div class="row"><span>法向Y</span><input type="range" id="sl_ny" min="-1" max="1" step="0.01" value="1"><span class="val" id="sv_ny">1</span></div>
  <div class="row"><span>法向Z</span><input type="range" id="sl_nz" min="-1" max="1" step="0.01" value="0"><span class="val" id="sv_nz">0</span></div>
- <div class="row"><span>刚度</span><input type="range" id="sl_bk" min="0.01" max="1" step="0.01" value="0.5"><span class="val" id="sv_bk">0.5</span></div>
+ <div class="row"><span>刚度</span><input type="range" id="sl_bk" min="0.001" max="1" step="0.001" value="0.500"><span class="val" id="sv_bk">0.500</span></div>
  <button class="btn" id="btn_normalize">归一化法向量</button>
  <button class="btn" id="btn_horiz">设为水平</button>
 </div>
@@ -139,7 +139,7 @@ function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
 
 // Slider wiring
 $('sl_ss').oninput=e=>{SHAPE_STIFF=+e.target.value;$('sv_ss').textContent=SHAPE_STIFF.toFixed(2);markPbdDirty();};
-$('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(2);for(const b of bands)b.stiffness=BAND_STIFF;markPbdDirty();};
+$('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(3);for(const b of bands)b.stiffness=BAND_STIFF;markPbdDirty();};
 $('sl_vs').oninput=e=>{VOL_STIFF=+e.target.value;$('sv_vs').textContent=VOL_STIFF.toFixed(2);markPbdDirty();};
 $('sl_bi').oninput=e=>{BAND_INFLU=+e.target.value;$('sv_bi').textContent=BAND_INFLU.toFixed(2);for(const b of bands)b.influRadius=BAND_INFLU;markPbdDirty();};
 $('sl_rc').oninput=e=>{
@@ -363,7 +363,7 @@ function updateLastBandPanel(idx){
   $('sl_nx').value=b.planeNormal[0];$('sv_nx').textContent=b.planeNormal[0].toFixed(2);
   $('sl_ny').value=b.planeNormal[1];$('sv_ny').textContent=b.planeNormal[1].toFixed(2);
   $('sl_nz').value=b.planeNormal[2];$('sv_nz').textContent=b.planeNormal[2].toFixed(2);
-  $('sl_bk').value=b.stiffness;$('sv_bk').textContent=b.stiffness.toFixed(2);
+  $('sl_bk').value=b.stiffness;$('sv_bk').textContent=b.stiffness.toFixed(3);
 }
 $('sl_lr').oninput=()=>{
   const v=+$('sl_lr').value;$('sv_lr').textContent=v.toFixed(3);
@@ -378,7 +378,7 @@ $('sl_nx').oninput=()=>{$('sv_nx').textContent=(+$('sl_nx').value).toFixed(2);ap
 $('sl_ny').oninput=()=>{$('sv_ny').textContent=(+$('sl_ny').value).toFixed(2);applyLastNormal();};
 $('sl_nz').oninput=()=>{$('sv_nz').textContent=(+$('sl_nz').value).toFixed(2);applyLastNormal();};
 $('sl_bk').oninput=()=>{
-  const v=+$('sl_bk').value;$('sv_bk').textContent=v.toFixed(2);
+  const v=+$('sl_bk').value;$('sv_bk').textContent=v.toFixed(3);
   if(bands.length>0){bands[bands.length-1].stiffness=v;markPbdDirty();}
 };
 function applyLastNormal(){
