@@ -73,8 +73,10 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="sl_rw" min="0.003" max="0.12" step="0.001" value="0.025">
  <label>厚度 <span class="val" id="sv_rt">0.006</span></label>
  <input type="range" id="sl_rt" min="0.001" max="0.03" step="0.001" value="0.006">
- <label>粗糙度 <span class="val" id="sv_rr">0.50</span></label>
- <input type="range" id="sl_rr" min="0.05" max="1.0" step="0.01" value="0.50">
+ <label>粗糙度 <span class="val" id="sv_rr">0.45</span></label>
+ <input type="range" id="sl_rr" min="0.05" max="1.0" step="0.01" value="0.45">
+ <label>各向异性 <span class="val" id="sv_an">0.30</span></label>
+ <input type="range" id="sl_an" min="0.0" max="0.8" step="0.01" value="0.30">
  <label>表面抬升 <span class="val" id="sv_rso">0.004</span></label>
  <input type="range" id="sl_rso" min="0.0" max="0.02" step="0.001" value="0.004">
  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px;">
@@ -193,6 +195,7 @@ function updateAllRibbonMaterials(){
   for(const vis of bandVisuals){
     if(vis.ribbon&&vis.ribbon.material){
       vis.ribbon.material.roughness=RIBBON_ROUGHNESS;
+      vis.ribbon.material.anisotropy=RIBBON_ANISOTROPY;
     }
   }
 }
@@ -203,6 +206,7 @@ function rebuildAllRibbonVisuals(){
 $('sl_rw').oninput=e=>{RIBBON_HALF_WIDTH=+e.target.value;$('sv_rw').textContent=RIBBON_HALF_WIDTH.toFixed(3);console.log('🔧 带宽→'+RIBBON_HALF_WIDTH.toFixed(3));rebuildAllRibbonVisuals();};
 $('sl_rt').oninput=e=>{RIBBON_THICKNESS=+e.target.value;$('sv_rt').textContent=RIBBON_THICKNESS.toFixed(3);rebuildAllRibbonVisuals();};
 $('sl_rr').oninput=e=>{RIBBON_ROUGHNESS=+e.target.value;$('sv_rr').textContent=RIBBON_ROUGHNESS.toFixed(2);updateAllRibbonMaterials();};
+$('sl_an').oninput=e=>{RIBBON_ANISOTROPY=+e.target.value;$('sv_an').textContent=RIBBON_ANISOTROPY.toFixed(2);updateAllRibbonMaterials();};
 $('sl_rso').oninput=e=>{RIBBON_SURFACE_OFFSET=+e.target.value;$('sv_rso').textContent=RIBBON_SURFACE_OFFSET.toFixed(3);rebuildAllRibbonVisuals();};
 
 // Target line toggle
@@ -230,7 +234,8 @@ const bandVisuals=[];  // {ribbon: THREE.Mesh, lineTarget: THREE.Line}
 let RIBBON_HALF_WIDTH = 0.025;     // ~2.5cm half-width → 5cm total band width (clearly visible)
 let RIBBON_THICKNESS  = 0.006;     // ~6mm thin thickness
 let RIBBON_SURFACE_OFFSET = 0.004; // ~4mm lift above surface to avoid z-fight
-let RIBBON_ROUGHNESS = 0.50;       // PBR roughness
+let RIBBON_ROUGHNESS = 0.45;       // PBR roughness
+let RIBBON_ANISOTROPY = 0.30;    // anisotropic stretch (0=round, 1=line)
 let RIBBON_WIDTH_SEGMENTS = 4;   // subdivisions across band width
 
 // ── Legacy line helpers (kept for target green line + hover preview) ──
@@ -295,6 +300,7 @@ function createBandRibbonMesh(){
   geo.setDrawRange(0,0);
   const mat=new THREE.MeshPhysicalMaterial({
     color:'#d4a017',roughness:RIBBON_ROUGHNESS,metalness:0.0,
+    anisotropy:RIBBON_ANISOTROPY,anisotropyRotation:Math.PI/2,
     side:THREE.DoubleSide,depthTest:true,depthWrite:true,
   });
   const mesh=new THREE.Mesh(geo,mat);
@@ -349,9 +355,9 @@ function updateBandRibbonMesh(mesh, band){
   const rOL=resample(oL.points3D,N),rOR=resample(oR.points3D,N);
   const rIL=resample(iL.points3D,N),rIR=resample(iR.points3D,N);
 
-  // 4. Build geometry with width subdivisions (W quads across band)
+  // 4. Build geometry with width subdivisions + SMOOTH tangents
   const W = RIBBON_WIDTH_SEGMENTS;
-  const vertsPerSeg = W*12 + 12; // outer(W*6) + inner(W*6) + 2 side walls(12)
+  const vertsPerSeg = W*12 + 12;
   const totalVerts = N*vertsPerSeg;
   const neededFloats = totalVerts*3;
   let posArr=mesh.geometry.attributes.position.array;
@@ -368,7 +374,26 @@ function updateBandRibbonMesh(mesh, band){
     mesh.geometry.setAttribute('tangent',new THREE.Float32BufferAttribute(tanArr,4));
   }
   let vi=0;
-  const _v=(x,y,z,nx,ny,nz,u,v,tx,ty,tz)=>{const i3=vi*3;posArr[i3]=x;posArr[i3+1]=y;posArr[i3+2]=z;normArr[i3]=nx;normArr[i3+1]=ny;normArr[i3+2]=nz;uvArr[vi*2]=u;uvArr[vi*2+1]=v;tanArr[vi*4]=tx;tanArr[vi*4+1]=ty;tanArr[vi*4+2]=tz;tanArr[vi*4+3]=1;vi++;};
+  // Smooth tangent helper: T = cross(up, radial), continuous across polygon edges
+  const smoothT=(x,y,z)=>{
+    const rx=x-cx,ry=y-cy,rz=z-cz;
+    const rl=Math.sqrt(rx*rx+ry*ry+rz*rz)||1;
+    const rnx=rx/rl,rny=ry/rl,rnz=rz/rl;
+    let tx,ty,tz;
+    if(Math.abs(rny)>0.999){tx=0;ty=-rnz;tz=rny;} // polar: cross((1,0,0), radial)
+    else{tx=rnz;ty=0;tz=-rnx;} // cross((0,1,0), radial)
+    const tl=Math.sqrt(tx*tx+ty*ty+tz*tz)||1;
+    return[tx/tl,ty/tl,tz/tl];
+  };
+  const _v=(x,y,z,nx,ny,nz,u,v)=>{
+    const i3=vi*3;
+    posArr[i3]=x;posArr[i3+1]=y;posArr[i3+2]=z;
+    normArr[i3]=nx;normArr[i3+1]=ny;normArr[i3+2]=nz;
+    uvArr[vi*2]=u;uvArr[vi*2+1]=v;
+    const[tTx,tTy,tTz]=smoothT(x,y,z);
+    tanArr[vi*4]=tTx;tanArr[vi*4+1]=tTy;tanArr[vi*4+2]=tTz;tanArr[vi*4+3]=1;
+    vi++;
+  };
   const rn=(x,y,z)=>{
     let nx=x-cx,ny=y-cy,nz=z-cz;
     const l=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
@@ -382,65 +407,55 @@ function updateBandRibbonMesh(mesh, band){
     const u=i/N, uj=j/N;
     for(let w=0;w<W;w++){
       const f0=w/W, f1=(w+1)/W;
-      // Outer face interpolated positions
       const[o0x,o0y,o0z]=lerp3(rOL,i3,rOR,i3,f0);
       const[o1x,o1y,o1z]=lerp3(rOL,i3,rOR,i3,f1);
       const[o0jx,o0jy,o0jz]=lerp3(rOL,j3,rOR,j3,f0);
       const[o1jx,o1jy,o1jz]=lerp3(rOL,j3,rOR,j3,f1);
-      // Inner face interpolated positions
       const[i0x,i0y,i0z]=lerp3(rIL,i3,rIR,i3,f0);
       const[i1x,i1y,i1z]=lerp3(rIL,i3,rIR,i3,f1);
       const[i0jx,i0jy,i0jz]=lerp3(rIL,j3,rIR,j3,f0);
       const[i1jx,i1jy,i1jz]=lerp3(rIL,j3,rIR,j3,f1);
-      // Radial normals
       const no0=rn(o0x,o0y,o0z),no1=rn(o1x,o1y,o1z);
       const no0j=rn(o0jx,o0jy,o0jz),no1j=rn(o1jx,o1jy,o1jz);
       const ni0=rn(i0x,i0y,i0z),ni1=rn(i1x,i1y,i1z);
       const ni0j=rn(i0jx,i0jy,i0jz),ni1j=rn(i1jx,i1jy,i1jz);
-      // Tangent along band
-      const t0x=o0jx-o0x,t0y=o0jy-o0y,t0z=o0jz-o0z;
-      const t1x=o1jx-o1x,t1y=o1jy-o1y,t1z=o1jz-o1z;
-      const tl0=Math.sqrt(t0x*t0x+t0y*t0y+t0z*t0z)||1;
-      const tl1=Math.sqrt(t1x*t1x+t1y*t1y+t1z*t1z)||1;
-      const t0N=[t0x/tl0,t0y/tl0,t0z/tl0];
-      const t1N=[t1x/tl1,t1y/tl1,t1z/tl1];
       const v0=f0, v1=f1;
       // Outer face (CCW from outside)
-      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0, t0N[0],t0N[1],t0N[2]);
-      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
-      _v(o1x,o1y,o1z, no1[0],no1[1],no1[2], u,v1, t1N[0],t1N[1],t1N[2]);
-      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0, t0N[0],t0N[1],t0N[2]);
-      _v(o0jx,o0jy,o0jz, no0j[0],no0j[1],no0j[2], uj,v0, t0N[0],t0N[1],t0N[2]);
-      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
+      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0);
+      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1);
+      _v(o1x,o1y,o1z, no1[0],no1[1],no1[2], u,v1);
+      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0);
+      _v(o0jx,o0jy,o0jz, no0j[0],no0j[1],no0j[2], uj,v0);
+      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1);
       // Inner face (reversed winding)
-      _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0, t0N[0],t0N[1],t0N[2]);
-      _v(i1x,i1y,i1z, ni1[0],ni1[1],ni1[2], u,v1, t1N[0],t1N[1],t1N[2]);
-      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
-      _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0, t0N[0],t0N[1],t0N[2]);
-      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
-      _v(i0jx,i0jy,i0jz, ni0j[0],ni0j[1],ni0j[2], uj,v0, t0N[0],t0N[1],t0N[2]);
+      _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0);
+      _v(i1x,i1y,i1z, ni1[0],ni1[1],ni1[2], u,v1);
+      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
+      _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0);
+      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
+      _v(i0jx,i0jy,i0jz, ni0j[0],ni0j[1],ni0j[2], uj,v0);
       // Side walls: only at leftmost (w==0) and rightmost (w==W-1)
       if(w===0){
         const elx=o0jx-o0x,ely=o0jy-o0y,elz=o0jz-o0z;
         const snlx=ely*no0[2]-elz*no0[1],snly=elz*no0[0]-elx*no0[2],snlz=elx*no0[1]-ely*no0[0];
         const sll=Math.sqrt(snlx*snlx+snly*snly+snlz*snlz)||1;
-        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5, t0N[0],t0N[1],t0N[2]);
-        _v(o0x,o0y,o0z, snlx/sll,snly/sll,snlz/sll, u,0.5, t0N[0],t0N[1],t0N[2]);
-        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5, t0N[0],t0N[1],t0N[2]);
-        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5, t0N[0],t0N[1],t0N[2]);
-        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5, t0N[0],t0N[1],t0N[2]);
-        _v(i0jx,i0jy,i0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5, t0N[0],t0N[1],t0N[2]);
+        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5);
+        _v(o0x,o0y,o0z, snlx/sll,snly/sll,snlz/sll, u,0.5);
+        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5);
+        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5);
+        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5);
+        _v(i0jx,i0jy,i0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5);
       }
       if(w===W-1){
         const erx=o1jx-o1x,ery=o1jy-o1y,erz=o1jz-o1z;
         const snrx=-(ery*no1[2]-erz*no1[1]),snry=-(erz*no1[0]-erx*no1[2]),snrz=-(erx*no1[1]-ery*no1[0]);
         const srl=Math.sqrt(snrx*snrx+snry*snry+snrz*snrz)||1;
-        _v(i1x,i1y,i1z, snrx/srl,snry/srl,snrz/srl, u,0.5, t1N[0],t1N[1],t1N[2]);
-        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5, t1N[0],t1N[1],t1N[2]);
-        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5, t1N[0],t1N[1],t1N[2]);
-        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5, t1N[0],t1N[1],t1N[2]);
-        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5, t1N[0],t1N[1],t1N[2]);
-        _v(o1jx,o1jy,o1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5, t1N[0],t1N[1],t1N[2]);
+        _v(i1x,i1y,i1z, snrx/srl,snry/srl,snrz/srl, u,0.5);
+        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5);
+        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5);
+        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5);
+        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5);
+        _v(o1jx,o1jy,o1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5);
       }
     }
   }
