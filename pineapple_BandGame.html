@@ -73,8 +73,8 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="sl_rw" min="0.003" max="0.12" step="0.001" value="0.025">
  <label>厚度 <span class="val" id="sv_rt">0.006</span></label>
  <input type="range" id="sl_rt" min="0.001" max="0.03" step="0.001" value="0.006">
- <label>粗糙度 <span class="val" id="sv_rr">0.38</span></label>
- <input type="range" id="sl_rr" min="0.05" max="1.0" step="0.01" value="0.38">
+ <label>粗糙度 <span class="val" id="sv_rr">0.50</span></label>
+ <input type="range" id="sl_rr" min="0.05" max="1.0" step="0.01" value="0.50">
  <label>表面抬升 <span class="val" id="sv_rso">0.004</span></label>
  <input type="range" id="sl_rso" min="0.0" max="0.02" step="0.001" value="0.004">
  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px;">
@@ -95,7 +95,7 @@ canvas { display:block; cursor:crosshair; }
 <canvas id="canvas"></canvas>
 
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.174.0/build/three.webgpu.js", "three/addons/loaders/GLTFLoader.js": "https://cdn.jsdelivr.net/npm/three@0.174.0/examples/jsm/loaders/GLTFLoader.js" } }
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.177.0/build/three.webgpu.js", "three/addons/loaders/GLTFLoader.js": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/loaders/GLTFLoader.js" } }
 </script>
 
 <script type="module">
@@ -136,6 +136,12 @@ scene.add(ambientLight);
 const dirLight = new THREE.DirectionalLight('#fff', 1.5);
 dirLight.position.set(0, 5, 0);
 scene.add(dirLight);
+
+// Environment map for PBR (required for anisotropy)
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+const envMap = pmremGenerator.fromScene(scene, 0.5).texture;
+scene.environment = envMap;
+pmremGenerator.dispose();
 
 // ═══════ State ═══════
 let proxyVertexCount=0, proxyTriCount=0, restVolume=0, restSurfaceArea=0;
@@ -224,7 +230,8 @@ const bandVisuals=[];  // {ribbon: THREE.Mesh, lineTarget: THREE.Line}
 let RIBBON_HALF_WIDTH = 0.025;     // ~2.5cm half-width → 5cm total band width (clearly visible)
 let RIBBON_THICKNESS  = 0.006;     // ~6mm thin thickness
 let RIBBON_SURFACE_OFFSET = 0.004; // ~4mm lift above surface to avoid z-fight
-let RIBBON_ROUGHNESS = 0.38;       // PBR roughness
+let RIBBON_ROUGHNESS = 0.50;       // PBR roughness
+let RIBBON_WIDTH_SEGMENTS = 4;   // subdivisions across band width
 
 // ── Legacy line helpers (kept for target green line + hover preview) ──
 function makeBandLine(color,opacity){
@@ -283,8 +290,10 @@ function createBandRibbonMesh(){
   const MAX_VERTS=2048*36;
   geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3));
   geo.setAttribute('normal',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3));
+  geo.setAttribute('uv',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*2),2));
+  geo.setAttribute('tangent',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*4),4));
   geo.setDrawRange(0,0);
-  const mat=new THREE.MeshStandardMaterial({
+  const mat=new THREE.MeshPhysicalMaterial({
     color:'#d4a017',roughness:RIBBON_ROUGHNESS,metalness:0.0,
     side:THREE.DoubleSide,depthTest:true,depthWrite:true,
   });
@@ -340,81 +349,106 @@ function updateBandRibbonMesh(mesh, band){
   const rOL=resample(oL.points3D,N),rOR=resample(oR.points3D,N);
   const rIL=resample(iL.points3D,N),rIR=resample(iR.points3D,N);
 
-  // 4. Build geometry: 4 quad strips (outer, inner, left side, right side)
-  const vertsPerSeg=24,totalVerts=N*vertsPerSeg;
-  const neededFloats=totalVerts*3;
+  // 4. Build geometry with width subdivisions (W quads across band)
+  const W = RIBBON_WIDTH_SEGMENTS;
+  const vertsPerSeg = W*12 + 12; // outer(W*6) + inner(W*6) + 2 side walls(12)
+  const totalVerts = N*vertsPerSeg;
+  const neededFloats = totalVerts*3;
   let posArr=mesh.geometry.attributes.position.array;
   let normArr=mesh.geometry.attributes.normal.array;
+  let uvArr=mesh.geometry.attributes.uv.array;
+  let tanArr=mesh.geometry.attributes.tangent.array;
   if(neededFloats>posArr.length){
     const ns=neededFloats*2;
     posArr=new Float32Array(ns);normArr=new Float32Array(ns);
+    uvArr=new Float32Array(ns/3*2);tanArr=new Float32Array(ns/3*4);
     mesh.geometry.setAttribute('position',new THREE.Float32BufferAttribute(posArr,3));
     mesh.geometry.setAttribute('normal',new THREE.Float32BufferAttribute(normArr,3));
+    mesh.geometry.setAttribute('uv',new THREE.Float32BufferAttribute(uvArr,2));
+    mesh.geometry.setAttribute('tangent',new THREE.Float32BufferAttribute(tanArr,4));
   }
   let vi=0;
-  const _v=(x,y,z,nx,ny,nz)=>{const i3=vi*3;posArr[i3]=x;posArr[i3+1]=y;posArr[i3+2]=z;normArr[i3]=nx;normArr[i3+1]=ny;normArr[i3+2]=nz;vi++;};
-  // Helper: radial normal for a point
+  const _v=(x,y,z,nx,ny,nz,u,v,tx,ty,tz)=>{const i3=vi*3;posArr[i3]=x;posArr[i3+1]=y;posArr[i3+2]=z;normArr[i3]=nx;normArr[i3+1]=ny;normArr[i3+2]=nz;uvArr[vi*2]=u;uvArr[vi*2+1]=v;tanArr[vi*4]=tx;tanArr[vi*4+1]=ty;tanArr[vi*4+2]=tz;tanArr[vi*4+3]=1;vi++;};
   const rn=(x,y,z)=>{
     let nx=x-cx,ny=y-cy,nz=z-cz;
     const l=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
     return[nx/l,ny/l,nz/l];
   };
+  const lerp3=(a,i3,b,j3,t)=>[a[i3]+t*(b[j3]-a[i3]),a[i3+1]+t*(b[j3+1]-a[i3+1]),a[i3+2]+t*(b[j3+2]-a[i3+2])];
 
   for(let i=0;i<N;i++){
     const j=(i+1)%N;
     const i3=i*3,j3=j*3;
-    // Compute raw radial normals (point outward from centroid)
-    const roOL=rn(rOL[i3],rOL[i3+1],rOL[i3+2]);
-    const roOR=rn(rOR[i3],rOR[i3+1],rOR[i3+2]);
-    const roOLj=rn(rOL[j3],rOL[j3+1],rOL[j3+2]);
-    const roORj=rn(rOR[j3],rOR[j3+1],rOR[j3+2]);
-    const roIL=rn(rIL[i3],rIL[i3+1],rIL[i3+2]);
-    const roIR=rn(rIR[i3],rIR[i3+1],rIR[i3+2]);
-    const roILj=rn(rIL[j3],rIL[j3+1],rIL[j3+2]);
-    const roIRj=rn(rIR[j3],rIR[j3+1],rIR[j3+2]);
-    // Outer face: raw radial normals (outward)
-    const noLi=roOL, noRi=roOR, noLj=roOLj, noRj=roORj;
-    // Inner face: same outward normals (visible from gap, faces away from pineapple)
-    const niLi=roIL, niRi=roIR, niLj=roILj, niRj=roIRj;
-
-    // Outer face (CCW from outside)
-    _v(rOL[i3],rOL[i3+1],rOL[i3+2],noLi[0],noLi[1],noLi[2]);
-    _v(rOR[j3],rOR[j3+1],rOR[j3+2],noRj[0],noRj[1],noRj[2]);
-    _v(rOR[i3],rOR[i3+1],rOR[i3+2],noRi[0],noRi[1],noRi[2]);
-    _v(rOL[i3],rOL[i3+1],rOL[i3+2],noLi[0],noLi[1],noLi[2]);
-    _v(rOL[j3],rOL[j3+1],rOL[j3+2],noLj[0],noLj[1],noLj[2]);
-    _v(rOR[j3],rOR[j3+1],rOR[j3+2],noRj[0],noRj[1],noRj[2]);
-    // Inner face (CCW from inside/gap)
-    _v(rIL[i3],rIL[i3+1],rIL[i3+2],niLi[0],niLi[1],niLi[2]);
-    _v(rIR[i3],rIR[i3+1],rIR[i3+2],niRi[0],niRi[1],niRi[2]);
-    _v(rIR[j3],rIR[j3+1],rIR[j3+2],niRj[0],niRj[1],niRj[2]);
-    _v(rIL[i3],rIL[i3+1],rIL[i3+2],niLi[0],niLi[1],niLi[2]);
-    _v(rIR[j3],rIR[j3+1],rIR[j3+2],niRj[0],niRj[1],niRj[2]);
-    _v(rIL[j3],rIL[j3+1],rIL[j3+2],niLj[0],niLj[1],niLj[2]);
-    // Left side wall
-    const elx=rOL[j3]-rOL[i3],ely=rOL[j3+1]-rOL[i3+1],elz=rOL[j3+2]-rOL[i3+2];
-    const snlx=ely*noLi[2]-elz*noLi[1],snly=elz*noLi[0]-elx*noLi[2],snlz=elx*noLi[1]-ely*noLi[0];
-    const sll=Math.sqrt(snlx*snlx+snly*snly+snlz*snlz)||1;
-    _v(rIL[i3],rIL[i3+1],rIL[i3+2],snlx/sll,snly/sll,snlz/sll);
-    _v(rOL[i3],rOL[i3+1],rOL[i3+2],snlx/sll,snly/sll,snlz/sll);
-    _v(rOL[j3],rOL[j3+1],rOL[j3+2],snlx/sll,snly/sll,snlz/sll);
-    _v(rIL[i3],rIL[i3+1],rIL[i3+2],snlx/sll,snly/sll,snlz/sll);
-    _v(rOL[j3],rOL[j3+1],rOL[j3+2],snlx/sll,snly/sll,snlz/sll);
-    _v(rIL[j3],rIL[j3+1],rIL[j3+2],snlx/sll,snly/sll,snlz/sll);
-    // Right side wall
-    const erx=rOR[j3]-rOR[i3],ery=rOR[j3+1]-rOR[i3+1],erz=rOR[j3+2]-rOR[i3+2];
-    const snrx=-(ery*noRi[2]-erz*noRi[1]),snry=-(erz*noRi[0]-erx*noRi[2]),snrz=-(erx*noRi[1]-ery*noRi[0]);
-    const srl=Math.sqrt(snrx*snrx+snry*snry+snrz*snrz)||1;
-    _v(rIR[i3],rIR[i3+1],rIR[i3+2],snrx/srl,snry/srl,snrz/srl);
-    _v(rIR[j3],rIR[j3+1],rIR[j3+2],snrx/srl,snry/srl,snrz/srl);
-    _v(rOR[i3],rOR[i3+1],rOR[i3+2],snrx/srl,snry/srl,snrz/srl);
-    _v(rOR[i3],rOR[i3+1],rOR[i3+2],snrx/srl,snry/srl,snrz/srl);
-    _v(rIR[j3],rIR[j3+1],rIR[j3+2],snrx/srl,snry/srl,snrz/srl);
-    _v(rOR[j3],rOR[j3+1],rOR[j3+2],snrx/srl,snry/srl,snrz/srl);
+    const u=i/N, uj=j/N;
+    for(let w=0;w<W;w++){
+      const f0=w/W, f1=(w+1)/W;
+      // Outer face interpolated positions
+      const[o0x,o0y,o0z]=lerp3(rOL,i3,rOR,i3,f0);
+      const[o1x,o1y,o1z]=lerp3(rOL,i3,rOR,i3,f1);
+      const[o0jx,o0jy,o0jz]=lerp3(rOL,j3,rOR,j3,f0);
+      const[o1jx,o1jy,o1jz]=lerp3(rOL,j3,rOR,j3,f1);
+      // Inner face interpolated positions
+      const[i0x,i0y,i0z]=lerp3(rIL,i3,rIR,i3,f0);
+      const[i1x,i1y,i1z]=lerp3(rIL,i3,rIR,i3,f1);
+      const[i0jx,i0jy,i0jz]=lerp3(rIL,j3,rIR,j3,f0);
+      const[i1jx,i1jy,i1jz]=lerp3(rIL,j3,rIR,j3,f1);
+      // Radial normals
+      const no0=rn(o0x,o0y,o0z),no1=rn(o1x,o1y,o1z);
+      const no0j=rn(o0jx,o0jy,o0jz),no1j=rn(o1jx,o1jy,o1jz);
+      const ni0=rn(i0x,i0y,i0z),ni1=rn(i1x,i1y,i1z);
+      const ni0j=rn(i0jx,i0jy,i0jz),ni1j=rn(i1jx,i1jy,i1jz);
+      // Tangent along band
+      const t0x=o0jx-o0x,t0y=o0jy-o0y,t0z=o0jz-o0z;
+      const t1x=o1jx-o1x,t1y=o1jy-o1y,t1z=o1jz-o1z;
+      const tl0=Math.sqrt(t0x*t0x+t0y*t0y+t0z*t0z)||1;
+      const tl1=Math.sqrt(t1x*t1x+t1y*t1y+t1z*t1z)||1;
+      const t0N=[t0x/tl0,t0y/tl0,t0z/tl0];
+      const t1N=[t1x/tl1,t1y/tl1,t1z/tl1];
+      const v0=f0, v1=f1;
+      // Outer face (CCW from outside)
+      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0, t0N[0],t0N[1],t0N[2]);
+      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
+      _v(o1x,o1y,o1z, no1[0],no1[1],no1[2], u,v1, t1N[0],t1N[1],t1N[2]);
+      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0, t0N[0],t0N[1],t0N[2]);
+      _v(o0jx,o0jy,o0jz, no0j[0],no0j[1],no0j[2], uj,v0, t0N[0],t0N[1],t0N[2]);
+      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
+      // Inner face (reversed winding)
+      _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0, t0N[0],t0N[1],t0N[2]);
+      _v(i1x,i1y,i1z, ni1[0],ni1[1],ni1[2], u,v1, t1N[0],t1N[1],t1N[2]);
+      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
+      _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0, t0N[0],t0N[1],t0N[2]);
+      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1, t1N[0],t1N[1],t1N[2]);
+      _v(i0jx,i0jy,i0jz, ni0j[0],ni0j[1],ni0j[2], uj,v0, t0N[0],t0N[1],t0N[2]);
+      // Side walls: only at leftmost (w==0) and rightmost (w==W-1)
+      if(w===0){
+        const elx=o0jx-o0x,ely=o0jy-o0y,elz=o0jz-o0z;
+        const snlx=ely*no0[2]-elz*no0[1],snly=elz*no0[0]-elx*no0[2],snlz=elx*no0[1]-ely*no0[0];
+        const sll=Math.sqrt(snlx*snlx+snly*snly+snlz*snlz)||1;
+        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5, t0N[0],t0N[1],t0N[2]);
+        _v(o0x,o0y,o0z, snlx/sll,snly/sll,snlz/sll, u,0.5, t0N[0],t0N[1],t0N[2]);
+        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5, t0N[0],t0N[1],t0N[2]);
+        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5, t0N[0],t0N[1],t0N[2]);
+        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5, t0N[0],t0N[1],t0N[2]);
+        _v(i0jx,i0jy,i0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5, t0N[0],t0N[1],t0N[2]);
+      }
+      if(w===W-1){
+        const erx=o1jx-o1x,ery=o1jy-o1y,erz=o1jz-o1z;
+        const snrx=-(ery*no1[2]-erz*no1[1]),snry=-(erz*no1[0]-erx*no1[2]),snrz=-(erx*no1[1]-ery*no1[0]);
+        const srl=Math.sqrt(snrx*snrx+snry*snry+snrz*snrz)||1;
+        _v(i1x,i1y,i1z, snrx/srl,snry/srl,snrz/srl, u,0.5, t1N[0],t1N[1],t1N[2]);
+        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5, t1N[0],t1N[1],t1N[2]);
+        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5, t1N[0],t1N[1],t1N[2]);
+        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5, t1N[0],t1N[1],t1N[2]);
+        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5, t1N[0],t1N[1],t1N[2]);
+        _v(o1jx,o1jy,o1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5, t1N[0],t1N[1],t1N[2]);
+      }
+    }
   }
 
   mesh.geometry.attributes.position.needsUpdate=true;
   mesh.geometry.attributes.normal.needsUpdate=true;
+  mesh.geometry.attributes.uv.needsUpdate=true;
+  mesh.geometry.attributes.tangent.needsUpdate=true;
   mesh.geometry.setDrawRange(0,vi);
   mesh.visible=true;
 }
