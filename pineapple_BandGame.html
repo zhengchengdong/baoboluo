@@ -200,7 +200,7 @@ function updateAllRibbonMaterials(){
   }
 }
 function rebuildAllRibbonVisuals(){
-  // Rebuild ribbon geometry with new width/thickness/offset
+  // Rebuild ribbon geometry with new width/thickness/offset (per-vertex stack auto-computed)
   for(let i=0;i<bands.length;i++)updateBandVisual(i);
 }
 $('sl_rw').oninput=e=>{RIBBON_HALF_WIDTH=+e.target.value;$('sv_rw').textContent=RIBBON_HALF_WIDTH.toFixed(3);console.log('🔧 带宽→'+RIBBON_HALF_WIDTH.toFixed(3));rebuildAllRibbonVisuals();};
@@ -290,7 +290,7 @@ function computeSmoothNormals(posArr,idxArr,vc){
   return norms;
 }
 
-function createBandRibbonMesh(){
+function createBandRibbonMesh(bandIndex){
   const geo=new THREE.BufferGeometry();
   const MAX_VERTS=2048*36;
   geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3));
@@ -302,20 +302,23 @@ function createBandRibbonMesh(){
     color:'#d4a017',roughness:RIBBON_ROUGHNESS,metalness:0.0,
     anisotropy:RIBBON_ANISOTROPY,anisotropyRotation:Math.PI/2,
     side:THREE.DoubleSide,depthTest:true,depthWrite:true,
+    polygonOffset:true, polygonOffsetFactor:bandIndex*0.5, polygonOffsetUnits:bandIndex*1.0,
   });
   const mesh=new THREE.Mesh(geo,mat);
-  mesh.renderOrder=0;mesh.frustumCulled=false;mesh.visible=false;
+  mesh.renderOrder=bandIndex;mesh.frustumCulled=false;mesh.visible=false;
   mesh.castShadow=true;mesh.receiveShadow=false;
   scene.add(mesh);return mesh;
 }
 
-function updateBandRibbonMesh(mesh, band){
+function updateBandRibbonMesh(mesh, band, bandIndex){
   const n=band.planeNormal, o=band.planeOrigin;
   const hw=RIBBON_HALF_WIDTH;
-  const offHi=RIBBON_SURFACE_OFFSET+RIBBON_THICKNESS;
-  const offLo=RIBBON_SURFACE_OFFSET;
 
-  // 1. Compute mesh centroid + outer/inner positions (same as cyan wireframe test)
+  // Per-vertex local stack offsets (Level 3b: each vertex independently)
+  const pvo = computePerVertexOffsets(bandIndex);
+  const vOffLo = pvo.offLo, vOffHi = pvo.offHi;
+
+  // 1. Compute mesh centroid + outer/inner positions (per-vertex offsets)
   let cx=0,cy=0,cz=0;
   for(let i=0;i<proxyVertexCount;i++){
     const i3=i*3;
@@ -332,8 +335,9 @@ function updateBandRibbonMesh(mesh, band){
     const nl=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
     nx/=nl;ny/=nl;nz/=nl;
     radialN[i3]=nx;radialN[i3+1]=ny;radialN[i3+2]=nz;
-    outerPos[i3]=px+nx*offHi;outerPos[i3+1]=py+ny*offHi;outerPos[i3+2]=pz+nz*offHi;
-    innerPos[i3]=px+nx*offLo;innerPos[i3+1]=py+ny*offLo;innerPos[i3+2]=pz+nz*offLo;
+    const oh=vOffHi[i], ol=vOffLo[i];
+    outerPos[i3]=px+nx*oh;outerPos[i3+1]=py+ny*oh;outerPos[i3+2]=pz+nz*oh;
+    innerPos[i3]=px+nx*ol;innerPos[i3+1]=py+ny*ol;innerPos[i3+2]=pz+nz*ol;
   }
 
   // 2. Cut outer & inner meshes with two parallel planes at ±hw
@@ -549,6 +553,94 @@ function getExactCrossSectionPolyline(posArr,idxArr,origin,normal){
 
 function smoothstep(e0,e1,x){const t=Math.max(0,Math.min(1,(x-e0)/(e1-e0)));return t*t*(3-2*t);}
 
+// ═══════ Band overlap & stacking helpers (Level 3b: per-vertex local compression) ═══════
+const BAND_COMPRESSION_PER_LAYER = 0.30; // 30% thickness reduction per pressing band above
+
+// Test if a 3D point lies within a band's belt (perpendicular distance < half-width * 2.5)
+function pointInBandBelt(band, px, py, pz) {
+  const d = Math.abs(
+    (px - band.planeOrigin[0]) * band.planeNormal[0] +
+    (py - band.planeOrigin[1]) * band.planeNormal[1] +
+    (pz - band.planeOrigin[2]) * band.planeNormal[2]
+  );
+  return d < RIBBON_HALF_WIDTH * 2.5;
+}
+
+// Per-vertex stack computation for a single band.
+// For each proxy vertex, determines which other bands cover it,
+// then computes cumulative stack below + this band's thickness after squash.
+// Returns {offLo: Float32Array(proxyVertexCount), offHi: Float32Array(proxyVertexCount)}
+function computePerVertexOffsets(bandIndex) {
+  const vc = proxyVertexCount;
+  const offLoArr = new Float32Array(vc);
+  const offHiArr = new Float32Array(vc);
+  const bc = bands.length;
+  if (bc <= 1) {
+    // Only one band — uniform offset
+    offLoArr.fill(RIBBON_SURFACE_OFFSET);
+    offHiArr.fill(RIBBON_SURFACE_OFFSET + RIBBON_THICKNESS);
+    return {offLo: offLoArr, offHi: offHiArr};
+  }
+
+  // Pre-compute per-vertex coverage: coveredByVert[b][v] = bool
+  // Use bit mask stored in Uint8Array for compactness
+  const coveredByVert = new Uint8Array(vc * bc); // 0 or 1
+  for (let b = 0; b < bc; b++) {
+    const band = bands[b];
+    const ox = band.planeOrigin[0], oy = band.planeOrigin[1], oz = band.planeOrigin[2];
+    const nx = band.planeNormal[0], ny = band.planeNormal[1], nz = band.planeNormal[2];
+    const tol = RIBBON_HALF_WIDTH * 2.5;
+    const off = b * vc;
+    for (let v = 0; v < vc; v++) {
+      const i3 = v * 3;
+      const d = Math.abs((proxyCurPositions[i3] - ox) * nx + (proxyCurPositions[i3+1] - oy) * ny + (proxyCurPositions[i3+2] - oz) * nz);
+      coveredByVert[off + v] = (d < tol) ? 1 : 0;
+    }
+  }
+
+  // For each vertex, compute per-band effective thickness (accounting for bands above)
+  // effThickness[b][v] = RIBBON_THICKNESS / (1 + count_of_bands_above_covering_v * COMPRESSION)
+  const effThick = new Float32Array(vc * bc);
+  for (let b = 0; b < bc; b++) {
+    const offB = b * vc;
+    for (let v = 0; v < vc; v++) {
+      if (coveredByVert[offB + v]) {
+        let aboveCount = 0;
+        for (let k = b + 1; k < bc; k++) {
+          if (coveredByVert[k * vc + v]) aboveCount++;
+        }
+        effThick[offB + v] = RIBBON_THICKNESS / (1.0 + aboveCount * BAND_COMPRESSION_PER_LAYER);
+      }
+    }
+  }
+
+  // Now compute offLo/offHi for the target band at each vertex
+  for (let v = 0; v < vc; v++) {
+    // Stack below: sum of effective thicknesses of bands j < bandIndex covering this vertex
+    let stackBelow = 0;
+    for (let j = 0; j < bandIndex; j++) {
+      if (coveredByVert[j * vc + v]) {
+        stackBelow += effThick[j * vc + v];
+      }
+    }
+
+    // This band's own effective thickness at this vertex
+    const myEff = effThick[bandIndex * vc + v] || RIBBON_THICKNESS;
+
+    // Count bands above covering this vertex (for HUD/debug)
+    let aboveCount = 0;
+    for (let k = bandIndex + 1; k < bc; k++) {
+      if (coveredByVert[k * vc + v]) aboveCount++;
+    }
+    const myThick = RIBBON_THICKNESS / (1.0 + aboveCount * BAND_COMPRESSION_PER_LAYER);
+
+    offLoArr[v] = RIBBON_SURFACE_OFFSET + stackBelow;
+    offHiArr[v] = offLoArr[v] + myThick;
+  }
+
+  return {offLo: offLoArr, offHi: offHiArr};
+}
+
 // ═══════ Band add/remove ═══════
 // Precompute 64 angle-bin rest radii + preScale for radius-based constraint
 function computeBandRestRadii(origin,normal,restPos,restIdx){
@@ -623,7 +715,7 @@ function addBand(origin,normal){
   };
   bands.push(band);
   writeBandRestRadii(bands.length-1,pre.radii);
-  const visRibbon=createBandRibbonMesh();
+  const visRibbon=createBandRibbonMesh(bands.length-1);
   const visTarget=makeBandLine('#33ff33',0.35);
   visTarget.visible = showTargetLine;
   bandVisuals.push({ribbon:visRibbon,lineTarget:visTarget});
@@ -1738,7 +1830,7 @@ function updateBandVisual(idx){
   if(!vis||!b)return;
   const exact=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,b.planeOrigin,b.planeNormal);
   if(exact.points3D.length<9){vis.ribbon.visible=false;vis.lineTarget.visible=false;return;}
-  updateBandRibbonMesh(vis.ribbon, b);
+  updateBandRibbonMesh(vis.ribbon, b, idx);
   // Target green line (thin reference, unchanged)
   if(exact.perimeter>b.restCircum){
     const s=b.restCircum/exact.perimeter;
