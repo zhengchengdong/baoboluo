@@ -67,6 +67,15 @@ canvas { display:block; cursor:crosshair; }
  <div class="row"><span>刚度</span><input type="range" id="sl_bk" min="0.001" max="1" step="0.001" value="0.500"><span class="val" id="sv_bk">0.500</span></div>
  <button class="btn" id="btn_normalize">归一化法向量</button>
  <button class="btn" id="btn_horiz">设为水平</button>
+
+ <h3>💡 光照</h3>
+ <label>环境光强度 <span class="val" id="sv_ai">0.50</span></label>
+ <input type="range" id="sl_ai" min="0" max="3.0" step="0.01" value="0.50">
+ <label>平行光强度 <span class="val" id="sv_di">1.50</span></label>
+ <input type="range" id="sl_di" min="0" max="5.0" step="0.01" value="1.50">
+ <div class="row"><span>平行光X</span><input type="range" id="sl_dx" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dx">0</span></div>
+ <div class="row"><span>平行光Y</span><input type="range" id="sl_dy" min="-10" max="10" step="0.1" value="5"><span class="val" id="sv_dy">5</span></div>
+ <div class="row"><span>平行光Z</span><input type="range" id="sl_dz" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dz">0</span></div>
 </div>
 
 <canvas id="canvas"></canvas>
@@ -108,8 +117,11 @@ scene.background = new THREE.Color('#111122');
 const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 50);
 camera.position.set(1.5, 1.8, 3.5);
 camera.lookAt(0, 0, 0);
-scene.add(new THREE.AmbientLight('#fff', 0.5));
-scene.add(new THREE.DirectionalLight('#fff', 1.5).translateY(5));
+const ambientLight = new THREE.AmbientLight('#fff', 0.5);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight('#fff', 1.5);
+dirLight.position.set(0, 5, 0);
+scene.add(dirLight);
 
 // ═══════ State ═══════
 let proxyVertexCount=0, proxyTriCount=0, restVolume=0, restSurfaceArea=0;
@@ -153,6 +165,13 @@ $('sl_rc').oninput=e=>{
 };
 $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
+
+// Lighting sliders
+$('sl_ai').oninput=e=>{const v=+e.target.value;ambientLight.intensity=v;$('sv_ai').textContent=v.toFixed(2);};
+$('sl_di').oninput=e=>{const v=+e.target.value;dirLight.intensity=v;$('sv_di').textContent=v.toFixed(2);};
+$('sl_dx').oninput=e=>{const v=+e.target.value;dirLight.position.x=v;$('sv_dx').textContent=v.toFixed(1);};
+$('sl_dy').oninput=e=>{const v=+e.target.value;dirLight.position.y=v;$('sv_dy').textContent=v.toFixed(1);};
+$('sl_dz').oninput=e=>{const v=+e.target.value;dirLight.position.z=v;$('sv_dz').textContent=v.toFixed(1);};
 
 // ═══════ Band System ═══════
 const MAX_BANDS=256;
@@ -405,38 +424,6 @@ $('btn_horiz').onclick=()=>{
 // ═══════ Model Loading (dual: proxy + high-res) ═══════
 let loaded=false;
 
-function computeNormalsFromAdjacency(posArr,idxArr){
-  const vc=posArr.length/3;
-  const norms=new Float32Array(vc*3);
-  const adjLists=Array.from({length:vc},()=>[]);
-  for(let t=0;t<idxArr.length;t+=3){
-    const a=idxArr[t],b=idxArr[t+1],c=idxArr[t+2];
-    adjLists[a].push(t/3);adjLists[b].push(t/3);adjLists[c].push(t/3);
-  }
-  for(let vi=0;vi<vc;vi++){
-    let nx=0,ny=0,nz=0;
-    for(const ti of adjLists[vi]){
-      const bi=idxArr[ti*3],ci=idxArr[ti*3+1],di=idxArr[ti*3+2];
-      const i3=vi*3;
-      // Use the triangle face normal
-      const ax=posArr[bi*3],ay=posArr[bi*3+1],az=posArr[bi*3+2];
-      const bx=posArr[ci*3],by=posArr[ci*3+1],bz=posArr[ci*3+2];
-      const cx=posArr[di*3],cy=posArr[di*3+1],cz=posArr[di*3+2];
-      const ux=bx-ax,uy=by-ay,uz=bz-az;
-      const vx=cx-ax,vy=cy-ay,vz=cz-az;
-      nx+=uy*vz-uz*vy;ny+=uz*vx-ux*vz;nz+=ux*vy-uy*vx;
-    }
-    const nl=Math.sqrt(nx*nx+ny*ny+nz*nz);
-    if(nl>1e-9){
-      // Ensure outward-facing (dot with position should be > 0 for convex shapes)
-      const px=posArr[vi*3],py=posArr[vi*3+1],pz=posArr[vi*3+2];
-      if(px*nx+py*ny+pz*nz<0){nx=-nx;ny=-ny;nz=-nz;}
-      norms[vi*3]=nx/nl;norms[vi*3+1]=ny/nl;norms[vi*3+2]=nz/nl;
-    }
-  }
-  return norms;
-}
-
 async function loadModel(name, doProcess, refTransform=null){
   const loader=new GLTFLoader();
   const gltf=await new Promise((res,rej)=>loader.load(name,res,undefined,rej));
@@ -455,7 +442,16 @@ async function loadModel(name, doProcess, refTransform=null){
   const pos=new Float32Array(vc*3);
   for(let i=0;i<vc;i++){pos[i*3]=(pa[i*3]-offX)*sc;pos[i*3+1]=(pa[i*3+1]-offY)*sc;pos[i*3+2]=(pa[i*3+2]-offZ)*sc;}
   const idxArr=srcGeo.index?new Uint32Array(srcGeo.index.array):(()=>{const a=new Uint32Array(vc);for(let i=0;i<vc;i++)a[i]=i;return a;})();
-  return{pos,idxArr,srcGeo,srcMesh,transform:{cen:{x:offX,y:offY,z:offZ},sc}};
+  // Extract original normals from GLB (uniform scaling preserves direction)
+  let origNormals=null;
+  if(srcGeo.attributes.normal){
+    const na=srcGeo.attributes.normal.array;
+    origNormals=new Float32Array(vc*3);
+    for(let i=0;i<vc;i++){
+      origNormals[i*3]=na[i*3];origNormals[i*3+1]=na[i*3+1];origNormals[i*3+2]=na[i*3+2];
+    }
+  }
+  return{pos,idxArr,srcGeo,srcMesh,transform:{cen:{x:offX,y:offY,z:offZ},sc},origNormals};
 }
 
 async function loadModels(){
@@ -518,7 +514,7 @@ async function loadModels(){
   highResCount=hrPos.length/3;
   highResRestPositions=new Float32Array(hrPos);
   highResIdxArr=hrIdx;
-  highResRestNormals=computeNormalsFromAdjacency(hrPos,hrIdx);
+  highResRestNormals=hr.origNormals;
   H.hcount.textContent=highResCount.toLocaleString();
 
   // Compute Y range for delta field (from proxy model)
