@@ -420,44 +420,53 @@ function updateBandRibbonMesh(mesh, band){
       const ni0=rn(i0x,i0y,i0z),ni1=rn(i1x,i1y,i1z);
       const ni0j=rn(i0jx,i0jy,i0jz),ni1j=rn(i1jx,i1jy,i1jz);
       const v0=f0, v1=f1;
-      // Outer face (CCW from outside)
-      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0);
-      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1);
-      _v(o1x,o1y,o1z, no1[0],no1[1],no1[2], u,v1);
-      _v(o0x,o0y,o0z, no0[0],no0[1],no0[2], u,v0);
-      _v(o0jx,o0jy,o0jz, no0j[0],no0j[1],no0j[2], uj,v0);
-      _v(o1jx,o1jy,o1jz, no1j[0],no1j[1],no1j[2], uj,v1);
-      // Inner face (reversed winding)
+      // Outer face — winding flips, so write inward, becomes outward
+      _v(o0x,o0y,o0z, -no0[0],-no0[1],-no0[2], u,v0);
+      _v(o1x,o1y,o1z, -no1[0],-no1[1],-no1[2], u,v1);
+      _v(o1jx,o1jy,o1jz, -no1j[0],-no1j[1],-no1j[2], uj,v1);
+      _v(o0x,o0y,o0z, -no0[0],-no0[1],-no0[2], u,v0);
+      _v(o1jx,o1jy,o1jz, -no1j[0],-no1j[1],-no1j[2], uj,v1);
+      _v(o0jx,o0jy,o0jz, -no0j[0],-no0j[1],-no0j[2], uj,v0);
+      // Inner face — winding flips, so write outward, becomes inward
       _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0);
+      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
       _v(i1x,i1y,i1z, ni1[0],ni1[1],ni1[2], u,v1);
-      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
       _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0);
-      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
       _v(i0jx,i0jy,i0jz, ni0j[0],ni0j[1],ni0j[2], uj,v0);
-      // Side walls: only at leftmost (w==0) and rightmost (w==W-1)
+      _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
+      // Side walls: normal = ± band plane normal
       if(w===0){
-        const elx=o0jx-o0x,ely=o0jy-o0y,elz=o0jz-o0z;
-        const snlx=ely*no0[2]-elz*no0[1],snly=elz*no0[0]-elx*no0[2],snlz=elx*no0[1]-ely*no0[0];
-        const sll=Math.sqrt(snlx*snlx+snly*snly+snlz*snlz)||1;
-        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5);
-        _v(o0x,o0y,o0z, snlx/sll,snly/sll,snlz/sll, u,0.5);
-        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5);
-        _v(i0x,i0y,i0z, snlx/sll,snly/sll,snlz/sll, u,0.5);
-        _v(o0jx,o0jy,o0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5);
-        _v(i0jx,i0jy,i0jz, snlx/sll,snly/sll,snlz/sll, uj,0.5);
+        // Left wall — winding flips, write +n to become -n
+        _v(i0x,i0y,i0z, n[0],n[1],n[2], u,0.5);
+        _v(o0x,o0y,o0z, n[0],n[1],n[2], u,0.5);
+        _v(o0jx,o0jy,o0jz, n[0],n[1],n[2], uj,0.5);
+        _v(i0x,i0y,i0z, n[0],n[1],n[2], u,0.5);
+        _v(o0jx,o0jy,o0jz, n[0],n[1],n[2], uj,0.5);
+        _v(i0jx,i0jy,i0jz, n[0],n[1],n[2], uj,0.5);
       }
       if(w===W-1){
-        const erx=o1jx-o1x,ery=o1jy-o1y,erz=o1jz-o1z;
-        const snrx=-(ery*no1[2]-erz*no1[1]),snry=-(erz*no1[0]-erx*no1[2]),snrz=-(erx*no1[1]-ery*no1[0]);
-        const srl=Math.sqrt(snrx*snrx+snry*snry+snrz*snrz)||1;
-        _v(i1x,i1y,i1z, snrx/srl,snry/srl,snrz/srl, u,0.5);
-        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5);
-        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5);
-        _v(o1x,o1y,o1z, snrx/srl,snry/srl,snrz/srl, u,0.5);
-        _v(i1jx,i1jy,i1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5);
-        _v(o1jx,o1jy,o1jz, snrx/srl,snry/srl,snrz/srl, uj,0.5);
+        // Right wall — winding flips, write -n to become +n
+        _v(i1x,i1y,i1z, -n[0],-n[1],-n[2], u,0.5);
+        _v(i1jx,i1jy,i1jz, -n[0],-n[1],-n[2], uj,0.5);
+        _v(o1x,o1y,o1z, -n[0],-n[1],-n[2], u,0.5);
+        _v(o1x,o1y,o1z, -n[0],-n[1],-n[2], u,0.5);
+        _v(i1jx,i1jy,i1jz, -n[0],-n[1],-n[2], uj,0.5);
+        _v(o1jx,o1jy,o1jz, -n[0],-n[1],-n[2], uj,0.5);
       }
     }
+  }
+
+  // ── DEBUG: log first normal of each face type ──
+  if(vi>=6){
+    const fmt=(arr,i)=>`(${arr[i].toFixed(3)},${arr[i+1].toFixed(3)},${arr[i+2].toFixed(3)})`;
+    console.log('🔍 法线诊断:');
+    console.log('  外层[0]:',fmt(normArr,0),'期望朝外(背离centroid)');
+    console.log('  内层[12]:',fmt(normArr,12*3),'期望朝内(指向centroid)');
+    console.log('  左壁[24]:',fmt(normArr,24*3),'期望朝左');
+    console.log('  右壁[36]:',fmt(normArr,36*3),'期望朝右');
+    console.log('  centroid:',cx.toFixed(3),cy.toFixed(3),cz.toFixed(3));
+    const op=posArr,p0=[op[0],op[1],op[2]];
+    console.log('  外层[0]位置:',fmt(op,0),'径向:',fmt([p0[0]-cx,p0[1]-cy,p0[2]-cz],0));
   }
 
   mesh.geometry.attributes.position.needsUpdate=true;
