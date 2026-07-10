@@ -68,6 +68,20 @@ canvas { display:block; cursor:crosshair; }
  <button class="btn" id="btn_normalize">归一化法向量</button>
  <button class="btn" id="btn_horiz">设为水平</button>
 
+ <h3>🎀 皮筋渲染</h3>
+ <label>带宽 <span class="val" id="sv_rw">0.025</span></label>
+ <input type="range" id="sl_rw" min="0.003" max="0.12" step="0.001" value="0.025">
+ <label>厚度 <span class="val" id="sv_rt">0.006</span></label>
+ <input type="range" id="sl_rt" min="0.001" max="0.03" step="0.001" value="0.006">
+ <label>粗糙度 <span class="val" id="sv_rr">0.38</span></label>
+ <input type="range" id="sl_rr" min="0.05" max="1.0" step="0.01" value="0.38">
+ <label>表面抬升 <span class="val" id="sv_rso">0.004</span></label>
+ <input type="range" id="sl_rso" min="0.0" max="0.02" step="0.001" value="0.004">
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px;">
+  <input type="checkbox" id="cb_target" checked style="accent-color:#ff44cc;width:16px;height:16px;">
+  🟢 显示目标周长参考线
+ </label>
+
  <h3>💡 光照</h3>
  <label>环境光强度 <span class="val" id="sv_ai">0.50</span></label>
  <input type="range" id="sl_ai" min="0" max="3.0" step="0.01" value="0.50">
@@ -134,6 +148,8 @@ let highResRestPositions=null;   // CPU: high-res rest positions
 let highResIdxArr=null;          // CPU: high-res index array
 let highResRestNormals=null;     // CPU: high-res rest normals
 let nearestProxyIdx=null;        // CPU: nearest proxy vertex for each high-res vertex
+// Spatial hash for fast surface projection
+let _hashGrid=24, _hashBmin=null, _hashGs=null, _hashCells=null, _vertTris=null;
 let pineappleMesh=null;
 let proxyWireMesh=null;
 let showProxyWire=false;
@@ -166,6 +182,32 @@ $('sl_rc').oninput=e=>{
 $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
 
+// Ribbon visual sliders
+function updateAllRibbonMaterials(){
+  for(const vis of bandVisuals){
+    if(vis.ribbon&&vis.ribbon.material){
+      vis.ribbon.material.roughness=RIBBON_ROUGHNESS;
+    }
+  }
+}
+function rebuildAllRibbonVisuals(){
+  // Rebuild ribbon geometry with new width/thickness/offset
+  for(let i=0;i<bands.length;i++)updateBandVisual(i);
+}
+$('sl_rw').oninput=e=>{RIBBON_HALF_WIDTH=+e.target.value;$('sv_rw').textContent=RIBBON_HALF_WIDTH.toFixed(3);console.log('🔧 带宽→'+RIBBON_HALF_WIDTH.toFixed(3));rebuildAllRibbonVisuals();};
+$('sl_rt').oninput=e=>{RIBBON_THICKNESS=+e.target.value;$('sv_rt').textContent=RIBBON_THICKNESS.toFixed(3);rebuildAllRibbonVisuals();};
+$('sl_rr').oninput=e=>{RIBBON_ROUGHNESS=+e.target.value;$('sv_rr').textContent=RIBBON_ROUGHNESS.toFixed(2);updateAllRibbonMaterials();};
+$('sl_rso').oninput=e=>{RIBBON_SURFACE_OFFSET=+e.target.value;$('sv_rso').textContent=RIBBON_SURFACE_OFFSET.toFixed(3);rebuildAllRibbonVisuals();};
+
+// Target line toggle
+let showTargetLine = true;
+$('cb_target').onchange = e => {
+  showTargetLine = e.target.checked;
+  for (const vis of bandVisuals) {
+    if (vis.lineTarget) vis.lineTarget.visible = showTargetLine;
+  }
+};
+
 // Lighting sliders
 $('sl_ai').oninput=e=>{const v=+e.target.value;ambientLight.intensity=v;$('sv_ai').textContent=v.toFixed(2);};
 $('sl_di').oninput=e=>{const v=+e.target.value;dirLight.intensity=v;$('sv_di').textContent=v.toFixed(2);};
@@ -176,16 +218,22 @@ $('sl_dz').oninput=e=>{const v=+e.target.value;dirLight.position.z=v;$('sv_dz').
 // ═══════ Band System ═══════
 const MAX_BANDS=256;
 const bands=[];
-const bandVisuals=[];  // {lineActual: THREE.LineLoop, lineTarget: THREE.LineLoop}
+const bandVisuals=[];  // {ribbon: THREE.Mesh, lineTarget: THREE.Line}
 
+// Ribbon parameters (world units; pineapple height ~3)
+let RIBBON_HALF_WIDTH = 0.025;     // ~2.5cm half-width → 5cm total band width (clearly visible)
+let RIBBON_THICKNESS  = 0.006;     // ~6mm thin thickness
+let RIBBON_SURFACE_OFFSET = 0.004; // ~4mm lift above surface to avoid z-fight
+let RIBBON_ROUGHNESS = 0.38;       // PBR roughness
+
+// ── Legacy line helpers (kept for target green line + hover preview) ──
 function makeBandLine(color,opacity){
   const geo=new THREE.BufferGeometry();
-  // Pre-allocate 2048 vertices (enough for dense cross-section polyline)
   geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(2048*3),3));
   geo.setDrawRange(0,0);
   const mat=new THREE.LineBasicMaterial({color,transparent:true,opacity,depthTest:false,depthWrite:false});
   const line=new THREE.Line(geo,mat);
-  line.renderOrder=1;line.frustumCulled=false;
+  line.renderOrder=2;line.frustumCulled=false;
   line.visible=false;
   scene.add(line);return line;
 }
@@ -201,6 +249,174 @@ function updateBandLine(line,points3D){
   posAttr.array[nPts*3+2]=points3D[2];
   posAttr.needsUpdate=true;
   line.geometry.setDrawRange(0,nPts+1);
+}
+
+// ── Ribbon mesh (PBR: copy proxy triangles in band → offset for thickness) ──
+
+// Compute smooth vertex normals from current positions (on the fly)
+function computeSmoothNormals(posArr,idxArr,vc){
+  const norms=new Float32Array(vc*3);
+  for(let t=0;t<idxArr.length;t+=3){
+    const a=idxArr[t],b=idxArr[t+1],c=idxArr[t+2];
+    const a3=a*3,b3=b*3,c3=c*3;
+    const e1x=posArr[b3]-posArr[a3],e1y=posArr[b3+1]-posArr[a3+1],e1z=posArr[b3+2]-posArr[a3+2];
+    const e2x=posArr[c3]-posArr[a3],e2y=posArr[c3+1]-posArr[a3+1],e2z=posArr[c3+2]-posArr[a3+2];
+    const nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
+    norms[a3]+=nx;norms[a3+1]+=ny;norms[a3+2]+=nz;
+    norms[b3]+=nx;norms[b3+1]+=ny;norms[b3+2]+=nz;
+    norms[c3]+=nx;norms[c3+1]+=ny;norms[c3+2]+=nz;
+  }
+  for(let i=0;i<vc;i++){
+    const i3=i*3;
+    const l=Math.sqrt(norms[i3]*norms[i3]+norms[i3+1]*norms[i3+1]+norms[i3+2]*norms[i3+2])||1;
+    norms[i3]/=l;norms[i3+1]/=l;norms[i3+2]/=l;
+    // Ensure outward (for convex-ish mesh centered near origin, dot(normal,pos) should be >0)
+    if(posArr[i3]*norms[i3]+posArr[i3+1]*norms[i3+1]+posArr[i3+2]*norms[i3+2]<0){
+      norms[i3]=-norms[i3];norms[i3+1]=-norms[i3+1];norms[i3+2]=-norms[i3+2];
+    }
+  }
+  return norms;
+}
+
+function createBandRibbonMesh(){
+  const geo=new THREE.BufferGeometry();
+  const MAX_VERTS=2048*36;
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3));
+  geo.setAttribute('normal',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3));
+  geo.setDrawRange(0,0);
+  const mat=new THREE.MeshStandardMaterial({
+    color:'#d4a017',roughness:RIBBON_ROUGHNESS,metalness:0.0,
+    side:THREE.DoubleSide,depthTest:true,depthWrite:true,
+  });
+  const mesh=new THREE.Mesh(geo,mat);
+  mesh.renderOrder=0;mesh.frustumCulled=false;mesh.visible=false;
+  mesh.castShadow=true;mesh.receiveShadow=false;
+  scene.add(mesh);return mesh;
+}
+
+function updateBandRibbonMesh(mesh, band){
+  const n=band.planeNormal, o=band.planeOrigin;
+  const hw=RIBBON_HALF_WIDTH;
+  const offHi=RIBBON_SURFACE_OFFSET+RIBBON_THICKNESS;
+  const offLo=RIBBON_SURFACE_OFFSET;
+
+  // 1. Compute mesh centroid + outer/inner positions (same as cyan wireframe test)
+  let cx=0,cy=0,cz=0;
+  for(let i=0;i<proxyVertexCount;i++){
+    const i3=i*3;
+    cx+=proxyCurPositions[i3];cy+=proxyCurPositions[i3+1];cz+=proxyCurPositions[i3+2];
+  }
+  cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+  const outerPos=new Float32Array(proxyVertexCount*3);
+  const innerPos=new Float32Array(proxyVertexCount*3);
+  const radialN=new Float32Array(proxyVertexCount*3);
+  for(let i=0;i<proxyVertexCount;i++){
+    const i3=i*3;
+    const px=proxyCurPositions[i3],py=proxyCurPositions[i3+1],pz=proxyCurPositions[i3+2];
+    let nx=px-cx,ny=py-cy,nz=pz-cz;
+    const nl=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+    nx/=nl;ny/=nl;nz/=nl;
+    radialN[i3]=nx;radialN[i3+1]=ny;radialN[i3+2]=nz;
+    outerPos[i3]=px+nx*offHi;outerPos[i3+1]=py+ny*offHi;outerPos[i3+2]=pz+nz*offHi;
+    innerPos[i3]=px+nx*offLo;innerPos[i3+1]=py+ny*offLo;innerPos[i3+2]=pz+nz*offLo;
+  }
+
+  // 2. Cut outer & inner meshes with two parallel planes at ±hw
+  const oL=getExactCrossSectionPolyline(outerPos,proxyIdxArr,[o[0]-n[0]*hw,o[1]-n[1]*hw,o[2]-n[2]*hw],n);
+  const oR=getExactCrossSectionPolyline(outerPos,proxyIdxArr,[o[0]+n[0]*hw,o[1]+n[1]*hw,o[2]+n[2]*hw],n);
+  const iL=getExactCrossSectionPolyline(innerPos,proxyIdxArr,[o[0]-n[0]*hw,o[1]-n[1]*hw,o[2]-n[2]*hw],n);
+  const iR=getExactCrossSectionPolyline(innerPos,proxyIdxArr,[o[0]+n[0]*hw,o[1]+n[1]*hw,o[2]+n[2]*hw],n);
+  if(oL.points3D.length<9||oR.points3D.length<9){mesh.visible=false;return;}
+
+  // 3. Resample all 4 polylines to same count
+  const resample=(pts,targetN)=>{
+    const np=pts.length/3;const chords=[0];
+    for(let i=0;i<np;i++){const j=(i+1)%np;const dx=pts[j*3]-pts[i*3],dy=pts[j*3+1]-pts[i*3+1],dz=pts[j*3+2]-pts[i*3+2];chords.push(chords[i]+Math.sqrt(dx*dx+dy*dy+dz*dz));}
+    const total=chords[np];const out=new Float32Array(targetN*3);
+    for(let k=0;k<targetN;k++){const td=(k/targetN)*total;let s=0;while(s<np-1&&chords[s+1]<td)s++;const sl=chords[s+1]-chords[s];const t=sl>1e-9?(td-chords[s])/sl:0;const sn=(s+1)%np;out[k*3]=pts[s*3]+t*(pts[sn*3]-pts[s*3]);out[k*3+1]=pts[s*3+1]+t*(pts[sn*3+1]-pts[s*3+1]);out[k*3+2]=pts[s*3+2]+t*(pts[sn*3+2]-pts[s*3+2]);}
+    return out;
+  };
+  const N=Math.max(64,Math.min(512,Math.floor((oL.points3D.length+oR.points3D.length)/6)));
+  const rOL=resample(oL.points3D,N),rOR=resample(oR.points3D,N);
+  const rIL=resample(iL.points3D,N),rIR=resample(iR.points3D,N);
+
+  // 4. Build geometry: 4 quad strips (outer, inner, left side, right side)
+  const vertsPerSeg=24,totalVerts=N*vertsPerSeg;
+  const neededFloats=totalVerts*3;
+  let posArr=mesh.geometry.attributes.position.array;
+  let normArr=mesh.geometry.attributes.normal.array;
+  if(neededFloats>posArr.length){
+    const ns=neededFloats*2;
+    posArr=new Float32Array(ns);normArr=new Float32Array(ns);
+    mesh.geometry.setAttribute('position',new THREE.Float32BufferAttribute(posArr,3));
+    mesh.geometry.setAttribute('normal',new THREE.Float32BufferAttribute(normArr,3));
+  }
+  let vi=0;
+  const _v=(x,y,z,nx,ny,nz)=>{const i3=vi*3;posArr[i3]=x;posArr[i3+1]=y;posArr[i3+2]=z;normArr[i3]=nx;normArr[i3+1]=ny;normArr[i3+2]=nz;vi++;};
+  // Helper: radial normal for a point
+  const rn=(x,y,z)=>{
+    let nx=x-cx,ny=y-cy,nz=z-cz;
+    const l=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+    return[nx/l,ny/l,nz/l];
+  };
+
+  for(let i=0;i<N;i++){
+    const j=(i+1)%N;
+    const i3=i*3,j3=j*3;
+    // Compute raw radial normals (point outward from centroid)
+    const roOL=rn(rOL[i3],rOL[i3+1],rOL[i3+2]);
+    const roOR=rn(rOR[i3],rOR[i3+1],rOR[i3+2]);
+    const roOLj=rn(rOL[j3],rOL[j3+1],rOL[j3+2]);
+    const roORj=rn(rOR[j3],rOR[j3+1],rOR[j3+2]);
+    const roIL=rn(rIL[i3],rIL[i3+1],rIL[i3+2]);
+    const roIR=rn(rIR[i3],rIR[i3+1],rIR[i3+2]);
+    const roILj=rn(rIL[j3],rIL[j3+1],rIL[j3+2]);
+    const roIRj=rn(rIR[j3],rIR[j3+1],rIR[j3+2]);
+    // Outer face: raw radial normals (outward)
+    const noLi=roOL, noRi=roOR, noLj=roOLj, noRj=roORj;
+    // Inner face: same outward normals (visible from gap, faces away from pineapple)
+    const niLi=roIL, niRi=roIR, niLj=roILj, niRj=roIRj;
+
+    // Outer face (CCW from outside)
+    _v(rOL[i3],rOL[i3+1],rOL[i3+2],noLi[0],noLi[1],noLi[2]);
+    _v(rOR[j3],rOR[j3+1],rOR[j3+2],noRj[0],noRj[1],noRj[2]);
+    _v(rOR[i3],rOR[i3+1],rOR[i3+2],noRi[0],noRi[1],noRi[2]);
+    _v(rOL[i3],rOL[i3+1],rOL[i3+2],noLi[0],noLi[1],noLi[2]);
+    _v(rOL[j3],rOL[j3+1],rOL[j3+2],noLj[0],noLj[1],noLj[2]);
+    _v(rOR[j3],rOR[j3+1],rOR[j3+2],noRj[0],noRj[1],noRj[2]);
+    // Inner face (CCW from inside/gap)
+    _v(rIL[i3],rIL[i3+1],rIL[i3+2],niLi[0],niLi[1],niLi[2]);
+    _v(rIR[i3],rIR[i3+1],rIR[i3+2],niRi[0],niRi[1],niRi[2]);
+    _v(rIR[j3],rIR[j3+1],rIR[j3+2],niRj[0],niRj[1],niRj[2]);
+    _v(rIL[i3],rIL[i3+1],rIL[i3+2],niLi[0],niLi[1],niLi[2]);
+    _v(rIR[j3],rIR[j3+1],rIR[j3+2],niRj[0],niRj[1],niRj[2]);
+    _v(rIL[j3],rIL[j3+1],rIL[j3+2],niLj[0],niLj[1],niLj[2]);
+    // Left side wall
+    const elx=rOL[j3]-rOL[i3],ely=rOL[j3+1]-rOL[i3+1],elz=rOL[j3+2]-rOL[i3+2];
+    const snlx=ely*noLi[2]-elz*noLi[1],snly=elz*noLi[0]-elx*noLi[2],snlz=elx*noLi[1]-ely*noLi[0];
+    const sll=Math.sqrt(snlx*snlx+snly*snly+snlz*snlz)||1;
+    _v(rIL[i3],rIL[i3+1],rIL[i3+2],snlx/sll,snly/sll,snlz/sll);
+    _v(rOL[i3],rOL[i3+1],rOL[i3+2],snlx/sll,snly/sll,snlz/sll);
+    _v(rOL[j3],rOL[j3+1],rOL[j3+2],snlx/sll,snly/sll,snlz/sll);
+    _v(rIL[i3],rIL[i3+1],rIL[i3+2],snlx/sll,snly/sll,snlz/sll);
+    _v(rOL[j3],rOL[j3+1],rOL[j3+2],snlx/sll,snly/sll,snlz/sll);
+    _v(rIL[j3],rIL[j3+1],rIL[j3+2],snlx/sll,snly/sll,snlz/sll);
+    // Right side wall
+    const erx=rOR[j3]-rOR[i3],ery=rOR[j3+1]-rOR[i3+1],erz=rOR[j3+2]-rOR[i3+2];
+    const snrx=-(ery*noRi[2]-erz*noRi[1]),snry=-(erz*noRi[0]-erx*noRi[2]),snrz=-(erx*noRi[1]-ery*noRi[0]);
+    const srl=Math.sqrt(snrx*snrx+snry*snry+snrz*snrz)||1;
+    _v(rIR[i3],rIR[i3+1],rIR[i3+2],snrx/srl,snry/srl,snrz/srl);
+    _v(rIR[j3],rIR[j3+1],rIR[j3+2],snrx/srl,snry/srl,snrz/srl);
+    _v(rOR[i3],rOR[i3+1],rOR[i3+2],snrx/srl,snry/srl,snrz/srl);
+    _v(rOR[i3],rOR[i3+1],rOR[i3+2],snrx/srl,snry/srl,snrz/srl);
+    _v(rIR[j3],rIR[j3+1],rIR[j3+2],snrx/srl,snry/srl,snrz/srl);
+    _v(rOR[j3],rOR[j3+1],rOR[j3+2],snrx/srl,snry/srl,snrz/srl);
+  }
+
+  mesh.geometry.attributes.position.needsUpdate=true;
+  mesh.geometry.attributes.normal.needsUpdate=true;
+  mesh.geometry.setDrawRange(0,vi);
+  mesh.visible=true;
 }
 
 // ═══════ Exact triangle-plane cross-section polyline (CPU) ═══════
@@ -349,9 +565,10 @@ function addBand(origin,normal){
   };
   bands.push(band);
   writeBandRestRadii(bands.length-1,pre.radii);
-  const visActual=makeBandLine('#ff3333',0.8);
+  const visRibbon=createBandRibbonMesh();
   const visTarget=makeBandLine('#33ff33',0.35);
-  bandVisuals.push({lineActual:visActual,lineTarget:visTarget});
+  visTarget.visible = showTargetLine;
+  bandVisuals.push({ribbon:visRibbon,lineTarget:visTarget});
   H.bcount.textContent=bands.length;
   updateLastBandPanel(bands.length-1);
   markPbdDirty();
@@ -361,7 +578,7 @@ function removeBand(){
   bands.pop();
   const vis=bandVisuals.pop();
   if(vis){
-    vis.lineActual.geometry.dispose();vis.lineActual.material.dispose();scene.remove(vis.lineActual);
+    vis.ribbon.geometry.dispose();vis.ribbon.material.dispose();scene.remove(vis.ribbon);
     vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();scene.remove(vis.lineTarget);
   }
   H.bcount.textContent=bands.length;
@@ -533,35 +750,41 @@ async function loadModels(){
   // ── CPU nearest-proxy with spatial hash ──
   nearestProxyIdx=new Uint32Array(highResCount);
   const tHash=performance.now();
-  // Build 3D spatial hash grid for proxy vertices
-  const GRID=24;
-  const bmin=[Infinity,Infinity,Infinity],bmax=[-Infinity,-Infinity,-Infinity];
+  // Build 3D spatial hash grid for proxy vertices — make global for fast projection
+  _hashGrid=24;
+  _hashBmin=[Infinity,Infinity,Infinity];const _hbmax=[-Infinity,-Infinity,-Infinity];
   for(let i=0;i<proxyVertexCount;i++){
-    for(let k=0;k<3;k++){const v=proxyRestPositions[i*3+k];if(v<bmin[k])bmin[k]=v;if(v>bmax[k])bmax[k]=v;}
+    for(let k=0;k<3;k++){const v=proxyRestPositions[i*3+k];if(v<_hashBmin[k])_hashBmin[k]=v;if(v>_hbmax[k])_hbmax[k]=v;}
   }
-  const gs=[(bmax[0]-bmin[0])/GRID+1e-6,(bmax[1]-bmin[1])/GRID+1e-6,(bmax[2]-bmin[2])/GRID+1e-6];
-  const cells=Array.from({length:GRID*GRID*GRID},()=>[]);
+  _hashGs=[(_hbmax[0]-_hashBmin[0])/_hashGrid+1e-6,(_hbmax[1]-_hashBmin[1])/_hashGrid+1e-6,(_hbmax[2]-_hashBmin[2])/_hashGrid+1e-6];
+  _hashCells=Array.from({length:_hashGrid*_hashGrid*_hashGrid},()=>[]);
   for(let i=0;i<proxyVertexCount;i++){
-    const ix=Math.min(GRID-1,Math.floor((proxyRestPositions[i*3]-bmin[0])/gs[0]));
-    const iy=Math.min(GRID-1,Math.floor((proxyRestPositions[i*3+1]-bmin[1])/gs[1]));
-    const iz=Math.min(GRID-1,Math.floor((proxyRestPositions[i*3+2]-bmin[2])/gs[2]));
-    cells[(ix*GRID+iy)*GRID+iz].push(i);
+    const ix=Math.min(_hashGrid-1,Math.floor((proxyRestPositions[i*3]-_hashBmin[0])/_hashGs[0]));
+    const iy=Math.min(_hashGrid-1,Math.floor((proxyRestPositions[i*3+1]-_hashBmin[1])/_hashGs[1]));
+    const iz=Math.min(_hashGrid-1,Math.floor((proxyRestPositions[i*3+2]-_hashBmin[2])/_hashGs[2]));
+    _hashCells[(ix*_hashGrid+iy)*_hashGrid+iz].push(i);
   }
-  // For each high-res vertex, search 27 neighboring cells (expand if empty)
+  // Build vertex→triangle adjacency
+  _vertTris=Array.from({length:proxyVertexCount},()=>[]);
+  for(let t=0;t<proxyIdxArr.length;t+=3){
+    _vertTris[proxyIdxArr[t]].push(t/3);
+    _vertTris[proxyIdxArr[t+1]].push(t/3);
+    _vertTris[proxyIdxArr[t+2]].push(t/3);
+  }
+  // For each high-res vertex, search 27 neighboring cells
   let fallbackCount=0;
   for(let i=0;i<highResCount;i++){
     const hx=highResRestPositions[i*3],hy=highResRestPositions[i*3+1],hz=highResRestPositions[i*3+2];
-    const ix=Math.min(GRID-1,Math.max(0,Math.floor((hx-bmin[0])/gs[0])));
-    const iy=Math.min(GRID-1,Math.max(0,Math.floor((hy-bmin[1])/gs[1])));
-    const iz=Math.min(GRID-1,Math.max(0,Math.floor((hz-bmin[2])/gs[2])));
+    const ix=Math.min(_hashGrid-1,Math.max(0,Math.floor((hx-_hashBmin[0])/_hashGs[0])));
+    const iy=Math.min(_hashGrid-1,Math.max(0,Math.floor((hy-_hashBmin[1])/_hashGs[1])));
+    const iz=Math.min(_hashGrid-1,Math.max(0,Math.floor((hz-_hashBmin[2])/_hashGs[2])));
     let bestD=Infinity,bestJ=0;
-    // Try expanding search radius until we find something
-    for(let radius=1;radius<=GRID&&bestD===Infinity;radius++){
+    for(let radius=1;radius<=_hashGrid&&bestD===Infinity;radius++){
       for(let dx=-radius;dx<=radius;dx++){for(let dy=-radius;dy<=radius;dy++){for(let dz=-radius;dz<=radius;dz++){
-        if(Math.abs(dx)<radius&&Math.abs(dy)<radius&&Math.abs(dz)<radius)continue; // skip inner region
+        if(Math.abs(dx)<radius&&Math.abs(dy)<radius&&Math.abs(dz)<radius)continue;
         const cx=ix+dx,cy=iy+dy,cz=iz+dz;
-        if(cx<0||cx>=GRID||cy<0||cy>=GRID||cz<0||cz>=GRID)continue;
-        for(const j of cells[(cx*GRID+cy)*GRID+cz]){
+        if(cx<0||cx>=_hashGrid||cy<0||cy>=_hashGrid||cz<0||cz>=_hashGrid)continue;
+        for(const j of _hashCells[(cx*_hashGrid+cy)*_hashGrid+cz]){
           const px=proxyRestPositions[j*3],py=proxyRestPositions[j*3+1],pz=proxyRestPositions[j*3+2];
           const d=(hx-px)**2+(hy-py)**2+(hz-pz)**2;
           if(d<bestD){bestD=d;bestJ=j;}
@@ -571,7 +794,7 @@ async function loadModels(){
     }
     nearestProxyIdx[i]=bestJ;
   }
-  console.log('🔗 CPU最近邻映射:',(performance.now()-tHash).toFixed(0),'ms (grid',GRID+'³, fallback:',fallbackCount+'/'+highResCount+')');
+  console.log('🔗 CPU最近邻映射:',(performance.now()-tHash).toFixed(0),'ms (grid',_hashGrid+'³, fallback:',fallbackCount+'/'+highResCount+')');
 
   // Create Three.js high-res mesh
   const geo=new THREE.BufferGeometry();
@@ -600,6 +823,37 @@ async function loadModels(){
   proxyWireMesh=new THREE.LineSegments(wireGeo,new THREE.LineBasicMaterial({color:'#ff44ff',transparent:true,opacity:0.7,depthTest:false,depthWrite:false}));
   proxyWireMesh.visible=false;proxyWireMesh.renderOrder=999;
   scene.add(proxyWireMesh);
+
+  // ── TEST: offset vertices along direction to centroid ──
+  if(false){
+    // Mesh centroid
+    let cx=0,cy=0,cz=0;
+    for(let i=0;i<proxyVertexCount;i++){
+      const i3=i*3;
+      cx+=proxyRestPositions[i3];cy+=proxyRestPositions[i3+1];cz+=proxyRestPositions[i3+2];
+    }
+    cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+    const offset=0.30;
+    const enlargedPos=new Float32Array(proxyVertexCount*3);
+    for(let i=0;i<proxyVertexCount;i++){
+      const i3=i*3;
+      const px=proxyRestPositions[i3],py=proxyRestPositions[i3+1],pz=proxyRestPositions[i3+2];
+      let nx=px-cx,ny=py-cy,nz=pz-cz;
+      const nl=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+      enlargedPos[i3]=px+nx/nl*offset;
+      enlargedPos[i3+1]=py+ny/nl*offset;
+      enlargedPos[i3+2]=pz+nz/nl*offset;
+    }
+    const bigWireGeo=new THREE.BufferGeometry();
+    bigWireGeo.setAttribute('position',new THREE.Float32BufferAttribute(enlargedPos,3));
+    bigWireGeo.setIndex(new THREE.BufferAttribute(edgeIdx,1));
+    bigWireGeo.computeBoundingSphere();
+    const bigWire=new THREE.LineSegments(bigWireGeo,new THREE.LineBasicMaterial({color:'#00ffff',transparent:true,opacity:0.8,depthTest:true,depthWrite:true}));
+    bigWire.renderOrder=998;
+    bigWire.name='enlargedProxyWire';
+    scene.add(bigWire);
+    console.log('🔵 青色线框 = 每个顶点沿质心方向推0.3单位，质心=('+cx.toFixed(2)+','+cy.toFixed(2)+','+cz.toFixed(2)+')');
+  }
 
   // Toggle wire button
   const btnWire=document.createElement('button');
@@ -1420,13 +1674,14 @@ async function readbackVolume(){
   H.vratio.textContent=ratio.toFixed(1);
 }
 
-// Update band visuals from CPU proxy positions (exact polyline, proven in testbed)
+// Update band visuals from CPU proxy positions (exact polyline, PBR ribbon + target line)
 function updateBandVisual(idx){
   const b=bands[idx],vis=bandVisuals[idx];
   if(!vis||!b)return;
   const exact=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,b.planeOrigin,b.planeNormal);
-  if(exact.points3D.length<9){vis.lineActual.visible=false;vis.lineTarget.visible=false;return;}
-  updateBandLine(vis.lineActual,exact.points3D);
+  if(exact.points3D.length<9){vis.ribbon.visible=false;vis.lineTarget.visible=false;return;}
+  updateBandRibbonMesh(vis.ribbon, b);
+  // Target green line (thin reference, unchanged)
   if(exact.perimeter>b.restCircum){
     const s=b.restCircum/exact.perimeter;
     const cx=exact.centroid[0],cy=exact.centroid[1],cz=exact.centroid[2];
@@ -1435,7 +1690,7 @@ function updateBandVisual(idx){
       const dx=exact.points3D[i]-cx,dy=exact.points3D[i+1]-cy,dz=exact.points3D[i+2]-cz;
       targetPts.push(cx+dx*s,cy+dy*s,cz+dz*s);
     }
-    updateBandLine(vis.lineTarget,targetPts);vis.lineTarget.visible=true;
+    updateBandLine(vis.lineTarget,targetPts);vis.lineTarget.visible=showTargetLine;
   }else{vis.lineTarget.visible=false;}
 }
 function updateAllBandVisuals(){
