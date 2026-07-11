@@ -40,7 +40,7 @@ canvas { display:block; cursor:crosshair; }
  <div>皮筋耗时: <span class="val" id="bandtime">--</span> ms</div>
 </div>
 <div id="info">
- Click surface to bind band (normal dir) &nbsp; <span class="kb">R</span>=割一?&nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">?GPU PBD + Three.js WebGPU</span>
+ Click surface to bind band (normal dir) &nbsp; <span class="kb">Shift+Click</span>=圆皮筋 &nbsp; <span class="kb">R</span>=割一&nbsp; <span class="kb">T</span>=割圆&nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">?GPU PBD + Three.js WebGPU</span>
 </div>
 <div id="panel">
  <h3>🔧 PBD 参数</h3>
@@ -244,6 +244,15 @@ let RIBBON_SURFACE_OFFSET = 0.004; // ~4mm lift above surface to avoid z-fight
 let RIBBON_ROUGHNESS = 0.45;       // PBR roughness
 let RIBBON_ANISOTROPY = 0.30;    // anisotropic stretch (0=round, 1=line)
 let RIBBON_WIDTH_SEGMENTS = 4;   // subdivisions across band width
+
+// ══════.? Circular Band (Tube) Parameters ══════.?
+const MAX_CIRC_BANDS = 64;
+const circularBands = [];          // {planeOrigin, planeNormal, tubeRadius}
+const circBandVisuals = [];        // visual data per circular band
+let TUBE_RADIUS = 0.018;           // tube cross-section radius
+let TUBE_RADIAL_SEGS = 12;         // subdivisions around tube circumference
+let TUBE_RING_SEGS = 192;          // subdivisions along band length
+const CIRC_BINS = 64;              // angle bins for center polyline
 
 // ── Legacy line helpers (kept for target green line + hover preview) ──
 function makeBandLine(color,opacity){
@@ -800,6 +809,37 @@ function removeAllBands(){
   while(bands.length>0)removeBand();
   // Immediately hide shared mesh (don't wait for next rAF)
   if(_sharedRibbonMesh){_sharedRibbonMesh.geometry.setDrawRange(0,0);_sharedRibbonMesh.visible=false;}
+}
+
+// ══════.?Circular Band (Tube) add/remove ══════.?
+function addCircularBand(origin, normal){
+  if(circularBands.length>=MAX_CIRC_BANDS){console.warn('达到最大圆皮筋数');return;}
+  const nl=Math.sqrt(normal[0]**2+normal[1]**2+normal[2]**2);
+  const nn=[normal[0]/nl,normal[1]/nl,normal[2]/nl];
+  const band={
+    planeOrigin:[...origin],
+    planeNormal:[...nn],
+    tubeRadius:TUBE_RADIUS,
+  };
+  circularBands.push(band);
+  circBandVisuals.push({});
+  console.log('🟤 圆皮筋 #'+circularBands.length+' added at ('+origin.map(v=>v.toFixed(2)).join(',')+') normal=['+nn.map(v=>v.toFixed(2)).join(',')+'] r='+TUBE_RADIUS.toFixed(4));
+  markPbdDirty();
+}
+function removeCircularBand(){
+  if(circularBands.length===0)return;
+  circularBands.pop();
+  circBandVisuals.pop();
+  needsRestore=true;markPbdDirty();
+  // Immediately hide if last one removed
+  if(circularBands.length===0&&_circSharedMesh){
+    _circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;
+  }
+}
+function removeAllCircularBands(){
+  while(circularBands.length>0){circularBands.pop();circBandVisuals.pop();}
+  needsRestore=true;markPbdDirty();
+  if(_circSharedMesh){_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}
 }
 
 // ══════.?Last band panel ══════.?
@@ -1770,6 +1810,255 @@ fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32,tx:f
 }
 `});
 
+// ═══════ GPU Circular Band (Tube) Shaders ═══════
+
+// Shader T1: Triangle-plane intersection for center polyline (single plane, radial offset by tubeRadius)
+const circCutBinsCS=device.createShaderModule({label:'circCutBins',code:`
+struct P{triCount:u32,vc:u32,ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,tubeR:f32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read_write>binRX:array<atomic<u32>>;
+@group(0)@binding(3)var<storage,read_write>binRY:array<atomic<u32>>;
+@group(0)@binding(4)var<storage,read_write>binRZ:array<atomic<u32>>;
+@group(0)@binding(5)var<storage,read_write>binC:array<atomic<u32>>;
+@group(0)@binding(6)var<uniform>p:P;
+
+const FIXED=1048576.0;
+const BINS=64u;
+
+fn addToBin(px:f32,py:f32,pz:f32){
+  var ux_:f32;var uy_:f32;var uz_:f32;
+  if(abs(p.nx)<0.9){ux_=1.0;uy_=0.0;uz_=0.0;}else{ux_=0.0;uy_=0.0;uz_=1.0;}
+  let du=ux_*p.nx+uy_*p.ny+uz_*p.nz;ux_-=du*p.nx;uy_-=du*p.ny;uz_-=du*p.nz;
+  let ul=sqrt(ux_*ux_+uy_*uy_+uz_*uz_);ux_/=ul;uy_/=ul;uz_/=ul;
+  let vx=p.ny*uz_-p.nz*uy_;let vy=p.nz*ux_-p.nx*uz_;let vz=p.nx*uy_-p.ny*ux_;
+  let rx=px-p.cx;let ry=py-p.cy;let rz=pz-p.cz;
+  let ru=rx*ux_+ry*uy_+rz*uz_;let rv=rx*vx+ry*vy+rz*vz;
+  let ang=atan2(rv,ru);
+  let bi=u32(floor((ang+3.14159265)/6.28318531*64.0))%BINS;
+  atomicAdd(&binRX[bi],u32((px+4.0)*FIXED));
+  atomicAdd(&binRY[bi],u32((py+4.0)*FIXED));
+  atomicAdd(&binRZ[bi],u32((pz+4.0)*FIXED));
+  atomicAdd(&binC[bi],1u);
+}
+
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let ti=gid.x;if(ti>=p.triCount){return;}
+  let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+  // Offset vertices radially by tubeRadius for centerline
+  let rd0=normalize(pos[i0].xyz-vec3(p.cx,p.cy,p.cz));
+  let rd1=normalize(pos[i1].xyz-vec3(p.cx,p.cy,p.cz));
+  let rd2=normalize(pos[i2].xyz-vec3(p.cx,p.cy,p.cz));
+  let v0=pos[i0].xyz+rd0*p.tubeR;
+  let v1=pos[i1].xyz+rd1*p.tubeR;
+  let v2=pos[i2].xyz+rd2*p.tubeR;
+  // Signed distances to band plane
+  let ox=p.ox;let oy=p.oy;let oz=p.oz;
+  let nx=p.nx;let ny=p.ny;let nz=p.nz;
+  let d0=(v0.x-ox)*nx+(v0.y-oy)*ny+(v0.z-oz)*nz;
+  let d1=(v1.x-ox)*nx+(v1.y-oy)*ny+(v1.z-oz)*nz;
+  let d2=(v2.x-ox)*nx+(v2.y-oy)*ny+(v2.z-oz)*nz;
+  let eps=1e-7;
+  let s0=select(0,select(1,-1,d0>eps),abs(d0)>eps);
+  let s1=select(0,select(1,-1,d1>eps),abs(d1)>eps);
+  let s2=select(0,select(1,-1,d2>eps),abs(d2)>eps);
+  if(s0==s1&&s1==s2&&s0!=0){return;}
+  if(s0==0){addToBin(v0.x,v0.y,v0.z);}
+  if(s1==0){addToBin(v1.x,v1.y,v1.z);}
+  if(s2==0){addToBin(v2.x,v2.y,v2.z);}
+  if((d0>eps&&d1<-eps)||(d0<-eps&&d1>eps)){
+    let t=d0/(d0-d1);
+    addToBin(v0.x+t*(v1.x-v0.x),v0.y+t*(v1.y-v0.y),v0.z+t*(v1.z-v0.z));
+  }
+  if((d1>eps&&d2<-eps)||(d1<-eps&&d2>eps)){
+    let t=d1/(d1-d2);
+    addToBin(v1.x+t*(v2.x-v1.x),v1.y+t*(v2.y-v1.y),v1.z+t*(v2.z-v1.z));
+  }
+  if((d2>eps&&d0<-eps)||(d2<-eps&&d0>eps)){
+    let t=d2/(d2-d0);
+    addToBin(v2.x+t*(v0.x-v2.x),v2.y+t*(v0.y-v2.y),v2.z+t*(v0.z-v2.z));
+  }
+}
+`});
+
+// Shader T2: Bin averaging → compact center polyline (64 vec4 points)
+const circResolveCS=device.createShaderModule({label:'circResolve',code:`
+struct P{ringSegs:u32}
+@group(0)@binding(0)var<storage,read>binRX:array<u32>;
+@group(0)@binding(1)var<storage,read>binRY:array<u32>;
+@group(0)@binding(2)var<storage,read>binRZ:array<u32>;
+@group(0)@binding(3)var<storage,read>binC:array<u32>;
+@group(0)@binding(4)var<storage,read_write>polyPts:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+const FIXED=1048576.0;
+const BINS=64u;
+@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>){
+  let base=lid.x;
+  let sx=binRX[base];let sy=binRY[base];let sz=binRZ[base];let c=binC[base];
+  if(c>0u){
+    let avgX=f32(sx)/FIXED/f32(c)-4.0;
+    let avgY=f32(sy)/FIXED/f32(c)-4.0;
+    let avgZ=f32(sz)/FIXED/f32(c)-4.0;
+    polyPts[base]=vec4(avgX,avgY,avgZ,1.0);
+  }else{
+    polyPts[base]=vec4(0.0,0.0,0.0,0.0);
+  }
+}
+`});
+
+// Shader T3: Build tube mesh from center polyline (triangle list, no tangents needed)
+const circBuildTubeCS=device.createShaderModule({label:'circBuildTube',code:`
+struct P{ringSegs:u32,radialSegs:u32,tubeR:f32,nx:f32,ny:f32,nz:f32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>polyPts:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>outPos:array<f32>;
+@group(0)@binding(2)var<storage,read_write>outNorm:array<f32>;
+@group(0)@binding(3)var<storage,read_write>outUV:array<f32>;
+@group(0)@binding(4)var<uniform>p:P;
+const BINS=64u;
+var<workgroup>wsX:array<f32,256>;
+var<workgroup>wsY:array<f32,256>;
+var<workgroup>wsZ:array<f32,256>;
+
+fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32){
+  let i3=vi*3u;
+  outPos[i3]=x;outPos[i3+1u]=y;outPos[i3+2u]=z;
+  outNorm[i3]=nx_;outNorm[i3+1u]=ny_;outNorm[i3+2u]=nz_;
+  outUV[vi*2u]=u_;outUV[vi*2u+1u]=v_;
+}
+
+fn fakeNormal(px:f32,py:f32,pz:f32)->vec3<f32>{
+  let dx=px-p.cx;let dy=py-p.cy;let dz=pz-p.cz;
+  let len=sqrt(dx*dx+dy*dy+dz*dz)+1e-9;
+  return vec3(dx/len,dy/len,dz/len);
+}
+// Rodrigues: rotate V toward tgt around cross(V,tgt), by (angle_between * strength)
+fn rotateTowards(V:vec3<f32>,tgt:vec3<f32>,strength:f32)->vec3<f32>{
+  let crs=cross(V,tgt);
+  let crsLen=sqrt(dot(crs,crs));
+  if(crsLen<1e-9){return V;} // parallel — nothing to rotate
+  let K=crs/crsLen;
+  let cosMax=clamp(dot(V,tgt),-1.0,1.0);
+  let angle=acos(cosMax)*strength;
+  let s=sin(angle);let c=cos(angle);
+  return V*c+cross(K,V)*s;
+}
+
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>){
+  let N=p.ringSegs;let R=p.radialSegs;let r=p.tubeR;
+  let bnX=p.nx;let bnY=p.ny;let bnZ=p.nz; // band plane normal (up direction for tube)
+
+  // Phase 1: resample 64 bins → N ring points
+  for(var idx=lid.x;idx<N;idx+=256u){
+    let frac=f32(idx)/f32(N)*64.0;
+    let b0=u32(floor(frac))%BINS;let b1=(b0+1u)%BINS;let t=frac-f32(b0);
+    let pt0=polyPts[b0];let pt1=polyPts[b1];
+    var x0=pt0.x;var y0=pt0.y;var z0=pt0.z;
+    var x1=pt1.x;var y1=pt1.y;var z1=pt1.z;
+    if(pt0.w<0.5){for(var d=1u;d<64u;d++){let nb=(b0+BINS-d)%BINS;let pt=polyPts[nb];if(pt.w>0.5){x0=pt.x;y0=pt.y;z0=pt.z;break;}}}
+    if(pt1.w<0.5){for(var d=1u;d<64u;d++){let nb=(b1+d)%BINS;let pt=polyPts[nb];if(pt.w>0.5){x1=pt.x;y1=pt.y;z1=pt.z;break;}}}
+    wsX[idx]=mix(x0,x1,t);wsY[idx]=mix(y0,y1,t);wsZ[idx]=mix(z0,z1,t);
+  }
+  workgroupBarrier();
+
+  // Phase 2: build tube mesh (each thread = 1 ring segment)
+  let vertsPerRing=R*6u; // 6 vertices per radial quad (2 triangles)
+  for(var seg=lid.x;seg<N;seg+=256u){
+    let j=(seg+1u)%N;
+    let cx=wsX[seg];let cy=wsY[seg];let cz=wsZ[seg];
+    let nx_=wsX[j];let ny_=wsY[j];let nz_=wsZ[j];
+
+    // Tangent along curve
+    var tx=nx_-cx;var ty=ny_-cy;var tz=nz_-cz;
+    let tl=sqrt(tx*tx+ty*ty+tz*tz);
+    if(tl<1e-6){tx=1.0;ty=0.0;tz=0.0;}else{tx/=tl;ty/=tl;tz/=tl;}
+
+    // Build basis: use band normal as "up", compute N = cross(up, tangent), B = cross(tangent, N)
+    // N is horizontal (perpendicular to both up and tangent)
+    var Nx=bnY*tz-bnZ*ty;var Ny=bnZ*tx-bnX*tz;var Nz=bnX*ty-bnY*tx;
+    let Nl=sqrt(Nx*Nx+Ny*Ny+Nz*Nz);
+    if(Nl<1e-6){
+      // Tangent parallel to band normal — pick arbitrary perpendicular
+      if(abs(bnX)<0.9){Nx=0.0;Ny=-bnZ;Nz=bnY;}else{Nx=-bnZ;Ny=0.0;Nz=bnX;}
+      let nnl=sqrt(Nx*Nx+Ny*Ny+Nz*Nz);Nx/=nnl;Ny/=nnl;Nz/=nnl;
+    }else{Nx/=Nl;Ny/=Nl;Nz/=Nl;}
+    // B = cross(tangent, N) — this is close to band normal for horizontal bands
+    let Bx=ty*Nz-tz*Ny;let By=tz*Nx-tx*Nz;let Bz=tx*Ny-ty*Nx;
+
+    // Generate ring vertices
+    let baseV=seg*vertsPerRing;
+    let uv_=f32(seg)/f32(N);
+    let uvj=f32(j)/f32(N);
+
+    for(var ri=0u;ri<R;ri++){
+      let rj=(ri+1u)%R;
+      let a0=f32(ri)/f32(R)*6.283185307;
+      let a1=f32(rj)/f32(R)*6.283185307;
+      let cos0=cos(a0);let sin0=sin(a0);
+      let cos1=cos(a1);let sin1=sin(a1);
+
+      // Current ring points
+      let p0x=cx+r*(cos0*Nx+sin0*Bx);
+      let p0y=cy+r*(cos0*Ny+sin0*By);
+      let p0z=cz+r*(cos0*Nz+sin0*Bz);
+      let p1x=cx+r*(cos1*Nx+sin1*Bx);
+      let p1y=cy+r*(cos1*Ny+sin1*By);
+      let p1z=cz+r*(cos1*Nz+sin1*Bz);
+
+      // Next ring points (need basis at next ring)
+      // Recompute tangent at next ring
+      let nxt=wsX[(j+1u)%N];let nyt=wsY[(j+1u)%N];let nzt=wsZ[(j+1u)%N];
+      var txj=nxt-nx_;var tyj=nyt-ny_;var tzj=nzt-nz_;
+      let tlj=sqrt(txj*txj+tyj*tyj+tzj*tzj);
+      if(tlj<1e-6){txj=tx;tyj=ty;tzj=tz;}else{txj/=tlj;tyj/=tlj;tzj/=tlj;}
+      var Nxj=bnY*tzj-bnZ*tyj;var Nyj=bnZ*txj-bnX*tzj;var Nzj=bnX*tyj-bnY*txj;
+      let Nlj=sqrt(Nxj*Nxj+Nyj*Nyj+Nzj*Nzj);
+      if(Nlj<1e-6){
+        if(abs(bnX)<0.9){Nxj=0.0;Nyj=-bnZ;Nzj=bnY;}else{Nxj=-bnZ;Nyj=0.0;Nzj=bnX;}
+        let nnl=sqrt(Nxj*Nxj+Nyj*Nyj+Nzj*Nzj);Nxj/=nnl;Nyj/=nnl;Nzj/=nnl;
+      }else{Nxj/=Nlj;Nyj/=Nlj;Nzj/=Nlj;}
+      let Bxj=tyj*Nzj-tzj*Nyj;let Byj=tzj*Nxj-txj*Nzj;let Bzj=txj*Nyj-tyj*Nxj;
+
+      let q0x=nx_+r*(cos0*Nxj+sin0*Bxj);
+      let q0y=ny_+r*(cos0*Nyj+sin0*Byj);
+      let q0z=nz_+r*(cos0*Nzj+sin0*Bzj);
+      let q1x=nx_+r*(cos1*Nxj+sin1*Bxj);
+      let q1y=ny_+r*(cos1*Nyj+sin1*Byj);
+      let q1z=nz_+r*(cos1*Nzj+sin1*Bzj);
+
+      // ── Decompose: cross-section = real (round), tangent = fake (smooth) ──
+      // R provides tube roundness (⊥T).  F·T provides along-band centroid-smoothness.
+      // H = normalize(R + dot(F,T)*T) — both properties simultaneously, no trade-off.
+      let Tvec=vec3(tx,ty,tz);let Tjvec=vec3(txj,tyj,tzj);
+      // real tube normals (cross-section plane only, gives round profile)
+      let R00=vec3(cos0*Nx+sin0*Bx,cos0*Ny+sin0*By,cos0*Nz+sin0*Bz);
+      let R01=vec3(cos1*Nx+sin1*Bx,cos1*Ny+sin1*By,cos1*Nz+sin1*Bz);
+      let R10=vec3(cos0*Nxj+sin0*Bxj,cos0*Nyj+sin0*Byj,cos0*Nzj+sin0*Bzj);
+      let R11=vec3(cos1*Nxj+sin1*Bxj,cos1*Nyj+sin1*Byj,cos1*Nzj+sin1*Bzj);
+      // fake normals (toward centroid, gives smooth along-band)
+      let F00=fakeNormal(p0x,p0y,p0z);let F01=fakeNormal(p1x,p1y,p1z);
+      let F10=fakeNormal(q0x,q0y,q0z);let F11=fakeNormal(q1x,q1y,q1z);
+      // combine: R (cross-section) + F's tangent projection (along-band)
+      let n00=normalize(R00+dot(F00,Tvec)*Tvec);
+      let n01=normalize(R01+dot(F01,Tvec)*Tvec);
+      let n10=normalize(R10+dot(F10,Tjvec)*Tjvec);
+      let n11=normalize(R11+dot(F11,Tjvec)*Tjvec);
+
+      let v0=f32(ri)/f32(R);let v1=f32(rj)/f32(R);
+
+      // Triangle 1: (seg,ri)-(seg,ri+1)-(seg+1,ri)
+      let vi=baseV+ri*6u;
+      writeVert(vi,   p0x,p0y,p0z, n00.x,n00.y,n00.z, uv_,v0);
+      writeVert(vi+1u,p1x,p1y,p1z, n01.x,n01.y,n01.z, uv_,v1);
+      writeVert(vi+2u,q0x,q0y,q0z, n10.x,n10.y,n10.z, uvj,v0);
+      // Triangle 2: (seg,ri+1)-(seg+1,ri+1)-(seg+1,ri)
+      writeVert(vi+3u,p1x,p1y,p1z, n01.x,n01.y,n01.z, uv_,v1);
+      writeVert(vi+4u,q1x,q1y,q1z, n11.x,n11.y,n11.z, uvj,v1);
+      writeVert(vi+5u,q0x,q0y,q0z, n10.x,n10.y,n10.z, uvj,v0);
+    }
+  }
+}
+`});
+
 // Normals recompute (unchanged from original)
 const normCS=device.createShaderModule({label:'norm',code:`
 struct P{vc:u32}
@@ -1848,6 +2137,10 @@ const bandStackPipe=cpPipe(bandStackCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S
 const bandCutBinsPipe=cpPipe(bandCutBinsCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_RO(4,CS),S_R(5,CS),S_R(6,CS),S_R(7,CS),S_R(8,CS),U_B(9,CS)],'bandCutBins');
 const bandResolvePipe=cpPipe(bandResolveCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'bandResolve');
 const bandBuildMeshPipe=cpPipe(bandBuildMeshCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandBuildMesh');
+// ── Circular Band (Tube) pipelines ──
+const circCutBinsPipe=cpPipe(circCutBinsCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'circCutBins');
+const circResolvePipe=cpPipe(circResolveCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'circResolve');
+const circBuildTubePipe=cpPipe(circBuildTubeCS,'main',[S_RO(0,CS),S_R(1,CS),S_R(2,CS),S_R(3,CS),U_B(4,CS)],'circBuildTube');
 
 
 // ══════.?GPU Buffers and Bind Groups ══════.?
@@ -1878,6 +2171,13 @@ let _greenAllB;                // green target line staging (MAP_READ)
 let _sharedRibbonMesh;         // single mesh for all bands
 
 let bandCutUB,bandResolveUB,bandBuildUB; // uniforms
+// ── Circular Band (Tube) buffers ──
+let _circBinRB,_circBinRYB,_circBinRZB,_circBinCB;  // 64 u32 atomics each
+let _circPolyPtsB;           // 64 vec4 center polyline points
+let _circSharedPosB,_circSharedNormB,_circSharedUVB; // shared tube mesh buffers
+let _circSharedMesh;         // single Three.js mesh for all circular bands
+let _circCutUB,_circResolveUB,_circBuildUB; // uniforms
+const MAX_TUBE_VERTS=256*16*6; // ringSegs*radialSegs*6 (2 triangles per quad)
 let WG,VWG;
 
 async function initGPU(){
@@ -1963,6 +2263,22 @@ async function initGPU(){
   bandCutUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandCutU');
   bandResolveUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandResolveU');
   bandBuildUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandBuildU');
+
+  // ── Circular Band (Tube) GPU buffers ──
+  _circBinRB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinRX');
+  _circBinRYB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinRY');
+  _circBinRZB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinRZ');
+  _circBinCB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinC');
+  _circPolyPtsB=mkBuf(CIRC_BINS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'circPolyPts');
+  // Shared tube mesh buffers (all circular bands, compute→render direct)
+  const TUBE_VERT_CAP=MAX_TUBE_VERTS;
+  _circSharedPosB=mkBuf(MAX_CIRC_BANDS*TUBE_VERT_CAP*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'circSharedPos');
+  _circSharedNormB=mkBuf(MAX_CIRC_BANDS*TUBE_VERT_CAP*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'circSharedNorm');
+  _circSharedUVB=mkBuf(MAX_CIRC_BANDS*TUBE_VERT_CAP*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'circSharedUV');
+  // Uniforms for circular pipe
+  _circCutUB=mkBuf(48,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circCutU');
+  _circResolveUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circResolveU');
+  _circBuildUB=mkBuf(48,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circBuildU');
 
   // .?(adjacency, idx, norms .?same as before) .?
 
@@ -2074,6 +2390,8 @@ async function initGPU(){
   
   // Create shared ribbon mesh (all bands in ONE draw call, 0 copyBufferToBuffer)
   _sharedRibbonMesh=createSharedRibbonMesh();
+  // Create shared circular tube mesh (all circular bands in ONE draw call)
+  _circSharedMesh=createCircSharedMesh();
 }
 
 // ── Shared ribbon mesh: one geometry, one material, all bands ──
@@ -2116,6 +2434,48 @@ function createSharedRibbonMesh(){
   // Force Three.js to create GPU buffers, then replace with shared buffers
   const attrNames=['position','normal','uv','tangent'];
   const sharedBufs=[_sharedPosB,_sharedNormB,_sharedUVB,_sharedTanB];
+  for(let i=0;i<attrNames.length;i++){
+    const attr=geo.attributes[attrNames[i]];
+    renderer.backend.createAttribute(attr);
+    const be=renderer.backend.get(attr);
+    if(be)be.buffer=sharedBufs[i];
+    attr.needsUpdate=false;
+  }
+  return mesh;
+}
+
+// ── Shared circular tube mesh: one geometry, one material, all circular bands ──
+function createCircSharedMesh(){
+  const totalAll=MAX_CIRC_BANDS*MAX_TUBE_VERTS;
+  const geo=new THREE.BufferGeometry();
+  const posArr=new Float32Array(MAX_TUBE_VERTS*3);
+  const normArr=new Float32Array(MAX_TUBE_VERTS*3);
+  const uvArr=new Float32Array(MAX_TUBE_VERTS*2);
+  const posAttr=new THREE.Float32BufferAttribute(posArr,3);
+  const normAttr=new THREE.Float32BufferAttribute(normArr,3);
+  const uvAttr=new THREE.Float32BufferAttribute(uvArr,2);
+  const FAKE_COUNT=MAX_CIRC_BANDS*MAX_TUBE_VERTS;
+  for(const a of[posAttr,normAttr])Object.defineProperty(a,'count',{get(){return FAKE_COUNT;},configurable:true});
+  for(const a of[uvAttr])Object.defineProperty(a,'count',{get(){return FAKE_COUNT;},configurable:true});
+  posAttr.needsUpdate=true;normAttr.needsUpdate=true;uvAttr.needsUpdate=true;
+  geo.setAttribute('position',posAttr);
+  geo.setAttribute('normal',normAttr);
+  geo.setAttribute('uv',uvAttr);
+  geo.setDrawRange(0,0);
+  const mat=new THREE.MeshStandardMaterial({
+    color:'#d4a017',roughness:0.45,metalness:0.0,
+    side:THREE.DoubleSide,depthTest:true,depthWrite:true,
+    polygonOffset:true, polygonOffsetFactor:1.0, polygonOffsetUnits:1.0,
+  });
+  const mesh=new THREE.Mesh(geo,mat);
+  mesh.renderOrder=2;mesh.frustumCulled=false;mesh.visible=false;
+  mesh.castShadow=true;mesh.receiveShadow=false;
+  geo.boundingSphere=new THREE.Sphere(new THREE.Vector3(0,0,0),100);
+  geo.boundingBox=new THREE.Box3(new THREE.Vector3(-100,-100,-100),new THREE.Vector3(100,100,100));
+  scene.add(mesh);
+  // Replace GPU buffers with shared compute→render buffers
+  const attrNames=['position','normal','uv'];
+  const sharedBufs=[_circSharedPosB,_circSharedNormB,_circSharedUVB];
   for(let i=0;i<attrNames.length;i++){
     const attr=geo.attributes[attrNames[i]];
     renderer.backend.createAttribute(attr);
@@ -2511,6 +2871,98 @@ async function runGPUBandVis(finalSrc){
 }
 let _stackU8=null,_stackF32=null,_cutU8=null,_cutF32=null,_buildU8=null,_buildF32=null,_resU32=null,_zeroBins=null;
 
+// ══════ GPU Circular Band (Tube) Visualization ══════
+let _circCutU8=null,_circCutF32=null,_circBuildU8=null,_circBuildF32=null,_circResU32=null,_circZeroBins=null;
+
+async function runGPUCircularBandVis(finalSrc){
+  if(!_circBinRB){return 0;}
+  const bc=circularBands.length;
+  if(bc===0){
+    if(_circSharedMesh){_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}
+    return 0;
+  }
+  const t0=performance.now();
+  const srcPos=(finalSrc===posA)?posA:posB;
+  const ringSegs=TUBE_RING_SEGS, radialSegs=TUBE_RADIAL_SEGS;
+  const totalVerts=ringSegs*radialSegs*6;
+
+  // Pre-alloc reusable typed arrays
+  if(!_circCutU8){_circCutU8=new Uint32Array(new ArrayBuffer(48));_circCutF32=new Float32Array(_circCutU8.buffer);}
+  if(!_circBuildU8){_circBuildU8=new Uint32Array(new ArrayBuffer(48));_circBuildF32=new Float32Array(_circBuildU8.buffer);}
+  if(!_circResU32){_circResU32=new Uint32Array(new ArrayBuffer(8));}
+  if(!_circZeroBins){_circZeroBins=new Uint32Array(CIRC_BINS);}
+
+  // Compute mesh centroid from rest positions
+  let cx=0,cy=0,cz=0;
+  for(let i=0;i<proxyVertexCount;i++){cx+=proxyRestPositions[i*3];cy+=proxyRestPositions[i*3+1];cz+=proxyRestPositions[i*3+2];}
+  cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+
+  for(let b=0;b<bc;b++){
+    const band=circularBands[b];
+    if(!band)continue;
+    const enc=device.createCommandEncoder();
+
+    // Clear bins
+    queue.writeBuffer(_circBinRB,0,_circZeroBins);
+    queue.writeBuffer(_circBinRYB,0,_circZeroBins);
+    queue.writeBuffer(_circBinRZB,0,_circZeroBins);
+    queue.writeBuffer(_circBinCB,0,_circZeroBins);
+
+    // ── T1: Cut (triangle-plane intersection, radial offset by tubeRadius) ──
+    _circCutU8[0]=proxyTriCount; _circCutU8[1]=proxyVertexCount;
+    _circCutF32[2]=band.planeOrigin[0]; _circCutF32[3]=band.planeOrigin[1]; _circCutF32[4]=band.planeOrigin[2];
+    _circCutF32[5]=band.planeNormal[0]; _circCutF32[6]=band.planeNormal[1]; _circCutF32[7]=band.planeNormal[2];
+    _circCutF32[8]=band.tubeRadius;
+    _circCutF32[9]=cx; _circCutF32[10]=cy; _circCutF32[11]=cz;
+    queue.writeBuffer(_circCutUB,0,_circCutU8);
+    const cutBG=device.createBindGroup({layout:circCutBinsPipe.bgl,entries:[
+      {binding:0,resource:{buffer:srcPos}},{binding:1,resource:{buffer:idxB}},
+      {binding:2,resource:{buffer:_circBinRB}},{binding:3,resource:{buffer:_circBinRYB}},
+      {binding:4,resource:{buffer:_circBinRZB}},{binding:5,resource:{buffer:_circBinCB}},
+      {binding:6,resource:{buffer:_circCutUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(circCutBinsPipe.pipe);cp.setBindGroup(0,cutBG);cp.dispatchWorkgroups(VWG,1,1);cp.end();}
+
+    // ── T2: Resolve (bin averaging → 64-point center polyline) ──
+    _circResU32[0]=ringSegs; queue.writeBuffer(_circResolveUB,0,_circResU32);
+    const resolveBG=device.createBindGroup({layout:circResolvePipe.bgl,entries:[
+      {binding:0,resource:{buffer:_circBinRB}},{binding:1,resource:{buffer:_circBinRYB}},
+      {binding:2,resource:{buffer:_circBinRZB}},{binding:3,resource:{buffer:_circBinCB}},
+      {binding:4,resource:{buffer:_circPolyPtsB}},{binding:5,resource:{buffer:_circResolveUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(circResolvePipe.pipe);cp.setBindGroup(0,resolveBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
+
+    // ── T3: Build tube mesh → direct to shared buffers at band offset ──
+    _circBuildU8[0]=ringSegs; _circBuildU8[1]=radialSegs;
+    _circBuildF32[2]=band.tubeRadius;
+    _circBuildF32[3]=band.planeNormal[0]; _circBuildF32[4]=band.planeNormal[1]; _circBuildF32[5]=band.planeNormal[2];
+    _circBuildF32[6]=cx; _circBuildF32[7]=cy; _circBuildF32[8]=cz;
+    queue.writeBuffer(_circBuildUB,0,_circBuildU8);
+    const bandVtxOff=b*totalVerts;
+    const buildBG=device.createBindGroup({layout:circBuildTubePipe.bgl,entries:[
+      {binding:0,resource:{buffer:_circPolyPtsB}},
+      {binding:1,resource:{buffer:_circSharedPosB,offset:bandVtxOff*3*4,size:totalVerts*3*4}},
+      {binding:2,resource:{buffer:_circSharedNormB,offset:bandVtxOff*3*4,size:totalVerts*3*4}},
+      {binding:3,resource:{buffer:_circSharedUVB,offset:bandVtxOff*2*4,size:totalVerts*2*4}},
+      {binding:4,resource:{buffer:_circBuildUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(circBuildTubePipe.pipe);cp.setBindGroup(0,buildBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
+
+    device.queue.submit([enc.finish()]);
+  }
+
+  // Update shared circular mesh: one draw call for all circular bands
+  if(_circSharedMesh){
+    if(bc>0){
+      _circSharedMesh.geometry.setDrawRange(0,bc*totalVerts);
+      _circSharedMesh.visible=true;
+    }else{
+      _circSharedMesh.geometry.setDrawRange(0,0);
+      _circSharedMesh.visible=false;
+    }
+  }
+
+  const elapsed=performance.now()-t0;
+  return elapsed;
+}
+
 
 // ══════.?Interaction ══════.?
 let mdx=0,mdy=0,dragging=false,prevCamYaw=0,prevCamPitch=0;
@@ -2594,7 +3046,12 @@ window.onmouseup=e=>{
 
   const hit=raycastProxyMesh([camPos.x,camPos.y,camPos.z],[Dx,Dy,Dz]);
   if(hit){
-    addBand(hit.point,[0,1,0]);
+    // Shift+click = circular band, regular click = square band
+    if(e.shiftKey){
+      addCircularBand(hit.point,[0,1,0]);
+    }else{
+      addBand(hit.point,[0,1,0]);
+    }
   }
 };
 canvas.onmousemove=e=>{
@@ -2636,7 +3093,8 @@ canvas.onwheel=e=>{e.preventDefault();let d=e.deltaY;if(e.deltaMode===1)d*=40;if
 window.onkeydown=e=>{
   const key=e.key.toLowerCase();
   if(key==='r'){removeBand();return;}
-  if(key==='c'){removeAllBands();return;}
+  if(key==='c'){removeAllBands();removeAllCircularBands();return;}
+  if(key==='t'){removeCircularBand();return;}
 };
 
 window.onresize=()=>{
@@ -2667,6 +3125,8 @@ async function animate(){
       pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
       if(showVolumeReadback)await readbackVolume();
       await runGPUBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
+      // Also render circular bands (function handles zero-case internally)
+      await runGPUCircularBandVis(finalSrc);
     }
     else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
   }else if(bands.length>0&&pbdConverged){
@@ -2686,8 +3146,12 @@ async function animate(){
     H.pbdtime.textContent='Restored';
     H.vratio.textContent='100.0';
     await runGPUBandVis(posA).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
+    // Also render circular bands on restore (function handles zero-case internally)
+    await runGPUCircularBandVis(posA);
   }else{
     H.pbdtime.textContent='空闲';
+    // Render circular bands even in idle state (function handles zero-case internally)
+    await runGPUCircularBandVis(posA);
   }
 
   const tRender0=performance.now();
@@ -2704,7 +3168,7 @@ async function animate(){
 
 console.log('🔧 皮筋游戏 GPU PBD + Three.js WebGPU');
 console.log('   Click surface to bind band (surface normal)');
-console.log('   R = cut one, C = cut all');
+console.log('   T = bind circular band  |  R = cut one  |  C = cut all');
 console.log('   Right panel to adjust params');
 animate();
 </script>
