@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>皮筋游戏 — GPU PBD + Three.js WebGPU</title>
+<title>皮筋游戏 GPU PBD + Three.js WebGPU</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:#111; overflow:hidden; font-family:monospace; }
@@ -34,12 +34,13 @@ canvas { display:block; cursor:crosshair; }
  <div>高模顶点: <span class="val" id="hcount">--</span></div>
  <div>皮筋: <span class="val" id="bcount">0</span></div>
  <div>体积: <span class="val" id="vratio">100</span>%</div>
- <div>周长比: <span class="val" id="cratio">--</span></div>
+ <div>周长比 <span class="val" id="cratio">--</span></div>
  <div>PBD迭代: <span class="val" id="pbditer">10</span></div>
  <div>PBD耗时: <span class="val" id="pbdtime">--</span> ms</div>
+ <div>皮筋耗时: <span class="val" id="bandtime">--</span> ms</div>
 </div>
 <div id="info">
- 🖱️ 点击表面绑皮筋(法向) &nbsp; <span class="kb">R</span>=割一根 &nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">⚡ GPU PBD + Three.js WebGPU</span>
+ Click surface to bind band (normal dir) &nbsp; <span class="kb">R</span>=割一?&nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">?GPU PBD + Three.js WebGPU</span>
 </div>
 <div id="panel">
  <h3>🔧 PBD 参数</h3>
@@ -58,7 +59,7 @@ canvas { display:block; cursor:crosshair; }
  <label>收敛帧数 <span class="val" id="sv_cf">5</span></label>
  <input type="range" id="sl_cf" min="1" max="20" step="1" value="5">
 
- <h3>🎯 最后皮筋 <span class="val" id="lb_info">(空)</span></h3>
+ <h3>🎯 最后皮筋<span class="val" id="lb_info">(空)</span></h3>
  <label>rest周长 <span class="val" id="sv_lr">--</span></label>
  <input type="range" id="sl_lr" min="0.3" max="8.0" step="0.01" value="2.51">
  <div class="row"><span>法向X</span><input type="range" id="sl_nx" min="-1" max="1" step="0.01" value="0"><span class="val" id="sv_nx">0</span></div>
@@ -72,22 +73,26 @@ canvas { display:block; cursor:crosshair; }
  <label>带宽 <span class="val" id="sv_rw">0.025</span></label>
  <input type="range" id="sl_rw" min="0.003" max="0.12" step="0.001" value="0.025">
  <label>厚度 <span class="val" id="sv_rt">0.006</span></label>
- <input type="range" id="sl_rt" min="0.001" max="0.03" step="0.001" value="0.006">
- <label>粗糙度 <span class="val" id="sv_rr">0.45</span></label>
+ <input type="range" id="sl_rt" min="0.001" max="0.06" step="0.001" value="0.015">
+ <label>粗糙度<span class="val" id="sv_rr">0.45</span></label>
  <input type="range" id="sl_rr" min="0.05" max="1.0" step="0.01" value="0.45">
- <label>各向异性 <span class="val" id="sv_an">0.30</span></label>
+ <label>各向异性<span class="val" id="sv_an">0.30</span></label>
  <input type="range" id="sl_an" min="0.0" max="0.8" step="0.01" value="0.30">
  <label>表面抬升 <span class="val" id="sv_rso">0.004</span></label>
- <input type="range" id="sl_rso" min="0.0" max="0.02" step="0.001" value="0.004">
+ <input type="range" id="sl_rso" min="0.0" max="0.10" step="0.001" value="0.004">
  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px;">
   <input type="checkbox" id="cb_target" checked style="accent-color:#ff44cc;width:16px;height:16px;">
   🟢 显示目标周长参考线
  </label>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="cb_vol" checked style="accent-color:#44aaff;width:16px;height:16px;">
+  📊 读回体积保持率 (HUD)
+ </label>
 
  <h3>💡 光照</h3>
- <label>环境光强度 <span class="val" id="sv_ai">0.50</span></label>
+ <label>环境光强度<span class="val" id="sv_ai">0.50</span></label>
  <input type="range" id="sl_ai" min="0" max="3.0" step="0.01" value="0.50">
- <label>平行光强度 <span class="val" id="sv_di">1.50</span></label>
+ <label>平行光强度<span class="val" id="sv_di">1.50</span></label>
  <input type="range" id="sl_di" min="0" max="5.0" step="0.01" value="1.50">
  <div class="row"><span>平行光X</span><input type="range" id="sl_dx" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dx">0</span></div>
  <div class="row"><span>平行光Y</span><input type="range" id="sl_dy" min="-10" max="10" step="0.1" value="5"><span class="val" id="sv_dy">5</span></div>
@@ -104,12 +109,12 @@ canvas { display:block; cursor:crosshair; }
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-// ═══════ DOM ═══════
+// ══════.?DOM ══════.?
 const $=id=>document.getElementById(id);
 const H={
   fps:$('fps'),framems:$('framems'),vcount:$('vcount'),hcount:$('hcount'),
   bcount:$('bcount'),vratio:$('vratio'),cratio:$('cratio'),
-  pbditer:$('pbditer'),pbdtime:$('pbdtime'),
+  pbditer:$('pbditer'),pbdtime:$('pbdtime'),bandtime:$('bandtime'),
 };
 const canvas=$('canvas');
 
@@ -117,11 +122,11 @@ const canvas=$('canvas');
 if(!navigator.gpu){alert('需要WebGPU！Chrome 113+');throw new Error('No WebGPU');}
 let adapter=null;for(let i=0;i<3&&!adapter;i++){adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!adapter&&i<2)await new Promise(r=>setTimeout(r,500));}
 if(!adapter){alert('无法获取GPU适配器');throw new Error('No adapter');}
-const device=await adapter.requestDevice();
+const device=await adapter.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:10}});
 device.addEventListener('uncapturederror',ev=>console.error('GPU error:',ev.error));
 const queue=device.queue;
 
-// ═══════ Three.js WebGPU Renderer ═══════
+// ══════.?Three.js WebGPU Renderer ══════.?
 const renderer = new THREE.WebGPURenderer({ canvas, device, antialias: true, alpha: false, depth: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -145,7 +150,7 @@ const envMap = pmremGenerator.fromScene(scene, 0.5).texture;
 scene.environment = envMap;
 pmremGenerator.dispose();
 
-// ═══════ State ═══════
+// ══════.?State ══════.?
 let proxyVertexCount=0, proxyTriCount=0, restVolume=0, restSurfaceArea=0;
 let proxyRestPositions=null;     // CPU: proxy rest positions (flat float32)
 let proxyCurPositions=null;      // CPU: proxy current positions (for CPU PBD)
@@ -203,11 +208,11 @@ function rebuildAllRibbonVisuals(){
   // Rebuild ribbon geometry with new width/thickness/offset (per-vertex stack auto-computed)
   for(let i=0;i<bands.length;i++)updateBandVisual(i);
 }
-$('sl_rw').oninput=e=>{RIBBON_HALF_WIDTH=+e.target.value;$('sv_rw').textContent=RIBBON_HALF_WIDTH.toFixed(3);console.log('🔧 带宽→'+RIBBON_HALF_WIDTH.toFixed(3));rebuildAllRibbonVisuals();};
-$('sl_rt').oninput=e=>{RIBBON_THICKNESS=+e.target.value;$('sv_rt').textContent=RIBBON_THICKNESS.toFixed(3);rebuildAllRibbonVisuals();};
+$('sl_rw').oninput=e=>{RIBBON_HALF_WIDTH=+e.target.value;$('sv_rw').textContent=RIBBON_HALF_WIDTH.toFixed(3);markPbdDirty();};
+$('sl_rt').oninput=e=>{RIBBON_THICKNESS=+e.target.value;$('sv_rt').textContent=RIBBON_THICKNESS.toFixed(3);markPbdDirty();};
 $('sl_rr').oninput=e=>{RIBBON_ROUGHNESS=+e.target.value;$('sv_rr').textContent=RIBBON_ROUGHNESS.toFixed(2);updateAllRibbonMaterials();};
 $('sl_an').oninput=e=>{RIBBON_ANISOTROPY=+e.target.value;$('sv_an').textContent=RIBBON_ANISOTROPY.toFixed(2);updateAllRibbonMaterials();};
-$('sl_rso').oninput=e=>{RIBBON_SURFACE_OFFSET=+e.target.value;$('sv_rso').textContent=RIBBON_SURFACE_OFFSET.toFixed(3);rebuildAllRibbonVisuals();};
+$('sl_rso').oninput=e=>{RIBBON_SURFACE_OFFSET=+e.target.value;$('sv_rso').textContent=RIBBON_SURFACE_OFFSET.toFixed(3);markPbdDirty();};
 
 // Target line toggle
 let showTargetLine = true;
@@ -218,6 +223,10 @@ $('cb_target').onchange = e => {
   }
 };
 
+// Volume readback toggle
+let showVolumeReadback = true;
+$('cb_vol').onchange = e => { showVolumeReadback = e.target.checked; };
+
 // Lighting sliders
 $('sl_ai').oninput=e=>{const v=+e.target.value;ambientLight.intensity=v;$('sv_ai').textContent=v.toFixed(2);};
 $('sl_di').oninput=e=>{const v=+e.target.value;dirLight.intensity=v;$('sv_di').textContent=v.toFixed(2);};
@@ -225,14 +234,14 @@ $('sl_dx').oninput=e=>{const v=+e.target.value;dirLight.position.x=v;$('sv_dx').
 $('sl_dy').oninput=e=>{const v=+e.target.value;dirLight.position.y=v;$('sv_dy').textContent=v.toFixed(1);};
 $('sl_dz').oninput=e=>{const v=+e.target.value;dirLight.position.z=v;$('sv_dz').textContent=v.toFixed(1);};
 
-// ═══════ Band System ═══════
+// ══════.?Band System ══════.?
 const MAX_BANDS=256;
 const bands=[];
 const bandVisuals=[];  // {ribbon: THREE.Mesh, lineTarget: THREE.Line}
 
 // Ribbon parameters (world units; pineapple height ~3)
-let RIBBON_HALF_WIDTH = 0.025;     // ~2.5cm half-width → 5cm total band width (clearly visible)
-let RIBBON_THICKNESS  = 0.006;     // ~6mm thin thickness
+let RIBBON_HALF_WIDTH = 0.025;     // ~2.5cm half-width ?5cm total band width (clearly visible)
+let RIBBON_THICKNESS  = 0.015;     // ~15mm visible thickness
 let RIBBON_SURFACE_OFFSET = 0.004; // ~4mm lift above surface to avoid z-fight
 let RIBBON_ROUGHNESS = 0.45;       // PBR roughness
 let RIBBON_ANISOTROPY = 0.30;    // anisotropic stretch (0=round, 1=line)
@@ -263,7 +272,7 @@ function updateBandLine(line,points3D){
   line.geometry.setDrawRange(0,nPts+1);
 }
 
-// ── Ribbon mesh (PBR: copy proxy triangles in band → offset for thickness) ──
+// ── Ribbon mesh (PBR: copy proxy triangles in band .?offset for thickness) ──
 
 // Compute smooth vertex normals from current positions (on the fly)
 function computeSmoothNormals(posArr,idxArr,vc){
@@ -293,21 +302,29 @@ function computeSmoothNormals(posArr,idxArr,vc){
 function createBandRibbonMesh(bandIndex){
   const geo=new THREE.BufferGeometry();
   const MAX_VERTS=2048*36;
-  geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3));
-  geo.setAttribute('normal',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3));
-  geo.setAttribute('uv',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*2),2));
-  geo.setAttribute('tangent',new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*4),4));
+  const posAttr=new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3);
+  const normAttr=new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*3),3);
+  const uvAttr=new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*2),2);
+  const tanAttr=new THREE.Float32BufferAttribute(new Float32Array(MAX_VERTS*4),4);
+  // Force GPU buffer allocation on first render (even when invisible)
+  posAttr.needsUpdate=true; normAttr.needsUpdate=true; uvAttr.needsUpdate=true; tanAttr.needsUpdate=true;
+  geo.setAttribute('position',posAttr);
+  geo.setAttribute('normal',normAttr);
+  geo.setAttribute('uv',uvAttr);
+  geo.setAttribute('tangent',tanAttr);
   geo.setDrawRange(0,0);
   const mat=new THREE.MeshPhysicalMaterial({
     color:'#d4a017',roughness:RIBBON_ROUGHNESS,metalness:0.0,
     anisotropy:RIBBON_ANISOTROPY,anisotropyRotation:Math.PI/2,
     side:THREE.DoubleSide,depthTest:true,depthWrite:true,
-    polygonOffset:true, polygonOffsetFactor:bandIndex*0.5, polygonOffsetUnits:bandIndex*1.0,
+    polygonOffset:true, polygonOffsetFactor:1.0, polygonOffsetUnits:1.0,
   });
   const mesh=new THREE.Mesh(geo,mat);
-  mesh.renderOrder=bandIndex;mesh.frustumCulled=false;mesh.visible=false;
+  mesh.renderOrder=bandIndex+1;mesh.frustumCulled=false;mesh.visible=false;
   mesh.castShadow=true;mesh.receiveShadow=false;
-  scene.add(mesh);return mesh;
+  scene.add(mesh);
+
+  return mesh;
 }
 
 function updateBandRibbonMesh(mesh, band, bandIndex){
@@ -424,14 +441,14 @@ function updateBandRibbonMesh(mesh, band, bandIndex){
       const ni0=rn(i0x,i0y,i0z),ni1=rn(i1x,i1y,i1z);
       const ni0j=rn(i0jx,i0jy,i0jz),ni1j=rn(i1jx,i1jy,i1jz);
       const v0=f0, v1=f1;
-      // Outer face — winding flips, so write inward, becomes outward
+      // Outer face .?winding flips, so write inward, becomes outward
       _v(o0x,o0y,o0z, -no0[0],-no0[1],-no0[2], u,v0);
       _v(o1x,o1y,o1z, -no1[0],-no1[1],-no1[2], u,v1);
       _v(o1jx,o1jy,o1jz, -no1j[0],-no1j[1],-no1j[2], uj,v1);
       _v(o0x,o0y,o0z, -no0[0],-no0[1],-no0[2], u,v0);
       _v(o1jx,o1jy,o1jz, -no1j[0],-no1j[1],-no1j[2], uj,v1);
       _v(o0jx,o0jy,o0jz, -no0j[0],-no0j[1],-no0j[2], uj,v0);
-      // Inner face — winding flips, so write outward, becomes inward
+      // Inner face .?winding flips, so write outward, becomes inward
       _v(i0x,i0y,i0z, ni0[0],ni0[1],ni0[2], u,v0);
       _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
       _v(i1x,i1y,i1z, ni1[0],ni1[1],ni1[2], u,v1);
@@ -440,7 +457,7 @@ function updateBandRibbonMesh(mesh, band, bandIndex){
       _v(i1jx,i1jy,i1jz, ni1j[0],ni1j[1],ni1j[2], uj,v1);
       // Side walls: normal = ± band plane normal
       if(w===0){
-        // Left wall — winding flips, write +n to become -n
+        // Left wall .?winding flips, write +n to become -n
         _v(i0x,i0y,i0z, n[0],n[1],n[2], u,0.5);
         _v(o0x,o0y,o0z, n[0],n[1],n[2], u,0.5);
         _v(o0jx,o0jy,o0jz, n[0],n[1],n[2], uj,0.5);
@@ -449,7 +466,7 @@ function updateBandRibbonMesh(mesh, band, bandIndex){
         _v(i0jx,i0jy,i0jz, n[0],n[1],n[2], uj,0.5);
       }
       if(w===W-1){
-        // Right wall — winding flips, write -n to become +n
+        // Right wall .?winding flips, write -n to become +n
         _v(i1x,i1y,i1z, -n[0],-n[1],-n[2], u,0.5);
         _v(i1jx,i1jy,i1jz, -n[0],-n[1],-n[2], uj,0.5);
         _v(o1x,o1y,o1z, -n[0],-n[1],-n[2], u,0.5);
@@ -481,7 +498,51 @@ function updateBandRibbonMesh(mesh, band, bandIndex){
   mesh.visible=true;
 }
 
-// ═══════ Exact triangle-plane cross-section polyline (CPU) ═══════
+// Variant with pre-computed per-vertex offLo/offHi arrays (from GPU bandStackCS)
+function updateBandRibbonMesh_offsets(mesh, band, bandIndex, offLoArr, offHiArr){
+  const n=band.planeNormal, o=band.planeOrigin, hw=RIBBON_HALF_WIDTH;
+  let cx=0,cy=0,cz=0;for(let i=0;i<proxyVertexCount;i++){const i3=i*3;cx+=proxyCurPositions[i3];cy+=proxyCurPositions[i3+1];cz+=proxyCurPositions[i3+2];}
+  cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+  const outerPos=new Float32Array(proxyVertexCount*3),innerPos=new Float32Array(proxyVertexCount*3);
+  for(let i=0;i<proxyVertexCount;i++){const i3=i*3,px=proxyCurPositions[i3],py=proxyCurPositions[i3+1],pz=proxyCurPositions[i3+2];let nx=px-cx,ny=py-cy,nz=pz-cz;const nl=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;nx/=nl;ny/=nl;nz/=nl;outerPos[i3]=px+nx*offHiArr[i];outerPos[i3+1]=py+ny*offHiArr[i];outerPos[i3+2]=pz+nz*offHiArr[i];innerPos[i3]=px+nx*offLoArr[i];innerPos[i3+1]=py+ny*offLoArr[i];innerPos[i3+2]=pz+nz*offLoArr[i];}
+  const oL=getExactCrossSectionPolyline(outerPos,proxyIdxArr,[o[0]-n[0]*hw,o[1]-n[1]*hw,o[2]-n[2]*hw],n);
+  const oR=getExactCrossSectionPolyline(outerPos,proxyIdxArr,[o[0]+n[0]*hw,o[1]+n[1]*hw,o[2]+n[2]*hw],n);
+  const iL=getExactCrossSectionPolyline(innerPos,proxyIdxArr,[o[0]-n[0]*hw,o[1]-n[1]*hw,o[2]-n[2]*hw],n);
+  const iR=getExactCrossSectionPolyline(innerPos,proxyIdxArr,[o[0]+n[0]*hw,o[1]+n[1]*hw,o[2]+n[2]*hw],n);
+  if(oL.points3D.length<9||oR.points3D.length<9){mesh.visible=false;return;}
+  const resample=(pts,tN)=>{const np=pts.length/3,chords=[0];for(let i=0;i<np;i++){const j=(i+1)%np;chords.push(chords[i]+Math.hypot(pts[j*3]-pts[i*3],pts[j*3+1]-pts[i*3+1],pts[j*3+2]-pts[i*3+2]));}const total=chords[np],out=new Float32Array(tN*3);for(let k=0;k<tN;k++){const td=(k/tN)*total;let s=0;while(s<np-1&&chords[s+1]<td)s++;const sl=chords[s+1]-chords[s]||1e-9,t=(td-chords[s])/sl,sn=(s+1)%np;out[k*3]=pts[s*3]+t*(pts[sn*3]-pts[s*3]);out[k*3+1]=pts[s*3+1]+t*(pts[sn*3+1]-pts[s*3+1]);out[k*3+2]=pts[s*3+2]+t*(pts[sn*3+2]-pts[s*3+2]);}return out;};
+  const N=Math.max(64,Math.min(512,Math.floor((oL.points3D.length+oR.points3D.length)/6)));
+  const rOL=resample(oL.points3D,N),rOR=resample(oR.points3D,N),rIL=resample(iL.points3D,N),rIR=resample(iR.points3D,N);
+  const W=RIBBON_WIDTH_SEGMENTS,totalVerts=N*(W*12+12),needed=totalVerts*3;
+  let pa=mesh.geometry.attributes.position.array,na=mesh.geometry.attributes.normal.array,ua=mesh.geometry.attributes.uv.array,ta=mesh.geometry.attributes.tangent.array;
+  if(needed>pa.length){const ns=needed*2;pa=new Float32Array(ns);na=new Float32Array(ns);ua=new Float32Array(ns/3*2);ta=new Float32Array(ns/3*4);mesh.geometry.setAttribute('position',new THREE.Float32BufferAttribute(pa,3));mesh.geometry.setAttribute('normal',new THREE.Float32BufferAttribute(na,3));mesh.geometry.setAttribute('uv',new THREE.Float32BufferAttribute(ua,2));mesh.geometry.setAttribute('tangent',new THREE.Float32BufferAttribute(ta,4));}
+  let vi=0;
+  const smT=(x,y,z)=>{const rx=x-cx,ry=y-cy,rz=z-cz,rl=Math.hypot(rx,ry,rz)||1,rnx=rx/rl,rny=ry/rl,rnz=rz/rl;let tx,ty,tz;if(Math.abs(rny)>0.999){tx=0;ty=-rnz;tz=rny;}else{tx=rnz;ty=0;tz=-rnx;}const tl=Math.hypot(tx,ty,tz)||1;return[tx/tl,ty/tl,tz/tl];};
+  const _v=(x,y,z,nx,ny,nz,u,v)=>{const i3=vi*3;pa[i3]=x;pa[i3+1]=y;pa[i3+2]=z;na[i3]=nx;na[i3+1]=ny;na[i3+2]=nz;ua[vi*2]=u;ua[vi*2+1]=v;const[tTx,tTy,tTz]=smT(x,y,z);ta[vi*4]=tTx;ta[vi*4+1]=tTy;ta[vi*4+2]=tTz;ta[vi*4+3]=1;vi++;};
+  const rn=(x,y,z)=>{let nx=x-cx,ny=y-cy,nz=z-cz;const l=Math.hypot(nx,ny,nz)||1;return[nx/l,ny/l,nz/l];};
+  const l3=(a,i3,b,j3,t)=>[a[i3]+t*(b[j3]-a[i3]),a[i3+1]+t*(b[j3+1]-a[i3+1]),a[i3+2]+t*(b[j3+2]-a[i3+2])];
+  for(let i=0;i<N;i++){const j=(i+1)%N,i3=i*3,j3=j*3,u=i/N,uj=j/N;
+    for(let w=0;w<W;w++){const f0=w/W,f1=(w+1)/W;
+      const[o0x,o0y,o0z]=l3(rOL,i3,rOR,i3,f0);const[o1x,o1y,o1z]=l3(rOL,i3,rOR,i3,f1);
+      const[o0jx,o0jy,o0jz]=l3(rOL,j3,rOR,j3,f0);const[o1jx,o1jy,o1jz]=l3(rOL,j3,rOR,j3,f1);
+      const[i0x,i0y,i0z]=l3(rIL,i3,rIR,i3,f0);const[i1x,i1y,i1z]=l3(rIL,i3,rIR,i3,f1);
+      const[i0jx,i0jy,i0jz]=l3(rIL,j3,rIR,j3,f0);const[i1jx,i1jy,i1jz]=l3(rIL,j3,rIR,j3,f1);
+      const no0=rn(o0x,o0y,o0z),no1=rn(o1x,o1y,o1z),no0j=rn(o0jx,o0jy,o0jz),no1j=rn(o1jx,o1jy,o1jz);
+      const ni0=rn(i0x,i0y,i0z),ni1=rn(i1x,i1y,i1z),ni0j=rn(i0jx,i0jy,i0jz),ni1j=rn(i1jx,i1jy,i1jz);
+      _v(o0x,o0y,o0z,-no0[0],-no0[1],-no0[2],u,f0);_v(o1x,o1y,o1z,-no1[0],-no1[1],-no1[2],u,f1);
+      _v(o1jx,o1jy,o1jz,-no1j[0],-no1j[1],-no1j[2],uj,f1);_v(o0x,o0y,o0z,-no0[0],-no0[1],-no0[2],u,f0);
+      _v(o1jx,o1jy,o1jz,-no1j[0],-no1j[1],-no1j[2],uj,f1);_v(o0jx,o0jy,o0jz,-no0j[0],-no0j[1],-no0j[2],uj,f0);
+      _v(i0x,i0y,i0z,ni0[0],ni0[1],ni0[2],u,f0);_v(i1jx,i1jy,i1jz,ni1j[0],ni1j[1],ni1j[2],uj,f1);
+      _v(i1x,i1y,i1z,ni1[0],ni1[1],ni1[2],u,f1);_v(i0x,i0y,i0z,ni0[0],ni0[1],ni0[2],u,f0);
+      _v(i0jx,i0jy,i0jz,ni0j[0],ni0j[1],ni0j[2],uj,f0);_v(i1jx,i1jy,i1jz,ni1j[0],ni1j[1],ni1j[2],uj,f1);
+      if(w===0){_v(i0x,i0y,i0z,n[0],n[1],n[2],u,0.5);_v(o0x,o0y,o0z,n[0],n[1],n[2],u,0.5);_v(o0jx,o0jy,o0jz,n[0],n[1],n[2],uj,0.5);_v(i0x,i0y,i0z,n[0],n[1],n[2],u,0.5);_v(o0jx,o0jy,o0jz,n[0],n[1],n[2],uj,0.5);_v(i0jx,i0jy,i0jz,n[0],n[1],n[2],uj,0.5);}
+      if(w===W-1){_v(i1x,i1y,i1z,-n[0],-n[1],-n[2],u,0.5);_v(i1jx,i1jy,i1jz,-n[0],-n[1],-n[2],uj,0.5);_v(o1x,o1y,o1z,-n[0],-n[1],-n[2],u,0.5);_v(o1x,o1y,o1z,-n[0],-n[1],-n[2],u,0.5);_v(i1jx,i1jy,i1jz,-n[0],-n[1],-n[2],uj,0.5);_v(o1jx,o1jy,o1jz,-n[0],-n[1],-n[2],uj,0.5);}
+    }
+  }
+  mesh.geometry.attributes.position.needsUpdate=true;mesh.geometry.attributes.normal.needsUpdate=true;
+  mesh.geometry.attributes.uv.needsUpdate=true;mesh.geometry.attributes.tangent.needsUpdate=true;
+  mesh.geometry.setDrawRange(0,vi);mesh.visible=true;
+}
 function getExactCrossSectionPolyline(posArr,idxArr,origin,normal){
   const EPS=1e-7;const pts=[];
   for(let t=0;t<idxArr.length;t+=3){
@@ -553,7 +614,7 @@ function getExactCrossSectionPolyline(posArr,idxArr,origin,normal){
 
 function smoothstep(e0,e1,x){const t=Math.max(0,Math.min(1,(x-e0)/(e1-e0)));return t*t*(3-2*t);}
 
-// ═══════ Band overlap & stacking helpers (Level 3b: per-vertex local compression) ═══════
+// ══════.?Band overlap & stacking helpers (Level 3b: per-vertex local compression) ══════.?
 const BAND_COMPRESSION_PER_LAYER = 0.30; // 30% thickness reduction per pressing band above
 
 // Test if a 3D point lies within a band's belt (perpendicular distance < half-width * 2.5)
@@ -576,7 +637,7 @@ function computePerVertexOffsets(bandIndex) {
   const offHiArr = new Float32Array(vc);
   const bc = bands.length;
   if (bc <= 1) {
-    // Only one band — uniform offset
+    // Only one band .?uniform offset
     offLoArr.fill(RIBBON_SURFACE_OFFSET);
     offHiArr.fill(RIBBON_SURFACE_OFFSET + RIBBON_THICKNESS);
     return {offLo: offLoArr, offHi: offHiArr};
@@ -641,7 +702,7 @@ function computePerVertexOffsets(bandIndex) {
   return {offLo: offLoArr, offHi: offHiArr};
 }
 
-// ═══════ Band add/remove ═══════
+// ══════.?Band add/remove ══════.?
 // Precompute 64 angle-bin rest radii + preScale for radius-based constraint
 function computeBandRestRadii(origin,normal,restPos,restIdx){
   const exact=getExactCrossSectionPolyline(restPos,restIdx,origin,normal);
@@ -686,7 +747,7 @@ function computeBandRestRadii(origin,normal,restPos,restIdx){
     perim+=Math.sqrt(r1*r1+r2*r2-2*r1*r2*Math.cos(da));
   }
   const preScale=exact.perimeter>0?BAND_REST_CIRCUM/exact.perimeter:1.0;
-  console.log('📏 band precompute: exactPerimeter='+exact.perimeter.toFixed(3)+' binPerim='+perim.toFixed(3)+' L₀='+BAND_REST_CIRCUM.toFixed(3)+' preScale='+preScale.toFixed(4)+' radii range=['+Math.min(...radii).toFixed(3)+','+Math.max(...radii).toFixed(3)+']');
+  console.log('📏 band precompute: exactPerimeter='+exact.perimeter.toFixed(3)+' binPerim='+perim.toFixed(3)+' L₀='+BAND_REST_CIRCUM.toFixed(3)+' preScale='+preScale.toFixed(4)+' radii range=['+Math.min(...radii).toFixed(3)+','+Math.max(...radii).toFixed(3)+'] @'+performance.now().toFixed(0)+'ms');
   return{radii,centroid:[cx,cy,cz],preScale,restPerimeter:exact.perimeter};
 }
 
@@ -715,13 +776,24 @@ function addBand(origin,normal){
   };
   bands.push(band);
   writeBandRestRadii(bands.length-1,pre.radii);
+  const tMesh0=performance.now();
   const visRibbon=createBandRibbonMesh(bands.length-1);
   const visTarget=makeBandLine('#33ff33',0.35);
+  const tMesh1=performance.now();
+  console.log('  ↳ mesh+line creation: '+(tMesh1-tMesh0).toFixed(1)+'ms (total bands='+bands.length+') @'+tMesh1.toFixed(0)+'ms');
   visTarget.visible = showTargetLine;
   bandVisuals.push({ribbon:visRibbon,lineTarget:visTarget});
   H.bcount.textContent=bands.length;
   updateLastBandPanel(bands.length-1);
+  _lastBandAddTime=performance.now(); // timestamp BEFORE markPbdDirty for accurate gap
   markPbdDirty();
+  // Double-rAF: measure true latency from addBand to screen update
+  const addTime=_lastBandAddTime;
+  requestAnimationFrame(()=>{
+    requestAnimationFrame(()=>{
+      console.log('⏱️ addBand→screen latency: '+(performance.now()-addTime).toFixed(0)+'ms (double rAF) @'+performance.now().toFixed(0)+'ms');
+    });
+  });
 }
 function removeBand(){
   if(bands.length===0)return;
@@ -733,16 +805,17 @@ function removeBand(){
   }
   H.bcount.textContent=bands.length;
   needsRestore=true;markPbdDirty();
+  _lastBandAddTime=performance.now();
   if(bands.length>0)updateLastBandPanel(bands.length-1);
-  else{$('lb_info').textContent='(空)';}
+  else{$('lb_info').textContent='(none)';}
 }
 function removeAllBands(){
   while(bands.length>0)removeBand();
 }
 
-// ═══════ Last band panel ═══════
+// ══════.?Last band panel ══════.?
 function updateLastBandPanel(idx){
-  if(idx<0||idx>=bands.length){$('lb_info').textContent='(空)';return;}
+  if(idx<0||idx>=bands.length){$('lb_info').textContent='(none)';return;}
   const b=bands[idx];
   $('lb_info').textContent='#'+(idx+1);
   $('sl_lr').value=b.restCircum;$('sv_lr').textContent=b.restCircum.toFixed(3);
@@ -788,7 +861,7 @@ $('btn_horiz').onclick=()=>{
   updateLastBandPanel(bands.length-1);markPbdDirty();
 };
 
-// ═══════ Model Loading (dual: proxy + high-res) ═══════
+// ══════.?Model Loading (dual: proxy + high-res) ══════.?
 let loaded=false;
 
 async function loadModel(name, doProcess, refTransform=null){
@@ -824,7 +897,7 @@ async function loadModel(name, doProcess, refTransform=null){
 async function loadModels(){
   // Load proxy (small mesh for PBD)
   const proxyResult=await loadModel('pineapple_py.glb?t='+Date.now(), true);
-  // Load high-res (display mesh) — use proxy's transform for alignment
+  // Load high-res (display mesh) .?use proxy's transform for alignment
   const hr=await loadModel('pineapple.glb', false, proxyResult.transform);
   const srcGeo=hr.srcGeo;const hrPos=hr.pos;const hrIdx=hr.idxArr;
   const srcMesh=hr.srcMesh;
@@ -874,7 +947,7 @@ async function loadModels(){
   lastVol=restVolume;
   H.vcount.textContent=proxyVertexCount.toLocaleString();
   H.vratio.textContent='100.0';
-  console.log('📦 代理模型:',proxyVertexCount.toLocaleString(),'顶点,',Math.round(proxyTriCount).toLocaleString(),'三角形');
+  console.log('Proxy model:',proxyVertexCount.toLocaleString(),'verts,',Math.round(proxyTriCount).toLocaleString(),'tris');
   console.log('   restVolume:',restVolume.toFixed(4),'restSurfaceArea:',restSurfaceArea.toFixed(2));
 
   // ── High-res setup ──
@@ -900,7 +973,7 @@ async function loadModels(){
   // ── CPU nearest-proxy with spatial hash ──
   nearestProxyIdx=new Uint32Array(highResCount);
   const tHash=performance.now();
-  // Build 3D spatial hash grid for proxy vertices — make global for fast projection
+  // Build 3D spatial hash grid for proxy vertices .?make global for fast projection
   _hashGrid=24;
   _hashBmin=[Infinity,Infinity,Infinity];const _hbmax=[-Infinity,-Infinity,-Infinity];
   for(let i=0;i<proxyVertexCount;i++){
@@ -1002,7 +1075,7 @@ async function loadModels(){
     bigWire.renderOrder=998;
     bigWire.name='enlargedProxyWire';
     scene.add(bigWire);
-    console.log('🔵 青色线框 = 每个顶点沿质心方向推0.3单位，质心=('+cx.toFixed(2)+','+cy.toFixed(2)+','+cz.toFixed(2)+')');
+    console.log('🔵 青色线框 = 每个顶点沿质心方向推0.3单位，centroid:('+cx.toFixed(2)+','+cy.toFixed(2)+','+cz.toFixed(2)+')');
   }
 
   // Toggle wire button
@@ -1011,31 +1084,31 @@ async function loadModels(){
   btnWire.onclick=()=>{showProxyWire=!showProxyWire;proxyWireMesh.visible=showProxyWire;btnWire.textContent='🔍 代理线框: '+(showProxyWire?'ON':'OFF');};
   $('panel').appendChild(btnWire);
 
-  console.log('🖼️ 高模:',highResCount.toLocaleString(),'顶点, 代理:',proxyVertexCount.toLocaleString(),'顶点');
+  console.log('Hi-res:',highResCount.toLocaleString(),'顶点, 代理:',proxyVertexCount.toLocaleString(),'顶点');
   // Diagnostic: check high-res rest normals (should be outward)
   {let inCnt=0;for(let i=0;i<Math.min(highResCount,1000);i++){
     const px=hrPos[i*3],py=hrPos[i*3+1],pz=hrPos[i*3+2];
     const nx=highResRestNormals[i*3],ny=highResRestNormals[i*3+1],nz=highResRestNormals[i*3+2];
     if(px*nx+py*ny+pz*nz<0)inCnt++;
   }console.log('🔍 高模法线朝内比例:',(inCnt/Math.min(highResCount,1000)*100).toFixed(1),'% (应为0%)');}
-  console.log('� delta字段Y范围:',modelMinY.toFixed(3),'~',modelMaxY.toFixed(3));
+  console.log('Delta Y range:',modelMinY.toFixed(3),'~',modelMaxY.toFixed(3));
 
   await initGPU();
   loaded=true;
 }
 loadModels().catch(e=>console.error('加载失败:',e));
 
-// ═══════ Utility ═══════
+// ══════.?Utility ══════.?
 function mkBuf(size,usage,label){return device.createBuffer({size,usage,label});}
 
-// ═══════ WGSL Compute Shaders ═══════
+// ══════.?WGSL Compute Shaders ══════.?
 const shapeCS=device.createShaderModule({label:'shape',code:`
 struct P{stiffness:f32,vc:u32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
 @group(0)@binding(3)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   let cur=src[i];let r=rest[i];let d=r.xyz-cur.xyz;
   dst[i]=vec4(cur.xyz+d*p.stiffness,1.0);
@@ -1048,7 +1121,7 @@ struct P{tc:u32}
 @group(0)@binding(1)var<storage,read>indices:array<u32>;
 @group(0)@binding(2)var<storage,read_write>volOut:array<f32>;
 @group(0)@binding(3)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let t=gid.x;if(t>=p.tc){return;}
   let i0=indices[t*3u];let i1=indices[t*3u+1u];let i2=indices[t*3u+2u];
   let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
@@ -1075,7 +1148,7 @@ struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read>volTotal:array<f32>;
 @group(0)@binding(3)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   let cur=src[i];
   let r=length(cur.xyz);
@@ -1102,7 +1175,7 @@ struct P{vc:u32,grid:u32,bminX:f32,bminY:f32,bminZ:f32,gsX:f32,gsY:f32,gsZ:f32}
 @group(0)@binding(4)var<storage,read_write>voxDz:array<atomic<i32>>;
 @group(0)@binding(5)var<storage,read_write>voxW:array<atomic<u32>>;
 @group(0)@binding(6)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   let disp=cur[i].xyz-rest[i].xyz;
   let rp=rest[i].xyz;
@@ -1151,7 +1224,7 @@ struct P{grid:u32}
 @group(0)@binding(3)var<storage,read>voxW:array<u32>;
 @group(0)@binding(4)var<storage,read_write>voxOut:array<vec4<f32>>;
 @group(0)@binding(5)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;let total=p.grid*p.grid*p.grid;if(i>=total){return;}
   let w=f32(voxW[i])/FIXED_SCALE;
   if(w>0.001){
@@ -1169,7 +1242,7 @@ struct P{vc:u32,grid:u32,bminX:f32,bminY:f32,bminZ:f32,gsX:f32,gsY:f32,gsZ:f32}
 @group(0)@binding(1)var<storage,read>voxOut:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read_write>outPos:array<vec4<f32>>;
 @group(0)@binding(3)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   let rp=restPos[i].xyz;
   let vx=(rp.x-p.bminX)/p.gsX-0.5;let vy=(rp.y-p.bminY)/p.gsY-0.5;let vz=(rp.z-p.bminZ)/p.gsZ-0.5;
@@ -1197,7 +1270,7 @@ struct P{grid:u32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
 @group(0)@binding(2)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;let g=p.grid;let total=g*g*g;if(i>=total){return;}
   let sv=src[i];
   if(sv.w>0.001){
@@ -1224,7 +1297,7 @@ struct P{proxyCount:u32,hrCount:u32}
 @group(0)@binding(1)var<storage,read>hrPos:array<vec4<f32>>;
 @group(0)@binding(2)var<storage,read_write>nearest:array<u32>;
 @group(0)@binding(3)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let hi=gid.x;if(hi>=p.hrCount){return;}
   let hp=hrPos[hi].xyz;
   var bestDist=1.0e30;var bestIdx=0u;
@@ -1297,7 +1370,7 @@ fn addBinPoint(px:f32,py:f32,pz:f32,Gx:f32,Gy:f32,Gz:f32,ux:f32,uy:f32,uz:f32,vx
   atomicAdd(&binC[b*64u+binIdx],1u);
 }
 
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let ti=gid.x;if(ti>=p.triCount){return;}
   let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
   let v0=pos[i0].xyz;let v1=pos[i1].xyz;let v2=pos[i2].xyz;
@@ -1344,48 +1417,6 @@ fn addBinPoint(px:f32,py:f32,pz:f32,Gx:f32,Gy:f32,Gz:f32,ux:f32,uy:f32,uz:f32,vx
 }
 `});
 
-// Phase A3: reduce bins → scale for ALL bands (bc workgroups of 64 threads)
-const bandPerimReduceAllCS=device.createShaderModule({label:'bandPerimReduceAll',code:`
-struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
-struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
-struct P{triCount:u32,bc:u32}
-@group(0)@binding(0)var<storage,read>binR:array<u32>;
-@group(0)@binding(1)var<storage,read>binC:array<u32>;
-@group(0)@binding(2)var<storage,read>params:array<BandParam>;
-@group(0)@binding(3)var<storage,read_write>state:array<BandState>;
-@group(0)@binding(4)var<uniform>p:P;
-var<workgroup>sR:array<f32,64>;
-@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
-  let b=wg.x;if(b>=p.bc){return;}
-  let off=b*64u+lid.x;
-  let cnt=binC[off];
-  let r=select(0.0,f32(binR[off])/1048576.0/f32(cnt),cnt>0u);
-  sR[lid.x]=r;
-  workgroupBarrier();
-  if(lid.x==0u){
-    var firstI=64u;var prevR=0.0;var prevI=64u;
-    for(var i=0u;i<64u;i++){if(sR[i]>0.0){firstI=i;prevR=sR[i];prevI=i;break;}}
-    var perim=0.0;
-    if(firstI<64u){
-      for(var i=firstI+1u;i<64u;i++){
-        if(sR[i]>0.0){
-          let da=6.28318531*f32(i-prevI)/64.0;
-          perim+=sqrt(prevR*prevR+sR[i]*sR[i]-2.0*prevR*sR[i]*cos(da));
-          prevR=sR[i];prevI=i;
-        }
-      }
-      let da=6.28318531*f32(64u+firstI-prevI)/64.0;
-      let firstR=sR[firstI];
-      perim+=sqrt(prevR*prevR+firstR*firstR-2.0*prevR*firstR*cos(da));
-    }
-    let param=params[b];
-    let sc=select(1.0,param.rest_circum/max(perim,0.001),perim>param.rest_circum);
-    let old=state[b];
-    state[b]=BandState(old.gx,old.gy,old.gz,sc);
-  }
-}
-`});
-
 // Phase B: apply ALL bands per vertex with internal GS loop (radius-based, REST centroid)
 const bandApplyRadiusCS=device.createShaderModule({label:'bandApplyRadius',code:`
 struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32,preScale:f32,rest_cx:f32,rest_cy:f32,rest_cz:f32}
@@ -1395,7 +1426,7 @@ struct P{vc:u32,bc:u32}
 @group(0)@binding(2)var<storage,read>params:array<BandParam>;
 @group(0)@binding(3)var<storage,read>radii:array<f32>;
 @group(0)@binding(4)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   var cur=src[i];
   for(var b=0u;b<256u;b++){
@@ -1440,61 +1471,9 @@ struct P{total:u32}
 @group(0)@binding(0)var<storage,read_write>binR:array<u32>;
 @group(0)@binding(1)var<storage,read_write>binC:array<u32>;
 @group(0)@binding(2)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.total){return;}
   binR[i]=0u;binC[i]=0u;
-}
-`});
-
-// Pass 4 (post-PBD): generate 3D polyline points from angle bins for band visualization
-const bandVisCS=device.createShaderModule({label:'bandVis',code:`
-struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
-struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
-struct P{bc:u32}
-@group(0)@binding(0)var<storage,read>binR:array<u32>;
-@group(0)@binding(1)var<storage,read>binC:array<u32>;
-@group(0)@binding(2)var<storage,read>params:array<BandParam>;
-@group(0)@binding(3)var<storage,read>state:array<BandState>;
-@group(0)@binding(4)var<storage,read_write>visPts:array<vec4<f32>>;
-@group(0)@binding(5)var<storage,read_write>visCnt:array<u32>;
-@group(0)@binding(6)var<uniform>p:P;
-var<workgroup>sFlag:array<u32,64>;
-var<workgroup>sOff:array<u32,64>;
-@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
-  let b=wg.x;if(b>=p.bc){return;}
-  let param=params[b];let st=state[b];
-  let nx=param.nx;let ny=param.ny;let nz=param.nz;
-  // Build 2D basis
-  var ux:f32;var uy:f32;var uz:f32;
-  if(abs(nx)<0.9){ux=1.0;uy=0.0;uz=0.0;}else{ux=0.0;uy=0.0;uz=1.0;}
-  let du=ux*nx+uy*ny+uz*nz;ux-=du*nx;uy-=du*ny;uz-=du*nz;
-  let ul=sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;
-  let vx=ny*uz-nz*uy;let vy=nz*ux-nx*uz;let vz=nx*uy-ny*ux;
-  // Read bin
-  let off=b*64u+lid.x;
-  let cnt=binC[off];
-  let hasPt=cnt>0u;
-  let r=select(0.0,f32(binR[off])/1048576.0/f32(cnt),hasPt);
-  let ang=6.28318531*(f32(lid.x)/64.0-0.5);
-  let ca=cos(ang);let sa=sin(ang);
-  let px=st.gx+r*(ca*ux+sa*vx);
-  let py=st.gy+r*(ca*uy+sa*vy);
-  let pz=st.gz+r*(ca*uz+sa*vz);
-  // Compact: sequential offset computation by thread 0
-  sFlag[lid.x]=select(0u,1u,hasPt);
-  workgroupBarrier();
-  if(lid.x==0u){
-    var off=0u;
-    for(var i=0u;i<64u;i++){
-      if(sFlag[i]>0u){sOff[i]=off;off++;}
-    }
-    visCnt[b]=off;
-  }
-  workgroupBarrier();
-  if(hasPt){
-    let outIdx=sOff[lid.x];
-    visPts[b*256u+outIdx]=vec4(px,py,pz,1.0);
-  }
 }
 `});
 
@@ -1521,6 +1500,288 @@ struct P{bc:u32}
 }
 `});
 
+// ══════.?GPU Band Rendering Shaders (Plan C) ══════.?
+
+// Shader C1: Per-vertex band stacking offsets
+const bandStackCS=device.createShaderModule({label:'bandStack',code:`
+struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32,preScale:f32,rest_cx:f32,rest_cy:f32,rest_cz:f32}
+struct P{bandIndex:u32,vc:u32,bc:u32,hw:f32,surfaceOff:f32,thickness:f32,compression:f32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>params:array<BandParam>;
+@group(0)@binding(2)var<storage,read_write>offLo:array<f32>;
+@group(0)@binding(3)var<storage,read_write>offHi:array<f32>;
+@group(0)@binding(4)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let v=gid.x;if(v>=p.vc){return;}
+  let P=pos[v].xyz;let bi=p.bandIndex;let tol=p.hw*2.5;
+  // Count bands above target that cover this vertex
+  var aboveCount=0u;
+  for(var k=bi+1u;k<p.bc;k++){
+    let bp=params[k];
+    let d=abs((P.x-bp.ox)*bp.nx+(P.y-bp.oy)*bp.ny+(P.z-bp.oz)*bp.nz);
+    if(d<tol){aboveCount++;}
+  }
+  let myThick=p.thickness/(1.0+f32(aboveCount)*p.compression);
+  // Stack below: sum effective thickness of bands j<bi covering this vertex
+  var stackBelow=0.0;
+  for(var j=0u;j<bi;j++){
+    let bp=params[j];
+    let d=abs((P.x-bp.ox)*bp.nx+(P.y-bp.oy)*bp.ny+(P.z-bp.oz)*bp.nz);
+    if(d<tol){
+      // Count bands above j covering this vertex (for compression)
+      var aboveJ=0u;
+      for(var k=j+1u;k<p.bc;k++){
+        let bpk=params[k];
+        let dk=abs((P.x-bpk.ox)*bpk.nx+(P.y-bpk.oy)*bpk.ny+(P.z-bpk.oz)*bpk.nz);
+        if(dk<tol){aboveJ++;}
+      }
+      stackBelow+=p.thickness/(1.0+f32(aboveJ)*p.compression);
+    }
+  }
+  offLo[v]=p.surfaceOff-myThick*0.5+stackBelow;
+  offHi[v]=p.surfaceOff+myThick*0.5+stackBelow;
+}
+`});
+
+// ═══════ GPU Ribbon Mesh Generation (3-shader pipeline) ═══════
+
+// Shader G1: Triangle-plane intersection → 4×64 angle bins (atomics)
+const bandCutBinsCS=device.createShaderModule({label:'bandCutBins',code:`
+struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32,preScale:f32,rest_cx:f32,rest_cy:f32,rest_cz:f32}
+struct P{bandIndex:u32,vc:u32,triCount:u32,hw:f32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read>offLo:array<f32>;
+@group(0)@binding(3)var<storage,read>offHi:array<f32>;
+@group(0)@binding(4)var<storage,read>params:array<BandParam>;
+@group(0)@binding(5)var<storage,read_write>binRX:array<atomic<u32>>;
+@group(0)@binding(6)var<storage,read_write>binRY:array<atomic<u32>>;
+@group(0)@binding(7)var<storage,read_write>binRZ:array<atomic<u32>>;
+@group(0)@binding(8)var<storage,read_write>binC:array<atomic<u32>>;
+@group(0)@binding(9)var<uniform>p:P;
+
+const FIXED=1048576.0;
+
+fn addToBin3D(binBase:u32,px:f32,py:f32,pz:f32,nx:f32,ny:f32,nz:f32){
+  var ux_:f32;var uy_:f32;var uz_:f32;
+  if(abs(nx)<0.9){ux_=1.0;uy_=0.0;uz_=0.0;}else{ux_=0.0;uy_=0.0;uz_=1.0;}
+  let du=ux_*nx+uy_*ny+uz_*nz;ux_-=du*nx;uy_-=du*ny;uz_-=du*nz;
+  let ul=sqrt(ux_*ux_+uy_*uy_+uz_*uz_);ux_/=ul;uy_/=ul;uz_/=ul;
+  let vx=ny*uz_-nz*uy_;let vy=nz*ux_-nx*uz_;let vz=nx*uy_-ny*ux_;
+  let rx=px-p.cx;let ry=py-p.cy;let rz=pz-p.cz;
+  let ru=rx*ux_+ry*uy_+rz*uz_;let rv=rx*vx+ry*vy+rz*vz;
+  let ang=atan2(rv,ru);
+  let bi=u32(floor((ang+3.14159265)/6.28318531*64.0))%64u;
+  atomicAdd(&binRX[binBase+bi],u32((px+4.0)*FIXED));
+  atomicAdd(&binRY[binBase+bi],u32((py+4.0)*FIXED));
+  atomicAdd(&binRZ[binBase+bi],u32((pz+4.0)*FIXED));
+  atomicAdd(&binC[binBase+bi],1u);
+}
+
+fn intersectEdge(a:vec3<f32>,b:vec3<f32>,da:f32,db:f32)->vec3<f32>{
+  let t=da/(da-db);
+  return vec3(a.x+t*(b.x-a.x),a.y+t*(b.y-a.y),a.z+t*(b.z-a.z));
+}
+
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let ti=gid.x;if(ti>=p.triCount){return;}
+  let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+  let bp=params[p.bandIndex];let nx=bp.nx;let ny=bp.ny;let nz=bp.nz;
+  let ox=bp.ox;let oy=bp.oy;let oz=bp.oz;
+  let hw=p.hw;let cx=p.cx;let cy=p.cy;let cz=p.cz;
+  // Offset vertex positions
+  let pi0=pos[i0].xyz;let pi1=pos[i1].xyz;let pi2=pos[i2].xyz;
+  let rd0=normalize(pi0-vec3(cx,cy,cz));
+  let rd1=normalize(pi1-vec3(cx,cy,cz));
+  let rd2=normalize(pi2-vec3(cx,cy,cz));
+  let oV0=pi0+rd0*offHi[i0];let oV1=pi1+rd1*offHi[i1];let oV2=pi2+rd2*offHi[i2];
+  let iV0=pi0+rd0*offLo[i0];let iV1=pi1+rd1*offLo[i1];let iV2=pi2+rd2*offLo[i2];
+  let eps=1e-7;
+  // 4 passes: outer-L, outer-R, inner-L, inner-R
+  for(var phase=0u;phase<4u;phase++){
+    var v0:vec3<f32>;var v1:vec3<f32>;var v2:vec3<f32>;var binBase:u32;
+    if(phase==0u){v0=oV0;v1=oV1;v2=oV2;binBase=0u;}
+    else if(phase==1u){v0=oV0;v1=oV1;v2=oV2;binBase=64u;}
+    else if(phase==2u){v0=iV0;v1=iV1;v2=iV2;binBase=128u;}
+    else{v0=iV0;v1=iV1;v2=iV2;binBase=192u;}
+    let sign=select(1.0,-1.0,phase==0u||phase==2u);
+    let pOx=ox+sign*nx*hw;let pOy=oy+sign*ny*hw;let pOz=oz+sign*nz*hw;
+    let d0=(v0.x-pOx)*nx+(v0.y-pOy)*ny+(v0.z-pOz)*nz;
+    let d1=(v1.x-pOx)*nx+(v1.y-pOy)*ny+(v1.z-pOz)*nz;
+    let d2=(v2.x-pOx)*nx+(v2.y-pOy)*ny+(v2.z-pOz)*nz;
+    let s0=select(0,select(1,-1,d0>eps),abs(d0)>eps);
+    let s1=select(0,select(1,-1,d1>eps),abs(d1)>eps);
+    let s2=select(0,select(1,-1,d2>eps),abs(d2)>eps);
+    if(s0==s1&&s1==s2&&s0!=0){continue;}
+    if(s0==0){addToBin3D(binBase,v0.x,v0.y,v0.z,nx,ny,nz);}
+    if(s1==0){addToBin3D(binBase,v1.x,v1.y,v1.z,nx,ny,nz);}
+    if(s2==0){addToBin3D(binBase,v2.x,v2.y,v2.z,nx,ny,nz);}
+    if((d0>eps&&d1<-eps)||(d0<-eps&&d1>eps)){let pt=intersectEdge(v0,v1,d0,d1);addToBin3D(binBase,pt.x,pt.y,pt.z,nx,ny,nz);}
+    if((d1>eps&&d2<-eps)||(d1<-eps&&d2>eps)){let pt=intersectEdge(v1,v2,d1,d2);addToBin3D(binBase,pt.x,pt.y,pt.z,nx,ny,nz);}
+    if((d2>eps&&d0<-eps)||(d2<-eps&&d0>eps)){let pt=intersectEdge(v2,v0,d2,d0);addToBin3D(binBase,pt.x,pt.y,pt.z,nx,ny,nz);}
+  }
+}
+`});
+
+// Shader G2: Bin averaging → 4×64 compact float points (1 workgroup × 64 threads)
+const bandResolveCS=device.createShaderModule({label:'bandResolve',code:`
+struct P{bandIndex:u32,ringSegs:u32}
+@group(0)@binding(0)var<storage,read>binRX:array<u32>;
+@group(0)@binding(1)var<storage,read>binRY:array<u32>;
+@group(0)@binding(2)var<storage,read>binRZ:array<u32>;
+@group(0)@binding(3)var<storage,read>binC:array<u32>;
+@group(0)@binding(4)var<storage,read_write>polyPts:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+const FIXED=1048576.0;
+const BINS=64u;
+@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  for(var poly=0u;poly<4u;poly++){
+    let base=poly*BINS+lid.x;
+    let sx=binRX[base];let sy=binRY[base];let sz=binRZ[base];let c=binC[base];
+    if(c>0u){
+      let avgX=f32(sx)/FIXED/f32(c)-4.0;
+      let avgY=f32(sy)/FIXED/f32(c)-4.0;
+      let avgZ=f32(sz)/FIXED/f32(c)-4.0;
+      polyPts[base]=vec4(avgX,avgY,avgZ,1.0);
+    }else{
+      polyPts[base]=vec4(0.0,0.0,0.0,0.0);
+    }
+  }
+}
+`});
+
+// Shader G3: Resample + build ribbon triangle mesh → direct to output buffers
+const bandBuildMeshCS=device.createShaderModule({label:'bandBuildMesh',code:`
+struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32,preScale:f32,rest_cx:f32,rest_cy:f32,rest_cz:f32}
+struct P{bandIndex:u32,ringSegs:u32,widthSegs:u32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>polyPts:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>params:array<BandParam>;
+@group(0)@binding(2)var<storage,read_write>outPos:array<f32>;
+@group(0)@binding(3)var<storage,read_write>outNorm:array<f32>;
+@group(0)@binding(4)var<storage,read_write>outUV:array<f32>;
+@group(0)@binding(5)var<storage,read_write>outTan:array<f32>;
+@group(0)@binding(6)var<uniform>p:P;
+const BINS=64u;
+var<workgroup>wsR:array<f32,256>;   // 4×64 bin validity (w component)
+var<workgroup>wsX:array<f32,1024>; // 4xN resampled coords (N<=256)
+var<workgroup>wsY:array<f32,1024>;
+var<workgroup>wsZ:array<f32,1024>;
+
+fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32,tx:f32,ty:f32,tz:f32){
+  let i3=vi*3u;outPos[i3]=x;outPos[i3+1u]=y;outPos[i3+2u]=z;
+  outNorm[i3]=nx_;outNorm[i3+1u]=ny_;outNorm[i3+2u]=nz_;
+  outUV[vi*2u]=u_;outUV[vi*2u+1u]=v_;
+  outTan[vi*4u]=tx;outTan[vi*4u+1u]=ty;outTan[vi*4u+2u]=tz;outTan[vi*4u+3u]=1.0;
+}
+
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>){
+  let bp=params[p.bandIndex];let nx=bp.nx;let ny=bp.ny;let nz=bp.nz;
+  let cx=p.cx;let cy=p.cy;let cz=p.cz;
+  var ux_:f32;var uy_:f32;var uz_:f32;
+  if(abs(nx)<0.9){ux_=1.0;uy_=0.0;uz_=0.0;}else{ux_=0.0;uy_=0.0;uz_=1.0;}
+  let du=ux_*nx+uy_*ny+uz_*nz;ux_-=du*nx;uy_-=du*ny;uz_-=du*nz;
+  let ul=sqrt(ux_*ux_+uy_*uy_+uz_*uz_);ux_/=ul;uy_/=ul;uz_/=ul;
+  let vx=ny*uz_-nz*uy_;let vy=nz*ux_-nx*uz_;let vz=nx*uy_-ny*ux_;
+  let N=p.ringSegs;let W=p.widthSegs;
+
+  // Phase 1: read polyPts → wsR (threads 0..63, 4 bins each)
+  if(lid.x<BINS){
+    for(var poly=0u;poly<4u;poly++){
+      let base=poly*BINS+lid.x;
+      wsX[base]=polyPts[base].x;wsY[base]=polyPts[base].y;wsZ[base]=polyPts[base].z;wsR[base]=polyPts[base].w;
+    }
+  }
+  workgroupBarrier();
+
+  // Phase 2: resample 64→N, fill missing bins from neighbors, then interpolate
+  for(var idx=lid.x;idx<N*4u;idx+=256u){
+    let poly=idx/N;let si=idx%N;
+    let frac=f32(si)/f32(N)*64.0;
+    let b0=u32(floor(frac))%BINS;let b1=(b0+1u)%BINS;let t=frac-f32(b0);
+    // Read directly from polyPts storage (NOT wsX — overwritten by Phase 2 output)
+    let base0=poly*BINS+b0;let base1=poly*BINS+b1;
+    let pt0=polyPts[base0];let pt1=polyPts[base1];
+    let x0=pt0.x;let y0=pt0.y;let z0=pt0.z;let v0=pt0.w;
+    let x1=pt1.x;let y1=pt1.y;let z1=pt1.z;let v1=pt1.w;
+    // Fill empty bins from neighbors (search for valid w>0.5)
+    var x0f=x0;var y0f=y0;var z0f=z0;var x1f=x1;var y1f=y1;var z1f=z1;
+    if(v0<0.5){for(var d=1u;d<64u;d++){let nb=(b0+BINS-d)%BINS;let pt=polyPts[poly*BINS+nb];if(pt.w>0.5){x0f=pt.x;y0f=pt.y;z0f=pt.z;break;}}}
+    if(v1<0.5){for(var d=1u;d<64u;d++){let nb=(b1+d)%BINS;let pt=polyPts[poly*BINS+nb];if(pt.w>0.5){x0f=pt.x;y0f=pt.y;z0f=pt.z;break;}}}
+    wsX[idx]=mix(x0f,x1f,t);
+    wsY[idx]=mix(y0f,y1f,t);
+    wsZ[idx]=mix(z0f,z1f,t);
+  }
+  workgroupBarrier();
+
+  // Phase 3: build mesh (each thread one ring segment)
+  let vertsPerSeg=W*12u+12u;
+  for(var seg=lid.x;seg<N;seg+=256u){
+    let j=(seg+1u)%N;let baseV=seg*vertsPerSeg;
+    let uv_=f32(seg)/f32(N);let uvj=f32(j)/f32(N);
+    for(var w=0u;w<W;w++){
+      let f0=f32(w)/f32(W);let f1=f32(w+1u)/f32(W);
+      let oL0=seg;let oR0=seg+N;let oL1=j;let oR1=j+N;
+      let iL0=seg+2u*N;let iR0=seg+3u*N;let iL1=j+2u*N;let iR1=j+3u*N;
+      let o0x=mix(wsX[oL0],wsX[oR0],f0);let o0y=mix(wsY[oL0],wsY[oR0],f0);let o0z=mix(wsZ[oL0],wsZ[oR0],f0);
+      let o1x=mix(wsX[oL0],wsX[oR0],f1);let o1y=mix(wsY[oL0],wsY[oR0],f1);let o1z=mix(wsZ[oL0],wsZ[oR0],f1);
+      let o0jx=mix(wsX[oL1],wsX[oR1],f0);let o0jy=mix(wsY[oL1],wsY[oR1],f0);let o0jz=mix(wsZ[oL1],wsZ[oR1],f0);
+      let o1jx=mix(wsX[oL1],wsX[oR1],f1);let o1jy=mix(wsY[oL1],wsY[oR1],f1);let o1jz=mix(wsZ[oL1],wsZ[oR1],f1);
+      let i0x=mix(wsX[iL0],wsX[iR0],f0);let i0y=mix(wsY[iL0],wsY[iR0],f0);let i0z=mix(wsZ[iL0],wsZ[iR0],f0);
+      let i1x=mix(wsX[iL0],wsX[iR0],f1);let i1y=mix(wsY[iL0],wsY[iR0],f1);let i1z=mix(wsZ[iL0],wsZ[iR0],f1);
+      let i0jx=mix(wsX[iL1],wsX[iR1],f0);let i0jy=mix(wsY[iL1],wsY[iR1],f0);let i0jz=mix(wsZ[iL1],wsZ[iR1],f0);
+      let i1jx=mix(wsX[iL1],wsX[iR1],f1);let i1jy=mix(wsY[iL1],wsY[iR1],f1);let i1jz=mix(wsZ[iL1],wsZ[iR1],f1);
+      // Normals
+      let no0=normalize(vec3(o0x-cx,o0y-cy,o0z-cz));let no1=normalize(vec3(o1x-cx,o1y-cy,o1z-cz));
+      let no0j=normalize(vec3(o0jx-cx,o0jy-cy,o0jz-cz));let no1j=normalize(vec3(o1jx-cx,o1jy-cy,o1jz-cz));
+      let ni0=normalize(vec3(i0x-cx,i0y-cy,i0z-cz));let ni1=normalize(vec3(i1x-cx,i1y-cy,i1z-cz));
+      let ni0j=normalize(vec3(i0jx-cx,i0jy-cy,i0jz-cz));let ni1j=normalize(vec3(i1jx-cx,i1jy-cy,i1jz-cz));
+      // Tangents
+      let t00=normalize(select(vec3(no0.z,0.0,-no0.x),vec3(0.0,-no0.z,no0.y),abs(no0.y)>0.999));
+      let t01=normalize(select(vec3(no1.z,0.0,-no1.x),vec3(0.0,-no1.z,no1.y),abs(no1.y)>0.999));
+      let t0j0=normalize(select(vec3(no0j.z,0.0,-no0j.x),vec3(0.0,-no0j.z,no0j.y),abs(no0j.y)>0.999));
+      let t0j1=normalize(select(vec3(no1j.z,0.0,-no1j.x),vec3(0.0,-no1j.z,no1j.y),abs(no1j.y)>0.999));
+      let ti0=normalize(select(vec3(ni0.z,0.0,-ni0.x),vec3(0.0,-ni0.z,ni0.y),abs(ni0.y)>0.999));
+      let ti1=normalize(select(vec3(ni1.z,0.0,-ni1.x),vec3(0.0,-ni1.z,ni1.y),abs(ni1.y)>0.999));
+      let ti0j=normalize(select(vec3(ni0j.z,0.0,-ni0j.x),vec3(0.0,-ni0j.z,ni0j.y),abs(ni0j.y)>0.999));
+      let ti1j=normalize(select(vec3(ni1j.z,0.0,-ni1j.x),vec3(0.0,-ni1j.z,ni1j.y),abs(ni1j.y)>0.999));
+      // Write vertices
+      let v0=baseV+w*12u;
+      writeVert(v0,   o0x,o0y,o0z, -no0.x,-no0.y,-no0.z, uv_,f0, t00.x,t00.y,t00.z);
+      writeVert(v0+1u,o1x,o1y,o1z, -no1.x,-no1.y,-no1.z, uv_,f1, t01.x,t01.y,t01.z);
+      writeVert(v0+2u,o1jx,o1jy,o1jz, -no1j.x,-no1j.y,-no1j.z, uvj,f1, t0j1.x,t0j1.y,t0j1.z);
+      writeVert(v0+3u,o0x,o0y,o0z, -no0.x,-no0.y,-no0.z, uv_,f0, t00.x,t00.y,t00.z);
+      writeVert(v0+4u,o1jx,o1jy,o1jz, -no1j.x,-no1j.y,-no1j.z, uvj,f1, t0j1.x,t0j1.y,t0j1.z);
+      writeVert(v0+5u,o0jx,o0jy,o0jz, -no0j.x,-no0j.y,-no0j.z, uvj,f0, t0j0.x,t0j0.y,t0j0.z);
+      let vi=v0+6u;
+      writeVert(vi,   i0x,i0y,i0z, ni0.x,ni0.y,ni0.z, uv_,f0, ti0.x,ti0.y,ti0.z);
+      writeVert(vi+1u,i1jx,i1jy,i1jz, ni1j.x,ni1j.y,ni1j.z, uvj,f1, ti1j.x,ti1j.y,ti1j.z);
+      writeVert(vi+2u,i1x,i1y,i1z, ni1.x,ni1.y,ni1.z, uv_,f1, ti1.x,ti1.y,ti1.z);
+      writeVert(vi+3u,i0x,i0y,i0z, ni0.x,ni0.y,ni0.z, uv_,f0, ti0.x,ti0.y,ti0.z);
+      writeVert(vi+4u,i0jx,i0jy,i0jz, ni0j.x,ni0j.y,ni0j.z, uvj,f0, ti0j.x,ti0j.y,ti0j.z);
+      writeVert(vi+5u,i1jx,i1jy,i1jz, ni1j.x,ni1j.y,ni1j.z, uvj,f1, ti1j.x,ti1j.y,ti1j.z);
+      if(w==0u){
+        let vs=v0+12u;
+        writeVert(vs,   i0x,i0y,i0z, nx,ny,nz, uv_,0.5, t00.x,t00.y,t00.z);
+        writeVert(vs+1u,o0x,o0y,o0z, nx,ny,nz, uv_,0.5, t00.x,t00.y,t00.z);
+        writeVert(vs+2u,o0jx,o0jy,o0jz, nx,ny,nz, uvj,0.5, t0j0.x,t0j0.y,t0j0.z);
+        writeVert(vs+3u,i0x,i0y,i0z, nx,ny,nz, uv_,0.5, t00.x,t00.y,t00.z);
+        writeVert(vs+4u,o0jx,o0jy,o0jz, nx,ny,nz, uvj,0.5, t0j0.x,t0j0.y,t0j0.z);
+        writeVert(vs+5u,i0jx,i0jy,i0jz, nx,ny,nz, uvj,0.5, t0j0.x,t0j0.y,t0j0.z);
+      }
+      if(w==W-1u){
+        let vs=v0+12u+select(0u,6u,w==0u);
+        writeVert(vs,   i1x,i1y,i1z, -nx,-ny,-nz, uv_,0.5, ti1.x,ti1.y,ti1.z);
+        writeVert(vs+1u,i1jx,i1jy,i1jz, -nx,-ny,-nz, uvj,0.5, ti1j.x,ti1j.y,ti1j.z);
+        writeVert(vs+2u,o1x,o1y,o1z, -nx,-ny,-nz, uv_,0.5, t01.x,t01.y,t01.z);
+        writeVert(vs+3u,o1x,o1y,o1z, -nx,-ny,-nz, uv_,0.5, t01.x,t01.y,t01.z);
+        writeVert(vs+4u,i1jx,i1jy,i1jz, -nx,-ny,-nz, uvj,0.5, ti1j.x,ti1j.y,ti1j.z);
+        writeVert(vs+5u,o1jx,o1jy,o1jz, -nx,-ny,-nz, uvj,0.5, t0j1.x,t0j1.y,t0j1.z);
+      }
+    }
+  }
+}
+`});
+
 // Normals recompute (unchanged from original)
 const normCS=device.createShaderModule({label:'norm',code:`
 struct P{vc:u32}
@@ -1530,7 +1791,7 @@ struct P{vc:u32}
 @group(0)@binding(3)var<storage,read>adjData:array<u32>;
 @group(0)@binding(4)var<storage,read_write>norms:array<vec4<f32>>;
 @group(0)@binding(5)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let vi=gid.x;if(vi>=p.vc){return;}
   let start=adjOff[vi];let end=adjOff[vi+1u];
   var sumN=vec3<f32>(0.0);
@@ -1550,7 +1811,7 @@ struct P{vc:u32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<f32>;
 @group(0)@binding(2)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   let v=src[i];dst[i*3u]=v.x;dst[i*3u+1u]=v.y;dst[i*3u+2u]=v.z;
 }
@@ -1561,13 +1822,13 @@ struct P{vc:u32}
 @group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
 @group(0)@binding(1)var<storage,read_write>dst:array<f32>;
 @group(0)@binding(2)var<uniform>p:P;
-@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let i=gid.x;if(i>=p.vc){return;}
   let v=src[i];dst[i*3u]=v.x;dst[i*3u+1u]=v.y;dst[i*3u+2u]=v.z;
 }
 `});
 
-// ═══════ Compute Pipeline Setup ═══════
+// ══════.?Compute Pipeline Setup ══════.?
 const S_R=(b,v)=>({binding:b,visibility:v,buffer:{type:'storage'}});
 const S_RO=(b,v)=>({binding:b,visibility:v,buffer:{type:'read-only-storage'}});
 const U_B=(b,v)=>({binding:b,visibility:v,buffer:{type:'uniform'}});
@@ -1591,10 +1852,17 @@ const voxelNormPipe=cpPipe(voxelNormCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),
 const voxelApplyPipe=cpPipe(voxelApplyCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'voxelApply');
 const nearestPipe=cpPipe(nearestCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'nearest');
 const bandApplyRadiusPipe=cpPipe(bandApplyRadiusCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'bandApplyRadius');
-const bandVisPipe=cpPipe(bandVisCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandVis');
-const bandVisTargetPipe=cpPipe(bandVisTargetCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandVisTarget');
 
-// ═══════ GPU Buffers and Bind Groups ═══════
+const bandVisTargetPipe=cpPipe(bandVisTargetCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandVisTarget');
+// ── Plan C: GPU band rendering pipeline ──
+const bandStackPipe=cpPipe(bandStackCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),U_B(4,CS)],'bandStack');
+// ── GPU Ribbon Mesh Generation pipelines ──
+const bandCutBinsPipe=cpPipe(bandCutBinsCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_RO(4,CS),S_R(5,CS),S_R(6,CS),S_R(7,CS),S_R(8,CS),U_B(9,CS)],'bandCutBins');
+const bandResolvePipe=cpPipe(bandResolveCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'bandResolve');
+const bandBuildMeshPipe=cpPipe(bandBuildMeshCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'bandBuildMesh');
+
+
+// ══════.?GPU Buffers and Bind Groups ══════.?
 let posA,posB,restB,idxB,volB,volTotalB;
 let volRedLevels=[],staging,volStaging;
 let voxDxBuf,voxDyBuf,voxDzBuf,voxWBuf,voxOutBuf;
@@ -1608,6 +1876,17 @@ let hrNormBG,hrNormUnpackBG,highResUnpackBG,proxyUnpackBG_A,proxyUnpackBG_B;
 let shapeUB,volAccUB,volApUB,bandReduceAllUB;
 let bandParamsB,bandRestRadiiB;
 let bandApplyRadiusBG_AB,bandApplyRadiusBG_BA;
+// ── Plan C: GPU band rendering buffers ──
+const MAX_RIBBON_VERTS=256*(4*12+12);
+let bandOffLoB,bandOffHiB; // per-vertex offsets (vc floats each)
+let bandStackUB; // uniform
+let bandStackBG; // bind group
+// ── GPU Ribbon Mesh Gen buffers ──
+let bandBinRB,bandBinRYB,bandBinRZB,bandBinCB; // 4×64 atomics (R=RX, RY, RZ, C)
+let bandPolyPtsB;              // 4×64 vec4 polyline points (reused)
+let bandMeshPosB,bandMeshNormB,bandMeshUVB,bandMeshTanB; // mesh output (reused, then GPU→GPU copy)
+
+let bandCutUB,bandResolveUB,bandBuildUB; // uniforms
 let WG,VWG;
 
 async function initGPU(){
@@ -1668,7 +1947,28 @@ async function initGPU(){
   // Precomputed rest radii per band per angle (64 floats × MAX_BANDS)
   bandRestRadiiB=mkBuf(MAX_BANDS*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bandRestRadii');
 
-  // ⋯ (adjacency, idx, norms — same as before) ⋯
+  // ── Plan C: GPU band rendering buffers ──
+  // Per-vertex stacking offsets
+  bandOffLoB=mkBuf(proxyVertexCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandOffLo');
+  bandOffHiB=mkBuf(proxyVertexCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandOffHi');
+  // Uniform
+  bandStackUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandStackU');
+
+  // ── GPU Ribbon Mesh Gen buffers ──
+  bandBinRB=mkBuf(4*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandBinRX');
+  bandBinRYB=mkBuf(4*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandBinRY');
+  bandBinRZB=mkBuf(4*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandBinRZ');
+  bandBinCB=mkBuf(4*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandBinC');
+  bandPolyPtsB=mkBuf(4*64*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandPolyPts');
+  bandMeshPosB=mkBuf(MAX_RIBBON_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshPos');
+  bandMeshNormB=mkBuf(MAX_RIBBON_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshNorm');
+  bandMeshUVB=mkBuf(MAX_RIBBON_VERTS*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshUV');
+  bandMeshTanB=mkBuf(MAX_RIBBON_VERTS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshTan');
+  bandCutUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandCutU');
+  bandResolveUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandResolveU');
+  bandBuildUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandBuildU');
+
+  // .?(adjacency, idx, norms .?same as before) .?
 
   // High-res adjacency for normals
   const adjLists=new Array(highResCount);for(let i=0;i<highResCount;i++)adjLists[i]=[];
@@ -1728,7 +2028,7 @@ async function initGPU(){
   voxelApplyBG=device.createBindGroup({layout:voxelApplyPipe.bgl,entries:[
     {binding:0,resource:{buffer:highResRestB}},{binding:1,resource:{buffer:voxOutBuf}},{binding:2,resource:{buffer:highResOutB}},{binding:3,resource:{buffer:voxelApplyUB}}]});
 
-  // Band applyRadius — AB / BA ping-pong (5 bindings: src, dst, params, radii, uniform)
+  // Band applyRadius .?AB / BA ping-pong (5 bindings: src, dst, params, radii, uniform)
   bandApplyRadiusBG_AB=device.createBindGroup({layout:bandApplyRadiusPipe.bgl,entries:[
     {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:posB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandRestRadiiB}},{binding:4,resource:{buffer:bandReduceAllUB}}]});
   bandApplyRadiusBG_BA=device.createBindGroup({layout:bandApplyRadiusPipe.bgl,entries:[
@@ -1751,7 +2051,7 @@ async function initGPU(){
   proxyUnpackBG_B=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
     {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:proxyPos3B}},{binding:2,resource:{buffer:proxyUnpackUB}}]});
 
-  console.log('⚡ GPU管线就绪. 代理:',proxyVertexCount.toLocaleString(),'顶点 高模:',highResCount.toLocaleString(),'顶点');
+  console.log('GPU pipeline ready. 代理:',proxyVertexCount.toLocaleString(),'顶点 高模:',highResCount.toLocaleString(),'顶点');
   // 🔍 Check shader compilation
   for(const [name,shader] of [['bandReduceAll',bandReduceAllCS],['bandApplyRadius',bandApplyRadiusCS]]){
     const info=await shader.getCompilationInfo();
@@ -1777,7 +2077,7 @@ async function initGPU(){
   }
 }
 
-// ═══════ GPU PBD: write band params to GPU buffer ═══════
+// ══════.?GPU PBD: write band params to GPU buffer ══════.?
 function writeBandParams(){
   if(!bandParamsB)return;
   const STRIDE=13; // ox,oy,oz,nx,ny,nz,L₀,stiff,inf,preScale,rest_cx,rest_cy,rest_cz
@@ -1801,7 +2101,9 @@ async function readbackProxyPositions(srcBuf){
   const cmd=device.createCommandEncoder();
   cmd.copyBufferToBuffer(srcBuf===posA?posA:posB,0,staging,0,size);
   device.queue.submit([cmd.finish()]);
+  const tWait0=performance.now();
   await staging.mapAsync(GPUMapMode.READ);
+  const tWait1=performance.now();
   const arr=new Float32Array(staging.getMappedRange(0,size));
   for(let i=0;i<proxyVertexCount;i++){
     proxyCurPositions[i*3]=arr[i*4];
@@ -1809,6 +2111,8 @@ async function readbackProxyPositions(srcBuf){
     proxyCurPositions[i*3+2]=arr[i*4+2];
   }
   staging.unmap();
+  const tCopy=performance.now()-tWait1;
+  if(tWait1-tWait0>1||tCopy>1)console.log('  ↳ readbackProxy: mapAsync='+(tWait1-tWait0).toFixed(1)+'ms copy='+tCopy.toFixed(1)+'ms');
 }
 
 // Read back current volume from GPU buffer for HUD display
@@ -1851,16 +2155,16 @@ function updateAllBandVisuals(){
     H.cratio.textContent=exact.perimeter>0?(exact.perimeter/lb.restCircum).toFixed(3):'--';
     // Diagnostic: log perimeters of all bands
     if(bands.length>=2&&convergeFrames===CONVERGE_FRAMES-1){
-      console.log('📏 PBD收敛后周长:');
+      console.log('📏 PBD收敛后周?');
       for(let b=0;b<bands.length;b++){
         const e=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,bands[b].planeOrigin,bands[b].planeNormal);
-        console.log('  band#'+(b+1)+' P='+e.perimeter.toFixed(4)+' L₀='+bands[b].restCircum.toFixed(4)+' ratio='+(e.perimeter/bands[b].restCircum).toFixed(4)+(e.perimeter<bands[b].restCircum?' ⚠️突破':' ✓'));
+        console.log('  band#'+(b+1)+' P='+e.perimeter.toFixed(4)+' L0='+bands[b].restCircum.toFixed(4)+' ratio='+(e.perimeter/bands[b].restCircum).toFixed(4)+(e.perimeter<bands[b].restCircum?' BROKEN':' OK'));
       }
     }
   }else{H.cratio.textContent='--';}
 }
 
-// ═══════ GPU PBD + post pipeline ═══════
+// ══════.?GPU PBD + post pipeline ══════.?
 let _zeroTriP=null,_zeroRedLv=null;
 // Pre-alloc reusable buffers to avoid per-iteration GC
 let _shapeU=new ArrayBuffer(8);
@@ -1873,7 +2177,11 @@ let _bandSmallU8=null;              // Pre-alloc for band uniform 8 bytes
 async function runGPUPBD(){
   const bc=bands.length;
   if(!bandParamsB)return;
-  if(bc>0)console.log('⏱️ PBD enter bc='+bc);
+  if(bc>0){
+    const addDelay=_lastBandAddTime>0?performance.now()-_lastBandAddTime:0;
+    _lastBandAddTime=0;
+    console.log('⏱️ PBD enter bc='+bc+(addDelay>0?' (+'+addDelay.toFixed(0)+'ms since addBand)':'')+' @'+performance.now().toFixed(0)+'ms');
+  }
 
   // Upload ALL band params at their proper offsets (done once per frame)
   writeBandParams();
@@ -1923,18 +2231,18 @@ async function runGPUPBD(){
   for(let iter=0;iter<PBD_ITER;iter++){
     const isA=srcPos===posA,isLast=iter===lastIter;
 
-    // ═══════ Phase 1: Write ALL per-iteration uniforms (before encoder) ═══════
+    // ══════.?Phase 1: Write ALL per-iteration uniforms (before encoder) ══════.?
     let t0=performance.now();
     new Float32Array(_shapeU)[0]=SHAPE_STIFF;
     queue.writeBuffer(shapeUB,0,_shapeU);
 
     let tw1=performance.now();
-    // (no bin clearing needed — radius-based constraint doesn't use bins)
+    // (no bin clearing needed .?radius-based constraint doesn't use bins)
     let tw2=performance.now();
     _zeroVolU[0]=proxyTriCount;
     queue.writeBuffer(volAccUB,0,_zeroVolU);
     queue.writeBuffer(volTotalB,0,_zeroVolF);
-    // volB cleared once before loop — volAcc overwrites all slots
+    // volB cleared once before loop .?volAcc overwrites all slots
     for(let li=0;li<volRedLevels.length;li++){
       const lv=volRedLevels[li];if(lv.dstBuf!==volTotalB)queue.writeBuffer(lv.dstBuf,0,_zeroRedLv[li]);
     }
@@ -1951,7 +2259,7 @@ async function runGPUPBD(){
     let dtIter=performance.now()-tIter;
     if(dtIter>1.0)console.log('⏱️   iter='+iter+' write='+dtIter.toFixed(1)+'ms (shape='+(tw1-t0).toFixed(1)+' bins='+(tw2-tw1).toFixed(1)+' vol='+(tw3-tw2).toFixed(1)+' vox='+(performance.now()-tw3).toFixed(1)+')');
 
-    // ═══════ Phase 2: ONE command encoder, multiple compute passes ═══════
+    // ══════.?Phase 2: ONE command encoder, multiple compute passes ══════.?
     const cmd=device.createCommandEncoder();
 
     // ── Shape pass ──
@@ -2000,7 +2308,7 @@ async function runGPUPBD(){
     cp.end();}
     tVol+=performance.now()-t0;
 
-    // ═══════ Phase 3: ONE submit ═══════
+    // ══════.?Phase 3: ONE submit ══════.?
     t0=performance.now();
     device.queue.submit([cmd.finish()]);
     tSubmit+=performance.now()-t0;
@@ -2012,7 +2320,7 @@ async function runGPUPBD(){
   return finalSrc;
 }
 
-// ═══════ Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ═══════
+// ══════.?Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ══════.?
 async function runGPUPostPBD(srcBuf){
   const t0=performance.now();
   // Normalize voxel grid
@@ -2021,8 +2329,8 @@ async function runGPUPostPBD(srcBuf){
   cp0.setPipeline(voxelNormPipe.pipe);cp0.setBindGroup(0,voxelNormBG);cp0.dispatchWorkgroups(Math.ceil(VOX_TOTAL/256),1,1);
   cp0.end();device.queue.submit([cmd0.finish()]);
 
-  // Apply voxel grid to high-res mesh — NOT waiting: GPU queue orders naturally
-  // (removed await device.queue.onSubmittedWorkDone — bottleneck was here)
+  // Apply voxel grid to high-res mesh .?NOT waiting: GPU queue orders naturally
+  // (removed await device.queue.onSubmittedWorkDone .?bottleneck was here)
   const tSync=performance.now();
   const tSyncEnd=performance.now();
   const vu=new ArrayBuffer(32);
@@ -2035,7 +2343,7 @@ async function runGPUPostPBD(srcBuf){
   cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,highResUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
   cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,hrNormBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
   cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,hrNormUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
-  // Unpack proxy positions for wireframe — use correct buffer
+  // Unpack proxy positions for wireframe .?use correct buffer
   cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,srcBuf===posA?proxyUnpackBG_A:proxyUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
   cp.end();device.queue.submit([cmd.finish()]);
 
@@ -2066,13 +2374,131 @@ async function runGPUPostPBD(srcBuf){
   console.log('⏱️ PostPBD: sync='+(tSyncEnd-tSync).toFixed(1)+'ms total='+(performance.now()-t0).toFixed(1)+'ms');
 }
 
-// ═══════ GPU Band Visualization (DISABLED — radius-based constraint doesn't produce bins) ═══════
-async function runGPUBandVis(finalSrc){
-  // DISABLED: bin-based visualization not compatible with radius-based band constraint.
-  // Use CPU-side updateAllBandVisuals() instead.
-}
+// ══════.?GPU Band Visualization (Plan C: GPU stack + cut + build) ══════.?
 
-// ═══════ Interaction ═══════
+// ══════.?GPU Band Visualization (Plan C: GPU stack offsets + CPU mesh build) ══════.?
+async function runGPUBandVis(finalSrc){
+  if(!bandOffLoB){H.bandtime.textContent='0 ms';return 0;}
+  const bc=bands.length;
+  if(bc===0){H.bandtime.textContent='0 ms';return 0;}
+  const t0=performance.now();
+  const srcPos=(finalSrc===posA)?posA:posB;
+  if(!_stackU8){_stackU8=new Uint32Array(new ArrayBuffer(32));}
+  if(!_stackF32){_stackF32=new Float32Array(_stackU8.buffer);}
+  if(!_cutU8){_cutU8=new Uint32Array(new ArrayBuffer(32));}
+  if(!_cutF32){_cutF32=new Float32Array(_cutU8.buffer);}
+  if(!_buildU8){_buildU8=new Uint32Array(new ArrayBuffer(32));}
+  if(!_buildF32){_buildF32=new Float32Array(_buildU8.buffer);}
+  if(!_zeroBins){_zeroBins=new Uint32Array(4*64);}
+
+  const hw=RIBBON_HALF_WIDTH, surfOff=RIBBON_SURFACE_OFFSET, thick=RIBBON_THICKNESS;
+  const comp=BAND_COMPRESSION_PER_LAYER;
+  const ringSegs=192, widthSegs=RIBBON_WIDTH_SEGMENTS, totalVerts=ringSegs*(widthSegs*12+12);
+
+  // Skip CPU proxy readback — GPU band vis is self-contained
+  let tProxyRead=0;
+  // Compute centroid from rest positions (stable, computed once during model load)
+  let cx=0,cy=0,cz=0;
+  for(let i=0;i<proxyVertexCount;i++){cx+=proxyRestPositions[i*3];cy+=proxyRestPositions[i*3+1];cz+=proxyRestPositions[i*3+2];}
+  cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+
+  let tGpuStack=0, tCut=0, tResolve=0, tBuild=0, tCopy=0, tTarget=0;
+
+  // Pre-set uniform fields that don't change per band
+  _cutU8[1]=proxyVertexCount; _cutU8[2]=proxyTriCount;
+  _cutF32[3]=hw; _cutF32[4]=cx; _cutF32[5]=cy; _cutF32[6]=cz;
+  _buildU8[1]=ringSegs; _buildU8[2]=widthSegs;
+  _buildF32[3]=cx; _buildF32[4]=cy; _buildF32[5]=cz;
+  _resU32=_resU32||new Uint32Array(new ArrayBuffer(8));
+
+  let t1;
+  // Per-band GPU pipeline (stack→cut→resolve→build→copy)
+  for(let b=0;b<bc;b++){
+    if(!bands[b]||!bandVisuals[b])continue;
+    
+    const enc=device.createCommandEncoder();
+    
+    // Stack
+    _stackU8[0]=b; _stackU8[1]=proxyVertexCount; _stackU8[2]=bc;
+    _stackF32[3]=hw; _stackF32[4]=surfOff; _stackF32[5]=thick; _stackF32[6]=comp;
+    queue.writeBuffer(bandStackUB,0,_stackU8);
+    const stackBG=device.createBindGroup({layout:bandStackPipe.bgl,entries:[
+      {binding:0,resource:{buffer:srcPos}},{binding:1,resource:{buffer:bandParamsB}},
+      {binding:2,resource:{buffer:bandOffLoB}},{binding:3,resource:{buffer:bandOffHiB}},
+      {binding:4,resource:{buffer:bandStackUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandStackPipe.pipe);cp.setBindGroup(0,stackBG);cp.dispatchWorkgroups(WG,1,1);cp.end();}
+    
+    // Clear bins + Cut
+    queue.writeBuffer(bandBinRB,0,_zeroBins);
+    queue.writeBuffer(bandBinRYB,0,_zeroBins);
+    queue.writeBuffer(bandBinRZB,0,_zeroBins);
+    queue.writeBuffer(bandBinCB,0,_zeroBins);
+    _cutU8[0]=b; queue.writeBuffer(bandCutUB,0,_cutU8);
+    const cutBG=device.createBindGroup({layout:bandCutBinsPipe.bgl,entries:[
+      {binding:0,resource:{buffer:srcPos}},{binding:1,resource:{buffer:idxB}},
+      {binding:2,resource:{buffer:bandOffLoB}},{binding:3,resource:{buffer:bandOffHiB}},
+      {binding:4,resource:{buffer:bandParamsB}},{binding:5,resource:{buffer:bandBinRB}},
+      {binding:6,resource:{buffer:bandBinRYB}},{binding:7,resource:{buffer:bandBinRZB}},
+      {binding:8,resource:{buffer:bandBinCB}},{binding:9,resource:{buffer:bandCutUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandCutBinsPipe.pipe);cp.setBindGroup(0,cutBG);cp.dispatchWorkgroups(VWG,1,1);cp.end();}
+    
+    // Resolve
+    _resU32[0]=b; _resU32[1]=ringSegs; queue.writeBuffer(bandResolveUB,0,_resU32);
+    const resolveBG=device.createBindGroup({layout:bandResolvePipe.bgl,entries:[
+      {binding:0,resource:{buffer:bandBinRB}},{binding:1,resource:{buffer:bandBinRYB}},
+      {binding:2,resource:{buffer:bandBinRZB}},{binding:3,resource:{buffer:bandBinCB}},
+      {binding:4,resource:{buffer:bandPolyPtsB}},{binding:5,resource:{buffer:bandResolveUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandResolvePipe.pipe);cp.setBindGroup(0,resolveBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
+    
+    // Build
+    _buildU8[0]=b; queue.writeBuffer(bandBuildUB,0,_buildU8);
+    const buildBG=device.createBindGroup({layout:bandBuildMeshPipe.bgl,entries:[
+      {binding:0,resource:{buffer:bandPolyPtsB}},{binding:1,resource:{buffer:bandParamsB}},
+      {binding:2,resource:{buffer:bandMeshPosB}},{binding:3,resource:{buffer:bandMeshNormB}},
+      {binding:4,resource:{buffer:bandMeshUVB}},{binding:5,resource:{buffer:bandMeshTanB}},
+      {binding:6,resource:{buffer:bandBuildUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandBuildMeshPipe.pipe);cp.setBindGroup(0,buildBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
+    
+    // GPU→GPU copy to Three.js (ribbon mesh)
+    const vis=bandVisuals[b];
+    if(vis&&vis.ribbon){
+      const geo=vis.ribbon.geometry;
+      for(const name of['position','normal','uv','tangent']){
+        const attr=geo.attributes[name];
+        if(attr){let d=renderer.backend.get(attr);if(!d||!d.buffer){renderer.backend.createAttribute(attr);}}
+      }
+      const pD=renderer.backend.get(geo.attributes.position);
+      const nD=renderer.backend.get(geo.attributes.normal);
+      const uD=renderer.backend.get(geo.attributes.uv);
+      const tD=renderer.backend.get(geo.attributes.tangent);
+      if(pD?.buffer)enc.copyBufferToBuffer(bandMeshPosB,0,pD.buffer,0,totalVerts*3*4);
+      if(nD?.buffer)enc.copyBufferToBuffer(bandMeshNormB,0,nD.buffer,0,totalVerts*3*4);
+      if(uD?.buffer)enc.copyBufferToBuffer(bandMeshUVB,0,uD.buffer,0,totalVerts*2*4);
+      if(tD?.buffer)enc.copyBufferToBuffer(bandMeshTanB,0,tD.buffer,0,totalVerts*4*4);
+      geo.setDrawRange(0,totalVerts);
+      vis.ribbon.visible=true;
+    }
+    
+    t1=performance.now();
+    device.queue.submit([enc.finish()]);
+    tBuild+=performance.now()-t1;
+  }
+
+  // Green target lines + HUD skipped — GPU band vis is self-contained
+  let tHud=0;
+
+  const elapsed=performance.now()-t0;
+  console.log('GPU BandVis: '+bands.length+' bands, total='+elapsed.toFixed(1)+'ms'+
+    ' | proxy='+tProxyRead.toFixed(1)+' stack='+tGpuStack.toFixed(1)+
+    ' cut='+tCut.toFixed(1)+' resolve='+tResolve.toFixed(1)+
+    ' build='+tBuild.toFixed(1)+' copy='+tCopy.toFixed(1)+
+    ' target='+tTarget.toFixed(1)+' @'+performance.now().toFixed(0)+'ms');
+  return elapsed;
+}
+let _stackU8=null,_stackF32=null,_cutU8=null,_cutF32=null,_buildU8=null,_buildF32=null,_resU32=null,_zeroBins=null;
+
+
+// ══════.?Interaction ══════.?
 let mdx=0,mdy=0,dragging=false,prevCamYaw=0,prevCamPitch=0;
 let previewLine=null;
 
@@ -2206,34 +2632,39 @@ window.onresize=()=>{
   camera.updateProjectionMatrix();
 };
 
-// ═══════ Animation Loop ═══════
+// ══════.?Animation Loop ══════.?
 const clock={last:performance.now()};
 let fpsFrames=0,fpsTime=0;
 
+let _lastFrameStart=0;
+let _lastBandAddTime=0; // timestamp of last addBand() for gap measurement
 async function animate(){
   const now=performance.now(),dt=Math.min((now-clock.last)/1000,0.1);clock.last=now;
   if(!loaded){requestAnimationFrame(animate);return;}
 
   const t0=performance.now();
+  const gap=t0-_lastFrameStart; _lastFrameStart=t0;
+  const wasConverging=!pbdConverged; // snapshot before this frame may set it
 
+  let tPbd=0,tPost=0,tRv=0,tRp=0,tBv=0,tRender=0,frameNum=convergeFrames;
   if(bands.length>0&&!pbdConverged){
     const pbdT0=performance.now();
     const finalSrc=await runGPUPBD();
+    const t1=performance.now();
     await runGPUPostPBD(finalSrc);
-    const frameTime=performance.now()-pbdT0;
-    pbdAccumTime+=frameTime;
-    console.log('⏱️ frame#'+convergeFrames+' pbdTime='+frameTime.toFixed(1)+'ms accum='+pbdAccumTime.toFixed(1)+'ms');
+    const t2=performance.now();
+    tPbd=t1-pbdT0; tPost=t2-t1;
+    frameNum=convergeFrames;
+    pbdAccumTime+=tPbd+tPost;
     convergeFrames++;
     if(convergeFrames>=CONVERGE_FRAMES){
-      pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ✓';
-      // 最终帧: 回传代理顶点+体积并更新红/绿皮筋可视化 (仅此帧有pipeline stall)
-      await readbackVolume();
-      await readbackProxyPositions(finalSrc);
-      updateAllBandVisuals();
+      pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
+      const rv0=performance.now(); if(showVolumeReadback)await readbackVolume(); tRv=performance.now()-rv0;
+      const bv0=performance.now(); await runGPUBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';}); tBv=performance.now()-bv0;
     }
     else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
   }else if(bands.length>0&&pbdConverged){
-    H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ✓';
+    H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
   }else if(needsRestore){
     // Restore: reset GPU proxy positions + zero displacement
     const pos4r=new Float32Array(proxyVertexCount*4);
@@ -2248,31 +2679,38 @@ async function animate(){
     proxyCurPositions.set(proxyRestPositions);
     await runGPUPostPBD(posA);
     needsRestore=false;lastVol=restVolume;
-    H.pbdtime.textContent='已恢复 ✓';
+    H.pbdtime.textContent='Restored';
     H.vratio.textContent='100.0';
-    // 恢复后更新皮筋可视化(所有皮筋回到rest位置)
-    updateAllBandVisuals();
+    // 恢复后更新皮筋可视化(GPU)
+    await runGPUBandVis(posA).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
   }else{
     H.pbdtime.textContent='空闲';
   }
 
-  renderer.render(scene,camera);
 
-  const ms=performance.now()-t0;
+  const tRender0=performance.now();
+  renderer.render(scene,camera);
+  tRender=performance.now()-tRender0;
   fpsFrames++;fpsTime+=dt;
   if(fpsTime>=1.0){
     H.fps.textContent=Math.round(fpsFrames/fpsTime);
-    H.framems.textContent=ms.toFixed(1);
+    H.framems.textContent=(performance.now()-t0).toFixed(1);
     fpsFrames=0;fpsTime=0;
   }
 
+  const total=performance.now()-t0;
+  if(wasConverging){
+    console.log('⏱️ #'+frameNum+' gap='+gap.toFixed(1)+' pbd='+tPbd.toFixed(1)+' post='+tPost.toFixed(1)+
+      ' rv='+tRv.toFixed(1)+' rp='+tRp.toFixed(1)+' bv='+tBv.toFixed(1)+
+      ' render='+tRender.toFixed(1)+' total='+total.toFixed(1)+'ms @'+performance.now().toFixed(0)+'ms');
+  }
   requestAnimationFrame(animate);
 }
 
-console.log('🔧 皮筋游戏 — GPU PBD + Three.js WebGPU');
-console.log('   🖱️ 点击表面绑皮筋(表面法向)');
-console.log('   R = 割一根, C = 全部割掉');
-console.log('   📐 右侧面板调参数');
+console.log('🔧 皮筋游戏 GPU PBD + Three.js WebGPU');
+console.log('   Click surface to bind band (surface normal)');
+console.log('   R = cut one, C = cut all');
+console.log('   Right panel to adjust params');
 animate();
 </script>
 </body>
