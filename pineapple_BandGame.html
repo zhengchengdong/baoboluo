@@ -89,7 +89,13 @@ canvas { display:block; cursor:crosshair; }
   📊 读回体积保持率 (HUD)
  </label>
 
- <h3>💡 光照</h3>
+ <h3>� 圆皮筋</h3>
+ <label>管半径 <span class="val" id="sv_tr">0.018</span></label>
+ <input type="range" id="sl_tr" min="0.005" max="0.08" step="0.001" value="0.018">
+ <label>截面细分 <span class="val" id="sv_rs">12</span></label>
+ <input type="range" id="sl_rs" min="4" max="24" step="1" value="12">
+
+ <h3>�💡 光照</h3>
  <label>环境光强度<span class="val" id="sv_ai">0.50</span></label>
  <input type="range" id="sl_ai" min="0" max="3.0" step="0.01" value="0.50">
  <label>平行光强度<span class="val" id="sv_di">1.50</span></label>
@@ -174,6 +180,7 @@ let SHAPE_STIFF=0.30, BAND_STIFF=0.50, VOL_STIFF=0.40, BAND_INFLU=0.60;
 let BAND_REST_CIRCUM=2.51, PBD_ITER=10;
 const DELTA_BUCKETS=256;
 let pbdAccumTime=0, pbdConverged=false, convergeFrames=0, needsRestore=false;
+let circVisDirty=false; // skip redundant circular band GPU work when nothing changed
 let CONVERGE_FRAMES=5;
 let lastVol=0;
 function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
@@ -211,6 +218,17 @@ $('sl_rt').oninput=e=>{RIBBON_THICKNESS=+e.target.value;$('sv_rt').textContent=R
 $('sl_rr').oninput=e=>{RIBBON_ROUGHNESS=+e.target.value;$('sv_rr').textContent=RIBBON_ROUGHNESS.toFixed(2);updateAllRibbonMaterials();};
 $('sl_an').oninput=e=>{RIBBON_ANISOTROPY=+e.target.value;$('sv_an').textContent=RIBBON_ANISOTROPY.toFixed(2);updateAllRibbonMaterials();};
 $('sl_rso').oninput=e=>{RIBBON_SURFACE_OFFSET=+e.target.value;$('sv_rso').textContent=RIBBON_SURFACE_OFFSET.toFixed(3);markPbdDirty();};
+
+// Circular band sliders
+$('sl_tr').oninput=e=>{
+  TUBE_RADIUS=+e.target.value;$('sv_tr').textContent=TUBE_RADIUS.toFixed(3);
+  for(const b of circularBands)b.tubeRadius=TUBE_RADIUS;
+  circVisDirty=true;
+};
+$('sl_rs').oninput=e=>{
+  TUBE_RADIAL_SEGS=+e.target.value|0;$('sv_rs').textContent=TUBE_RADIAL_SEGS;
+  circVisDirty=true;
+};
 
 // Target line toggle
 let showTargetLine = true;
@@ -823,6 +841,7 @@ function addCircularBand(origin, normal){
   };
   circularBands.push(band);
   circBandVisuals.push({});
+  circVisDirty=true;
   console.log('🟤 圆皮筋 #'+circularBands.length+' added at ('+origin.map(v=>v.toFixed(2)).join(',')+') normal=['+nn.map(v=>v.toFixed(2)).join(',')+'] r='+TUBE_RADIUS.toFixed(4));
   markPbdDirty();
 }
@@ -830,7 +849,7 @@ function removeCircularBand(){
   if(circularBands.length===0)return;
   circularBands.pop();
   circBandVisuals.pop();
-  needsRestore=true;markPbdDirty();
+  needsRestore=true;markPbdDirty();circVisDirty=true;
   // Immediately hide if last one removed
   if(circularBands.length===0&&_circSharedMesh){
     _circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;
@@ -1918,6 +1937,9 @@ const BINS=64u;
 var<workgroup>wsX:array<f32,256>;
 var<workgroup>wsY:array<f32,256>;
 var<workgroup>wsZ:array<f32,256>;
+var<workgroup>sX:array<f32,256>;
+var<workgroup>sY:array<f32,256>;
+var<workgroup>sZ:array<f32,256>;
 
 fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32){
   let i3=vi*3u;
@@ -1959,6 +1981,23 @@ fn rotateTowards(V:vec3<f32>,tgt:vec3<f32>,strength:f32)->vec3<f32>{
     wsX[idx]=mix(x0,x1,t);wsY[idx]=mix(y0,y1,t);wsZ[idx]=mix(z0,z1,t);
   }
   workgroupBarrier();
+
+  // Phase 1.5: smooth centerline — remove triangle-facet noise, keep large-scale shape
+  // Weighted average over ±2 neighbors, 2 passes. Band feels "pulled tight".
+  for(var sp=0u;sp<3u;sp++){
+    for(var idx=lid.x;idx<N;idx+=256u){
+      var sx_:f32=0.0;var sy_:f32=0.0;var sz_:f32=0.0;var sw:f32=0.0;
+      for(var di:i32=-2;di<=2;di++){
+        let ni=u32((i32(idx)+di+i32(N))%i32(N));
+        let w=3.0-f32(abs(di)); // weights: 1,2,3,2,1
+        sx_+=wsX[ni]*w;sy_+=wsY[ni]*w;sz_+=wsZ[ni]*w;sw+=w;
+      }
+      sX[idx]=sx_/sw;sY[idx]=sy_/sw;sZ[idx]=sz_/sw;
+    }
+    workgroupBarrier();
+    for(var idx=lid.x;idx<N;idx+=256u){wsX[idx]=sX[idx];wsY[idx]=sY[idx];wsZ[idx]=sZ[idx];}
+    workgroupBarrier();
+  }
 
   // Phase 2: build tube mesh (each thread = 1 ring segment)
   let vertsPerRing=R*6u; // 6 vertices per radial quad (2 triangles)
@@ -3125,8 +3164,7 @@ async function animate(){
       pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
       if(showVolumeReadback)await readbackVolume();
       await runGPUBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
-      // Also render circular bands (function handles zero-case internally)
-      await runGPUCircularBandVis(finalSrc);
+      await runGPUCircularBandVis(finalSrc);circVisDirty=false;
     }
     else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
   }else if(bands.length>0&&pbdConverged){
@@ -3146,12 +3184,10 @@ async function animate(){
     H.pbdtime.textContent='Restored';
     H.vratio.textContent='100.0';
     await runGPUBandVis(posA).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
-    // Also render circular bands on restore (function handles zero-case internally)
-    await runGPUCircularBandVis(posA);
+    await runGPUCircularBandVis(posA);circVisDirty=false;
   }else{
     H.pbdtime.textContent='空闲';
-    // Render circular bands even in idle state (function handles zero-case internally)
-    await runGPUCircularBandVis(posA);
+    if(circVisDirty){await runGPUCircularBandVis(posA);circVisDirty=false;}
   }
 
   const tRender0=performance.now();
