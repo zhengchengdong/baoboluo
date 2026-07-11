@@ -197,11 +197,9 @@ $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CO
 
 // Ribbon visual sliders
 function updateAllRibbonMaterials(){
-  for(const vis of bandVisuals){
-    if(vis.ribbon&&vis.ribbon.material){
-      vis.ribbon.material.roughness=RIBBON_ROUGHNESS;
-      vis.ribbon.material.anisotropy=RIBBON_ANISOTROPY;
-    }
+  if(_sharedRibbonMesh&&_sharedRibbonMesh.material){
+    _sharedRibbonMesh.material.roughness=RIBBON_ROUGHNESS;
+    _sharedRibbonMesh.material.anisotropy=RIBBON_ANISOTROPY;
   }
 }
 function rebuildAllRibbonVisuals(){
@@ -237,7 +235,7 @@ $('sl_dz').oninput=e=>{const v=+e.target.value;dirLight.position.z=v;$('sv_dz').
 // ══════.?Band System ══════.?
 const MAX_BANDS=256;
 const bands=[];
-const bandVisuals=[];  // {ribbon: THREE.Mesh, lineTarget: THREE.Line}
+const bandVisuals=[];  // {lineTarget: THREE.Line}  (ribbon mesh is shared _sharedRibbonMesh)
 
 // Ribbon parameters (world units; pineapple height ~3)
 let RIBBON_HALF_WIDTH = 0.025;     // ~2.5cm half-width ?5cm total band width (clearly visible)
@@ -747,7 +745,7 @@ function computeBandRestRadii(origin,normal,restPos,restIdx){
     perim+=Math.sqrt(r1*r1+r2*r2-2*r1*r2*Math.cos(da));
   }
   const preScale=exact.perimeter>0?BAND_REST_CIRCUM/exact.perimeter:1.0;
-  console.log('📏 band precompute: exactPerimeter='+exact.perimeter.toFixed(3)+' binPerim='+perim.toFixed(3)+' L₀='+BAND_REST_CIRCUM.toFixed(3)+' preScale='+preScale.toFixed(4)+' radii range=['+Math.min(...radii).toFixed(3)+','+Math.max(...radii).toFixed(3)+'] @'+performance.now().toFixed(0)+'ms');
+  console.log('📏 band precompute: exactPerimeter='+exact.perimeter.toFixed(3)+' binPerim='+perim.toFixed(3)+' L₀='+BAND_REST_CIRCUM.toFixed(3)+' preScale='+preScale.toFixed(4)+' radii range=['+Math.min(...radii).toFixed(3)+','+Math.max(...radii).toFixed(3)+']');
   return{radii,centroid:[cx,cy,cz],preScale,restPerimeter:exact.perimeter};
 }
 
@@ -776,36 +774,22 @@ function addBand(origin,normal){
   };
   bands.push(band);
   writeBandRestRadii(bands.length-1,pre.radii);
-  const tMesh0=performance.now();
-  const visRibbon=createBandRibbonMesh(bands.length-1);
   const visTarget=makeBandLine('#33ff33',0.35);
-  const tMesh1=performance.now();
-  console.log('  ↳ mesh+line creation: '+(tMesh1-tMesh0).toFixed(1)+'ms (total bands='+bands.length+') @'+tMesh1.toFixed(0)+'ms');
   visTarget.visible = showTargetLine;
-  bandVisuals.push({ribbon:visRibbon,lineTarget:visTarget});
+  bandVisuals.push({lineTarget:visTarget});
   H.bcount.textContent=bands.length;
   updateLastBandPanel(bands.length-1);
-  _lastBandAddTime=performance.now(); // timestamp BEFORE markPbdDirty for accurate gap
   markPbdDirty();
-  // Double-rAF: measure true latency from addBand to screen update
-  const addTime=_lastBandAddTime;
-  requestAnimationFrame(()=>{
-    requestAnimationFrame(()=>{
-      console.log('⏱️ addBand→screen latency: '+(performance.now()-addTime).toFixed(0)+'ms (double rAF) @'+performance.now().toFixed(0)+'ms');
-    });
-  });
 }
 function removeBand(){
   if(bands.length===0)return;
   bands.pop();
   const vis=bandVisuals.pop();
   if(vis){
-    vis.ribbon.geometry.dispose();vis.ribbon.material.dispose();scene.remove(vis.ribbon);
     vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();scene.remove(vis.lineTarget);
   }
   H.bcount.textContent=bands.length;
   needsRestore=true;markPbdDirty();
-  _lastBandAddTime=performance.now();
   if(bands.length>0)updateLastBandPanel(bands.length-1);
   else{$('lb_info').textContent='(none)';}
 }
@@ -1514,30 +1498,29 @@ struct P{bandIndex:u32,vc:u32,bc:u32,hw:f32,surfaceOff:f32,thickness:f32,compres
 @compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
   let v=gid.x;if(v>=p.vc){return;}
   let P=pos[v].xyz;let bi=p.bandIndex;let tol=p.hw*2.5;
-  // Count bands above target that cover this vertex
-  var aboveCount=0u;
-  for(var k=bi+1u;k<p.bc;k++){
+  // Phase 1: count total covered + aboveMe + build "rank" (position in covered set)
+  var totalCovered=0u;var aboveMe=0u;
+  for(var k=0u;k<p.bc;k++){
     let bp=params[k];
     let d=abs((P.x-bp.ox)*bp.nx+(P.y-bp.oy)*bp.ny+(P.z-bp.oz)*bp.nz);
-    if(d<tol){aboveCount++;}
+    if(d<tol){
+      totalCovered++;
+      if(k>bi){aboveMe++;}
+    }
   }
-  let myThick=p.thickness/(1.0+f32(aboveCount)*p.compression);
-  // Stack below: sum effective thickness of bands j<bi covering this vertex
-  var stackBelow=0.0;
+  if(totalCovered==0u){offLo[v]=0.0;offHi[v]=0.0;return;}
+  // Phase 2: stack below via prefix sum — rank of band j = count of covered bands with index<j
+  var stackBelow=0.0;var coveredBefore=0u;
   for(var j=0u;j<bi;j++){
     let bp=params[j];
     let d=abs((P.x-bp.ox)*bp.nx+(P.y-bp.oy)*bp.ny+(P.z-bp.oz)*bp.nz);
     if(d<tol){
-      // Count bands above j covering this vertex (for compression)
-      var aboveJ=0u;
-      for(var k=j+1u;k<p.bc;k++){
-        let bpk=params[k];
-        let dk=abs((P.x-bpk.ox)*bpk.nx+(P.y-bpk.oy)*bpk.ny+(P.z-bpk.oz)*bpk.nz);
-        if(dk<tol){aboveJ++;}
-      }
+      let aboveJ=totalCovered-coveredBefore-1u; // bands above j in covered order
       stackBelow+=p.thickness/(1.0+f32(aboveJ)*p.compression);
+      coveredBefore++;
     }
   }
+  let myThick=p.thickness/(1.0+f32(aboveMe)*p.compression);
   offLo[v]=p.surfaceOff-myThick*0.5+stackBelow;
   offHi[v]=p.surfaceOff+myThick*0.5+stackBelow;
 }
@@ -1884,7 +1867,9 @@ let bandStackBG; // bind group
 // ── GPU Ribbon Mesh Gen buffers ──
 let bandBinRB,bandBinRYB,bandBinRZB,bandBinCB; // 4×64 atomics (R=RX, RY, RZ, C)
 let bandPolyPtsB;              // 4×64 vec4 polyline points (reused)
-let bandMeshPosB,bandMeshNormB,bandMeshUVB,bandMeshTanB; // mesh output (reused, then GPU→GPU copy)
+// ── Shared ribbon mesh buffers (all bands, compute→render direct, 0 copy) ──
+let _sharedPosB,_sharedNormB,_sharedUVB,_sharedTanB;
+let _sharedRibbonMesh;         // single mesh for all bands
 
 let bandCutUB,bandResolveUB,bandBuildUB; // uniforms
 let WG,VWG;
@@ -1960,10 +1945,13 @@ async function initGPU(){
   bandBinRZB=mkBuf(4*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandBinRZ');
   bandBinCB=mkBuf(4*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bandBinC');
   bandPolyPtsB=mkBuf(4*64*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandPolyPts');
-  bandMeshPosB=mkBuf(MAX_RIBBON_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshPos');
-  bandMeshNormB=mkBuf(MAX_RIBBON_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshNorm');
-  bandMeshUVB=mkBuf(MAX_RIBBON_VERTS*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshUV');
-  bandMeshTanB=mkBuf(MAX_RIBBON_VERTS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bandMeshTan');
+  // Shared buffers: compute writes direct, Three.js renders direct (STORAGE|VERTEX, 0 copies!)
+  const SHARED_VERTS=MAX_RIBBON_VERTS; // per-band vertex capacity
+  _sharedPosB=mkBuf(MAX_BANDS*SHARED_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'sharedPos');
+  _sharedNormB=mkBuf(MAX_BANDS*SHARED_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'sharedNorm');
+  _sharedUVB=mkBuf(MAX_BANDS*SHARED_VERTS*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'sharedUV');
+  _sharedTanB=mkBuf(MAX_BANDS*SHARED_VERTS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'sharedTan');
+  // Legacy per-band temp buffers removed — shared buffers replace them
   bandCutUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandCutU');
   bandResolveUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandResolveU');
   bandBuildUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandBuildU');
@@ -2075,6 +2063,59 @@ async function initGPU(){
   testStg.unmap();testStg.destroy();
   queue.writeBuffer(posA,0,pos4);
   }
+  
+  // Create shared ribbon mesh (all bands in ONE draw call, 0 copyBufferToBuffer)
+  _sharedRibbonMesh=createSharedRibbonMesh();
+}
+
+// ── Shared ribbon mesh: one geometry, one material, all bands ──
+function createSharedRibbonMesh(){
+  const totalAll=MAX_BANDS*MAX_RIBBON_VERTS;
+  const geo=new THREE.BufferGeometry();
+  // Use one-band-sized arrays as placeholders (Three.js GPU buffers are replaced below)
+  const posArr=new Float32Array(MAX_RIBBON_VERTS*3);
+  const normArr=new Float32Array(MAX_RIBBON_VERTS*3);
+  const uvArr=new Float32Array(MAX_RIBBON_VERTS*2);
+  const tanArr=new Float32Array(MAX_RIBBON_VERTS*4);
+  const posAttr=new THREE.Float32BufferAttribute(posArr,3);
+  const normAttr=new THREE.Float32BufferAttribute(normArr,3);
+  const uvAttr=new THREE.Float32BufferAttribute(uvArr,2);
+  const tanAttr=new THREE.Float32BufferAttribute(tanArr,4);
+  // Lie about count: GPU buffer has MAX_BANDS worth, CPU array is just placeholder
+  const FAKE_COUNT=MAX_BANDS*MAX_RIBBON_VERTS;
+  for(const a of[posAttr,normAttr])Object.defineProperty(a,'count',{get(){return FAKE_COUNT;},configurable:true});
+  for(const a of[uvAttr])Object.defineProperty(a,'count',{get(){return FAKE_COUNT;},configurable:true});
+  for(const a of[tanAttr])Object.defineProperty(a,'count',{get(){return FAKE_COUNT;},configurable:true});
+  posAttr.needsUpdate=true;normAttr.needsUpdate=true;uvAttr.needsUpdate=true;tanAttr.needsUpdate=true;
+  geo.setAttribute('position',posAttr);
+  geo.setAttribute('normal',normAttr);
+  geo.setAttribute('uv',uvAttr);
+  geo.setAttribute('tangent',tanAttr);
+  geo.setDrawRange(0,0);
+  const mat=new THREE.MeshPhysicalMaterial({
+    color:'#d4a017',roughness:RIBBON_ROUGHNESS,metalness:0.0,
+    anisotropy:RIBBON_ANISOTROPY,anisotropyRotation:Math.PI/2,
+    side:THREE.DoubleSide,depthTest:true,depthWrite:true,
+    polygonOffset:true, polygonOffsetFactor:1.0, polygonOffsetUnits:1.0,
+  });
+  const mesh=new THREE.Mesh(geo,mat);
+  mesh.renderOrder=1;mesh.frustumCulled=false;mesh.visible=false;
+  mesh.castShadow=true;mesh.receiveShadow=false;
+  // Override bounding sphere/box (Three.js would read NaN from placeholder array)
+  geo.boundingSphere=new THREE.Sphere(new THREE.Vector3(0,0,0),100);
+  geo.boundingBox=new THREE.Box3(new THREE.Vector3(-100,-100,-100),new THREE.Vector3(100,100,100));
+  scene.add(mesh);
+  // Force Three.js to create GPU buffers, then replace with shared buffers
+  const attrNames=['position','normal','uv','tangent'];
+  const sharedBufs=[_sharedPosB,_sharedNormB,_sharedUVB,_sharedTanB];
+  for(let i=0;i<attrNames.length;i++){
+    const attr=geo.attributes[attrNames[i]];
+    renderer.backend.createAttribute(attr);
+    const be=renderer.backend.get(attr);
+    if(be)be.buffer=sharedBufs[i];
+    attr.needsUpdate=false;
+  }
+  return mesh;
 }
 
 // ══════.?GPU PBD: write band params to GPU buffer ══════.?
@@ -2101,9 +2142,7 @@ async function readbackProxyPositions(srcBuf){
   const cmd=device.createCommandEncoder();
   cmd.copyBufferToBuffer(srcBuf===posA?posA:posB,0,staging,0,size);
   device.queue.submit([cmd.finish()]);
-  const tWait0=performance.now();
   await staging.mapAsync(GPUMapMode.READ);
-  const tWait1=performance.now();
   const arr=new Float32Array(staging.getMappedRange(0,size));
   for(let i=0;i<proxyVertexCount;i++){
     proxyCurPositions[i*3]=arr[i*4];
@@ -2111,8 +2150,6 @@ async function readbackProxyPositions(srcBuf){
     proxyCurPositions[i*3+2]=arr[i*4+2];
   }
   staging.unmap();
-  const tCopy=performance.now()-tWait1;
-  if(tWait1-tWait0>1||tCopy>1)console.log('  ↳ readbackProxy: mapAsync='+(tWait1-tWait0).toFixed(1)+'ms copy='+tCopy.toFixed(1)+'ms');
 }
 
 // Read back current volume from GPU buffer for HUD display
@@ -2177,11 +2214,7 @@ let _bandSmallU8=null;              // Pre-alloc for band uniform 8 bytes
 async function runGPUPBD(){
   const bc=bands.length;
   if(!bandParamsB)return;
-  if(bc>0){
-    const addDelay=_lastBandAddTime>0?performance.now()-_lastBandAddTime:0;
-    _lastBandAddTime=0;
-    console.log('⏱️ PBD enter bc='+bc+(addDelay>0?' (+'+addDelay.toFixed(0)+'ms since addBand)':'')+' @'+performance.now().toFixed(0)+'ms');
-  }
+  if(bc>0)console.log('⏱️ PBD enter bc='+bc);
 
   // Upload ALL band params at their proper offsets (done once per frame)
   writeBandParams();
@@ -2193,9 +2226,6 @@ async function runGPUPBD(){
   if(!_zeroVox||_zeroVox.length<VOX_TOTAL){_zeroVox=new Uint32Array(VOX_TOTAL);}
   if(!_zeroVolU||_zeroVolU.length<1){_zeroVolU=new Uint32Array(1);}
   if(!_zeroVolF||_zeroVolF.length<1){_zeroVolF=new Float32Array(1);}
-
-  let srcPos=posA,dstPos=posB;
-  const lastIter=PBD_ITER-1;
 
   // Pre-fill reusable uniform buffers (values that don't change per iteration)
   new Float32Array(_shapeU)[1]=0;
@@ -2212,9 +2242,8 @@ async function runGPUPBD(){
   new Float32Array(_voxU32,24)[0]=voxGS[1];
   new Float32Array(_voxU32,28)[0]=voxGS[2];
 
-  // Pre-clear volB (once per frame, volAcc overwrites it each iteration)
+  // Pre-clear volB + voxel buffers (once per frame)
   queue.writeBuffer(volB,0,_zeroTriP);
-  // Pre-clear voxel buffers (once per frame, outside timing)
   queue.writeBuffer(voxDxBuf,0,_zeroVox);
   queue.writeBuffer(voxDyBuf,0,_zeroVox);
   queue.writeBuffer(voxDzBuf,0,_zeroVox);
@@ -2225,55 +2254,38 @@ async function runGPUPBD(){
   _bandSmallU8[0]=proxyVertexCount;_bandSmallU8[1]=bc;
   queue.writeBuffer(bandReduceAllUB,0,_bandSmallU8);
 
-  // 🔍 Timing accumulators
-  let tWrite=0,tShape=0,tBand=0,tVol=0,tSubmit=0;
-
+  let srcPos=posA,dstPos=posB;
+  const lastIter=PBD_ITER-1;
   for(let iter=0;iter<PBD_ITER;iter++){
     const isA=srcPos===posA,isLast=iter===lastIter;
 
-    // ══════.?Phase 1: Write ALL per-iteration uniforms (before encoder) ══════.?
-    let t0=performance.now();
     new Float32Array(_shapeU)[0]=SHAPE_STIFF;
     queue.writeBuffer(shapeUB,0,_shapeU);
 
-    let tw1=performance.now();
-    // (no bin clearing needed .?radius-based constraint doesn't use bins)
-    let tw2=performance.now();
     _zeroVolU[0]=proxyTriCount;
     queue.writeBuffer(volAccUB,0,_zeroVolU);
     queue.writeBuffer(volTotalB,0,_zeroVolF);
-    // volB cleared once before loop .?volAcc overwrites all slots
     for(let li=0;li<volRedLevels.length;li++){
       const lv=volRedLevels[li];if(lv.dstBuf!==volTotalB)queue.writeBuffer(lv.dstBuf,0,_zeroRedLv[li]);
     }
     new Float32Array(_volU16,8)[0]=VOL_STIFF;
     queue.writeBuffer(volApUB,0,_volU16);
 
-    let tw3=performance.now();
     if(isLast){
       new Uint32Array(_voxU32)[0]=proxyVertexCount;
       queue.writeBuffer(voxelScatterUB,0,_voxU32);
     }
-    let tIter=t0;
-    tWrite+=performance.now()-t0;
-    let dtIter=performance.now()-tIter;
-    if(dtIter>1.0)console.log('⏱️   iter='+iter+' write='+dtIter.toFixed(1)+'ms (shape='+(tw1-t0).toFixed(1)+' bins='+(tw2-tw1).toFixed(1)+' vol='+(tw3-tw2).toFixed(1)+' vox='+(performance.now()-tw3).toFixed(1)+')');
 
-    // ══════.?Phase 2: ONE command encoder, multiple compute passes ══════.?
     const cmd=device.createCommandEncoder();
-
-    // ── Shape pass ──
-    t0=performance.now();
+    // Shape pass
     {const cp=cmd.beginComputePass();
     cp.setPipeline(shapePipe.pipe);
     cp.setBindGroup(0,isA?shapeBG_AB:shapeBG_BA);
     cp.dispatchWorkgroups(WG,1,1);
     cp.end();}
     [srcPos,dstPos]=[dstPos,srcPos];
-    tShape+=performance.now()-t0;
 
-    // ── Band pass: applyRadius only (per-vertex GS with REST centroid, no reduceAll needed) ──
-    t0=performance.now();
+    // Band pass
     if(bc>0){
       const cp=cmd.beginComputePass();
       const isAB=srcPos===posA;
@@ -2283,10 +2295,8 @@ async function runGPUPBD(){
       [srcPos,dstPos]=[dstPos,srcPos];
       cp.end();
     }
-    tBand+=performance.now()-t0;
 
-    // ── Volume pass ──
-    t0=performance.now();
+    // Volume pass
     {const isAV=srcPos===posA;
     const cp=cmd.beginComputePass();
     cp.setPipeline(volAccPipe.pipe);
@@ -2306,33 +2316,24 @@ async function runGPUPBD(){
       cp.dispatchWorkgroups(WG,1,1);
     }
     cp.end();}
-    tVol+=performance.now()-t0;
 
-    // ══════.?Phase 3: ONE submit ══════.?
-    t0=performance.now();
     device.queue.submit([cmd.finish()]);
-    tSubmit+=performance.now()-t0;
     [srcPos,dstPos]=[dstPos,srcPos];
   }
   const finalSrc=srcPos;
-
-  if(bc>0){console.log('⏱️ bands='+bc+' write='+tWrite.toFixed(1)+' shape='+tShape.toFixed(1)+' band='+tBand.toFixed(1)+' vol='+tVol.toFixed(1)+' submit='+tSubmit.toFixed(1)+' total='+(tWrite+tShape+tBand+tVol+tSubmit).toFixed(1)+'ms');}
   return finalSrc;
 }
 
+// ══════ Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ══════
+
 // ══════.?Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ══════.?
 async function runGPUPostPBD(srcBuf){
-  const t0=performance.now();
   // Normalize voxel grid
   queue.writeBuffer(voxelNormUB,0,new Uint32Array([64]));
   const cmd0=device.createCommandEncoder();const cp0=cmd0.beginComputePass();
   cp0.setPipeline(voxelNormPipe.pipe);cp0.setBindGroup(0,voxelNormBG);cp0.dispatchWorkgroups(Math.ceil(VOX_TOTAL/256),1,1);
   cp0.end();device.queue.submit([cmd0.finish()]);
 
-  // Apply voxel grid to high-res mesh .?NOT waiting: GPU queue orders naturally
-  // (removed await device.queue.onSubmittedWorkDone .?bottleneck was here)
-  const tSync=performance.now();
-  const tSyncEnd=performance.now();
   const vu=new ArrayBuffer(32);
   new Uint32Array(vu)[0]=highResCount;new Uint32Array(vu)[1]=64;
   new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
@@ -2371,12 +2372,9 @@ async function runGPUPostPBD(srcBuf){
       device.queue.submit([cmd3.finish()]);
     }
   }
-  console.log('⏱️ PostPBD: sync='+(tSyncEnd-tSync).toFixed(1)+'ms total='+(performance.now()-t0).toFixed(1)+'ms');
 }
 
-// ══════.?GPU Band Visualization (Plan C: GPU stack + cut + build) ══════.?
-
-// ══════.?GPU Band Visualization (Plan C: GPU stack offsets + CPU mesh build) ══════.?
+// ══════ GPU Band Visualization ══════
 async function runGPUBandVis(finalSrc){
   if(!bandOffLoB){H.bandtime.textContent='0 ms';return 0;}
   const bc=bands.length;
@@ -2395,14 +2393,10 @@ async function runGPUBandVis(finalSrc){
   const comp=BAND_COMPRESSION_PER_LAYER;
   const ringSegs=192, widthSegs=RIBBON_WIDTH_SEGMENTS, totalVerts=ringSegs*(widthSegs*12+12);
 
-  // Skip CPU proxy readback — GPU band vis is self-contained
-  let tProxyRead=0;
   // Compute centroid from rest positions (stable, computed once during model load)
   let cx=0,cy=0,cz=0;
   for(let i=0;i<proxyVertexCount;i++){cx+=proxyRestPositions[i*3];cy+=proxyRestPositions[i*3+1];cz+=proxyRestPositions[i*3+2];}
   cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
-
-  let tGpuStack=0, tCut=0, tResolve=0, tBuild=0, tCopy=0, tTarget=0;
 
   // Pre-set uniform fields that don't change per band
   _cutU8[1]=proxyVertexCount; _cutU8[2]=proxyTriCount;
@@ -2411,14 +2405,13 @@ async function runGPUBandVis(finalSrc){
   _buildF32[3]=cx; _buildF32[4]=cy; _buildF32[5]=cz;
   _resU32=_resU32||new Uint32Array(new ArrayBuffer(8));
 
-  let t1;
-  // Per-band GPU pipeline (stack→cut→resolve→build→copy)
+  // Per-band GPU pipeline (stack→cut→resolve→build)
   for(let b=0;b<bc;b++){
     if(!bands[b]||!bandVisuals[b])continue;
     
     const enc=device.createCommandEncoder();
     
-    // Stack
+    // Stack (O(vc*bc) — prefix-sum algorithm)
     _stackU8[0]=b; _stackU8[1]=proxyVertexCount; _stackU8[2]=bc;
     _stackF32[3]=hw; _stackF32[4]=surfOff; _stackF32[5]=thick; _stackF32[6]=comp;
     queue.writeBuffer(bandStackUB,0,_stackU8);
@@ -2450,49 +2443,33 @@ async function runGPUBandVis(finalSrc){
       {binding:4,resource:{buffer:bandPolyPtsB}},{binding:5,resource:{buffer:bandResolveUB}}]});
     {const cp=enc.beginComputePass();cp.setPipeline(bandResolvePipe.pipe);cp.setBindGroup(0,resolveBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
     
-    // Build
+    // Build — write directly to shared buffers at band offset (0 copy!)
     _buildU8[0]=b; queue.writeBuffer(bandBuildUB,0,_buildU8);
+    const bandVtxOff=b*totalVerts; // must match drawRange stride
     const buildBG=device.createBindGroup({layout:bandBuildMeshPipe.bgl,entries:[
       {binding:0,resource:{buffer:bandPolyPtsB}},{binding:1,resource:{buffer:bandParamsB}},
-      {binding:2,resource:{buffer:bandMeshPosB}},{binding:3,resource:{buffer:bandMeshNormB}},
-      {binding:4,resource:{buffer:bandMeshUVB}},{binding:5,resource:{buffer:bandMeshTanB}},
+      {binding:2,resource:{buffer:_sharedPosB,offset:bandVtxOff*3*4,size:totalVerts*3*4}},
+      {binding:3,resource:{buffer:_sharedNormB,offset:bandVtxOff*3*4,size:totalVerts*3*4}},
+      {binding:4,resource:{buffer:_sharedUVB,offset:bandVtxOff*2*4,size:totalVerts*2*4}},
+      {binding:5,resource:{buffer:_sharedTanB,offset:bandVtxOff*4*4,size:totalVerts*4*4}},
       {binding:6,resource:{buffer:bandBuildUB}}]});
     {const cp=enc.beginComputePass();cp.setPipeline(bandBuildMeshPipe.pipe);cp.setBindGroup(0,buildBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
     
-    // GPU→GPU copy to Three.js (ribbon mesh)
-    const vis=bandVisuals[b];
-    if(vis&&vis.ribbon){
-      const geo=vis.ribbon.geometry;
-      for(const name of['position','normal','uv','tangent']){
-        const attr=geo.attributes[name];
-        if(attr){let d=renderer.backend.get(attr);if(!d||!d.buffer){renderer.backend.createAttribute(attr);}}
-      }
-      const pD=renderer.backend.get(geo.attributes.position);
-      const nD=renderer.backend.get(geo.attributes.normal);
-      const uD=renderer.backend.get(geo.attributes.uv);
-      const tD=renderer.backend.get(geo.attributes.tangent);
-      if(pD?.buffer)enc.copyBufferToBuffer(bandMeshPosB,0,pD.buffer,0,totalVerts*3*4);
-      if(nD?.buffer)enc.copyBufferToBuffer(bandMeshNormB,0,nD.buffer,0,totalVerts*3*4);
-      if(uD?.buffer)enc.copyBufferToBuffer(bandMeshUVB,0,uD.buffer,0,totalVerts*2*4);
-      if(tD?.buffer)enc.copyBufferToBuffer(bandMeshTanB,0,tD.buffer,0,totalVerts*4*4);
-      geo.setDrawRange(0,totalVerts);
-      vis.ribbon.visible=true;
-    }
-    
-    t1=performance.now();
     device.queue.submit([enc.finish()]);
-    tBuild+=performance.now()-t1;
+  }
+  
+  // Update shared ribbon mesh: one draw call for all bands, 0 copyBufferToBuffer
+  if(_sharedRibbonMesh){
+    if(bc>0){
+      _sharedRibbonMesh.geometry.setDrawRange(0,bc*totalVerts);
+      _sharedRibbonMesh.visible=true;
+    }else{
+      _sharedRibbonMesh.geometry.setDrawRange(0,0);
+      _sharedRibbonMesh.visible=false;
+    }
   }
 
-  // Green target lines + HUD skipped — GPU band vis is self-contained
-  let tHud=0;
-
   const elapsed=performance.now()-t0;
-  console.log('GPU BandVis: '+bands.length+' bands, total='+elapsed.toFixed(1)+'ms'+
-    ' | proxy='+tProxyRead.toFixed(1)+' stack='+tGpuStack.toFixed(1)+
-    ' cut='+tCut.toFixed(1)+' resolve='+tResolve.toFixed(1)+
-    ' build='+tBuild.toFixed(1)+' copy='+tCopy.toFixed(1)+
-    ' target='+tTarget.toFixed(1)+' @'+performance.now().toFixed(0)+'ms');
   return elapsed;
 }
 let _stackU8=null,_stackF32=null,_cutU8=null,_cutF32=null,_buildU8=null,_buildF32=null,_resU32=null,_zeroBins=null;
@@ -2636,42 +2613,32 @@ window.onresize=()=>{
 const clock={last:performance.now()};
 let fpsFrames=0,fpsTime=0;
 
-let _lastFrameStart=0;
-let _lastBandAddTime=0; // timestamp of last addBand() for gap measurement
 async function animate(){
   const now=performance.now(),dt=Math.min((now-clock.last)/1000,0.1);clock.last=now;
   if(!loaded){requestAnimationFrame(animate);return;}
 
   const t0=performance.now();
-  const gap=t0-_lastFrameStart; _lastFrameStart=t0;
-  const wasConverging=!pbdConverged; // snapshot before this frame may set it
 
-  let tPbd=0,tPost=0,tRv=0,tRp=0,tBv=0,tRender=0,frameNum=convergeFrames;
   if(bands.length>0&&!pbdConverged){
     const pbdT0=performance.now();
     const finalSrc=await runGPUPBD();
-    const t1=performance.now();
     await runGPUPostPBD(finalSrc);
-    const t2=performance.now();
-    tPbd=t1-pbdT0; tPost=t2-t1;
-    frameNum=convergeFrames;
-    pbdAccumTime+=tPbd+tPost;
+    const frameTime=performance.now()-pbdT0;
+    pbdAccumTime+=frameTime;
     convergeFrames++;
     if(convergeFrames>=CONVERGE_FRAMES){
       pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
-      const rv0=performance.now(); if(showVolumeReadback)await readbackVolume(); tRv=performance.now()-rv0;
-      const bv0=performance.now(); await runGPUBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';}); tBv=performance.now()-bv0;
+      if(showVolumeReadback)await readbackVolume();
+      await runGPUBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
     }
     else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
   }else if(bands.length>0&&pbdConverged){
     H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
   }else if(needsRestore){
-    // Restore: reset GPU proxy positions + zero displacement
     const pos4r=new Float32Array(proxyVertexCount*4);
     for(let i=0;i<proxyVertexCount;i++){pos4r[i*4]=proxyRestPositions[i*3];pos4r[i*4+1]=proxyRestPositions[i*3+1];pos4r[i*4+2]=proxyRestPositions[i*3+2];pos4r[i*4+3]=1;}
     queue.writeBuffer(posA,0,pos4r);
     queue.writeBuffer(posB,0,pos4r);
-    // Clear all voxel buffers so voxelNorm produces zero displacement
     queue.writeBuffer(voxDxBuf,0,new Uint32Array(VOX_TOTAL));
     queue.writeBuffer(voxDyBuf,0,new Uint32Array(VOX_TOTAL));
     queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
@@ -2681,28 +2648,19 @@ async function animate(){
     needsRestore=false;lastVol=restVolume;
     H.pbdtime.textContent='Restored';
     H.vratio.textContent='100.0';
-    // 恢复后更新皮筋可视化(GPU)
     await runGPUBandVis(posA).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
   }else{
     H.pbdtime.textContent='空闲';
   }
 
-
   const tRender0=performance.now();
   renderer.render(scene,camera);
-  tRender=performance.now()-tRender0;
+  const renderMs=performance.now()-tRender0;
   fpsFrames++;fpsTime+=dt;
   if(fpsTime>=1.0){
     H.fps.textContent=Math.round(fpsFrames/fpsTime);
     H.framems.textContent=(performance.now()-t0).toFixed(1);
     fpsFrames=0;fpsTime=0;
-  }
-
-  const total=performance.now()-t0;
-  if(wasConverging){
-    console.log('⏱️ #'+frameNum+' gap='+gap.toFixed(1)+' pbd='+tPbd.toFixed(1)+' post='+tPost.toFixed(1)+
-      ' rv='+tRv.toFixed(1)+' rp='+tRp.toFixed(1)+' bv='+tBv.toFixed(1)+
-      ' render='+tRender.toFixed(1)+' total='+total.toFixed(1)+'ms @'+performance.now().toFixed(0)+'ms');
   }
   requestAnimationFrame(animate);
 }
