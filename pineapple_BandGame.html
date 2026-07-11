@@ -791,10 +791,15 @@ function removeBand(){
   H.bcount.textContent=bands.length;
   needsRestore=true;markPbdDirty();
   if(bands.length>0)updateLastBandPanel(bands.length-1);
-  else{$('lb_info').textContent='(none)';}
+  else{
+    $('lb_info').textContent='(none)';
+    if(_sharedRibbonMesh){_sharedRibbonMesh.geometry.setDrawRange(0,0);_sharedRibbonMesh.visible=false;}
+  }
 }
 function removeAllBands(){
   while(bands.length>0)removeBand();
+  // Immediately hide shared mesh (don't wait for next rAF)
+  if(_sharedRibbonMesh){_sharedRibbonMesh.geometry.setDrawRange(0,0);_sharedRibbonMesh.visible=false;}
 }
 
 // ══════.?Last band panel ══════.?
@@ -1743,7 +1748,7 @@ fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32,tx:f
       writeVert(vi+4u,i0jx,i0jy,i0jz, ni0j.x,ni0j.y,ni0j.z, uvj,f0, ti0j.x,ti0j.y,ti0j.z);
       writeVert(vi+5u,i1jx,i1jy,i1jz, ni1j.x,ni1j.y,ni1j.z, uvj,f1, ti1j.x,ti1j.y,ti1j.z);
       if(w==0u){
-        let vs=v0+12u;
+        let vs=baseV+W*12u;  // left wall after all width segments
         writeVert(vs,   i0x,i0y,i0z, nx,ny,nz, uv_,0.5, t00.x,t00.y,t00.z);
         writeVert(vs+1u,o0x,o0y,o0z, nx,ny,nz, uv_,0.5, t00.x,t00.y,t00.z);
         writeVert(vs+2u,o0jx,o0jy,o0jz, nx,ny,nz, uvj,0.5, t0j0.x,t0j0.y,t0j0.z);
@@ -1752,7 +1757,7 @@ fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32,tx:f
         writeVert(vs+5u,i0jx,i0jy,i0jz, nx,ny,nz, uvj,0.5, t0j0.x,t0j0.y,t0j0.z);
       }
       if(w==W-1u){
-        let vs=v0+12u+select(0u,6u,w==0u);
+        let vs=baseV+W*12u+6u;  // right wall after left wall
         writeVert(vs,   i1x,i1y,i1z, -nx,-ny,-nz, uv_,0.5, ti1.x,ti1.y,ti1.z);
         writeVert(vs+1u,i1jx,i1jy,i1jz, -nx,-ny,-nz, uvj,0.5, ti1j.x,ti1j.y,ti1j.z);
         writeVert(vs+2u,o1x,o1y,o1z, -nx,-ny,-nz, uv_,0.5, t01.x,t01.y,t01.z);
@@ -1869,6 +1874,7 @@ let bandBinRB,bandBinRYB,bandBinRZB,bandBinCB; // 4×64 atomics (R=RX, RY, RZ, C
 let bandPolyPtsB;              // 4×64 vec4 polyline points (reused)
 // ── Shared ribbon mesh buffers (all bands, compute→render direct, 0 copy) ──
 let _sharedPosB,_sharedNormB,_sharedUVB,_sharedTanB;
+let _greenAllB;                // green target line staging (MAP_READ)
 let _sharedRibbonMesh;         // single mesh for all bands
 
 let bandCutUB,bandResolveUB,bandBuildUB; // uniforms
@@ -1951,6 +1957,8 @@ async function initGPU(){
   _sharedNormB=mkBuf(MAX_BANDS*SHARED_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'sharedNorm');
   _sharedUVB=mkBuf(MAX_BANDS*SHARED_VERTS*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'sharedUV');
   _sharedTanB=mkBuf(MAX_BANDS*SHARED_VERTS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'sharedTan');
+  // Green target line staging (outer-L polyline, 64 vec4 × MAX_BANDS)
+  _greenAllB=mkBuf(MAX_BANDS*64*16,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'greenAll');
   // Legacy per-band temp buffers removed — shared buffers replace them
   bandCutUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandCutU');
   bandResolveUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandResolveU');
@@ -2455,7 +2463,36 @@ async function runGPUBandVis(finalSrc){
       {binding:6,resource:{buffer:bandBuildUB}}]});
     {const cp=enc.beginComputePass();cp.setPipeline(bandBuildMeshPipe.pipe);cp.setBindGroup(0,buildBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
     
+    // Copy outer-L polyline to green staging for target line
+    enc.copyBufferToBuffer(bandPolyPtsB,0,_greenAllB,b*64*16,64*16);
+    
     device.queue.submit([enc.finish()]);
+  }
+  
+  // Green target lines: read back outer-L polylines, scale toward centroid
+  if(bc>0&&_greenAllB){
+    await device.queue.onSubmittedWorkDone();
+    await _greenAllB.mapAsync(GPUMapMode.READ);
+    const gd=new Float32Array(_greenAllB.getMappedRange(0,bc*64*16));
+    for(let b=0;b<bc;b++){
+      const vis=bandVisuals[b];if(!vis||!vis.lineTarget)continue;
+      const band=bands[b];if(!band)continue;
+      const base=b*64*4;
+      let nV=0,cxG=0,cyG=0,czG=0;
+      for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;nV++;cxG+=gd[base+i*4];cyG+=gd[base+i*4+1];czG+=gd[base+i*4+2];}
+      if(nV<3){vis.lineTarget.visible=false;continue;}
+      cxG/=nV;cyG/=nV;czG/=nV;
+      let perim=0,fa=-1,pa=-1;
+      for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;if(fa<0)fa=i;if(pa>=0){const dx=gd[base+i*4]-gd[base+pa*4],dy=gd[base+i*4+1]-gd[base+pa*4+1],dz=gd[base+i*4+2]-gd[base+pa*4+2];perim+=Math.sqrt(dx*dx+dy*dy+dz*dz);}pa=i;}
+      if(fa>=0&&pa>=0&&pa!==fa){const dx=gd[base+fa*4]-gd[base+pa*4],dy=gd[base+fa*4+1]-gd[base+pa*4+1],dz=gd[base+fa*4+2]-gd[base+pa*4+2];perim+=Math.sqrt(dx*dx+dy*dy+dz*dz);}
+      const rc=band.restCircum||perim;
+      if(perim>rc&&rc>0){
+        const s=rc/perim,pts=[];
+        for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;pts.push(cxG+(gd[base+i*4]-cxG)*s,cyG+(gd[base+i*4+1]-cyG)*s,czG+(gd[base+i*4+2]-czG)*s);}
+        updateBandLine(vis.lineTarget,pts);vis.lineTarget.visible=showTargetLine;
+      }else{vis.lineTarget.visible=false;}
+    }
+    _greenAllB.unmap();
   }
   
   // Update shared ribbon mesh: one draw call for all bands, 0 copyBufferToBuffer
