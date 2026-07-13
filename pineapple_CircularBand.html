@@ -97,7 +97,19 @@ canvas { display:block; cursor:crosshair; }
  <label>亮度 <span class="val" id="sv_bb">0.70</span></label>
  <input type="range" id="sl_bb" min="0.1" max="2.0" step="0.01" value="0.70">
 
- <h3>🔦 追光灯</h3>
+ <h3>💡 光斑</h3>
+ <label>颜色 <input type="color" id="halo_color" value="#ffffff" style="width:100%;height:28px;border:none;cursor:pointer;"></label>
+ <label>亮度 <span class="val" id="halo_sb">1.00</span></label>
+ <input type="range" id="halo_slb" min="0.1" max="3.0" step="0.01" value="1.00">
+ <label>羽化 <span class="val" id="halo_ssf">0.30</span></label>
+ <input type="range" id="halo_slsf" min="0.02" max="1.0" step="0.01" value="0.30">
+ <label>透明度 <span class="val" id="halo_so">1.00</span></label>
+ <input type="range" id="halo_slo" min="0" max="1.0" step="0.01" value="1.00">
+ <label>大小 <span class="val" id="halo_ssz">6</span></label>
+ <input type="range" id="halo_slsz" min="1" max="20" step="0.5" value="6">
+ <div class="row"><span>Y偏移</span><input type="range" id="halo_sly" min="-5" max="10" step="0.1" value="0"><span class="val" id="halo_svy">0</span></div>
+
+ <h3>�🔦 追光灯</h3>
  <label>色相 <span class="val" id="spot_sh">0°</span></label>
  <input type="range" id="spot_slh" min="0" max="360" step="1" value="0">
  <label>饱和度 <span class="val" id="spot_ss">0.00</span></label>
@@ -232,6 +244,7 @@ function createCycloramaBackdrop() {
   backdropMesh.renderOrder = -1;
   backdropMesh.receiveShadow = true;
   backdropMesh.name = 'cycloramaUnified';
+  backdropMesh.layers.enable(1); // also receive spotlight (layer 1)
   scene.add(backdropMesh);
 
   // ── Side walls (separate, DoubleSide) ──
@@ -254,6 +267,7 @@ function createCycloramaBackdrop() {
     const sw = new THREE.Mesh(sg, sm);
     sw.renderOrder = -1; sw.receiveShadow = true;
     sw.name = 'sideWall'; sw.userData.isBackdropPart = true;
+    sw.layers.enable(1); // also receive spotlight
     scene.add(sw);
     backdropMesh.userData.sideWalls.push(sw);
   }
@@ -282,19 +296,27 @@ const envMap = pmremGenerator.fromScene(scene, 0.5).texture;
 scene.environment = envMap;
 pmremGenerator.dispose();
 
-// ── Concert Spotlight (追光灯) ──
-// Generate radial gradient texture via offscreen Canvas
-function createRadialGradientTexture(size) {
+// ── Radial Gradient Texture (shared by spotlight + halo) ──
+// Mimics SpotLight penumbra: smoothstep from inner radius to outer radius
+function createRadialGradientTexture(size, softness) {
   const canvas = document.createElement('canvas');
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext('2d');
   const half = size / 2;
-  const gradient = ctx.createRadialGradient(half, half, half * 0.05, half, half, half);
-  gradient.addColorStop(0, 'rgba(255,255,255,1)');    // center: full white
-  gradient.addColorStop(0.3, 'rgba(255,255,255,0.9)');
-  gradient.addColorStop(0.6, 'rgba(255,255,255,0.4)');
-  gradient.addColorStop(0.85, 'rgba(255,255,255,0.05)');
-  gradient.addColorStop(1, 'rgba(255,255,255,0)');     // edge: transparent
+  const s = Math.max(0.02, softness);
+  // inner=1-s: full white inside this radius. outer=1: transparent at edge.
+  // penumbra semantics: inner cone → outer cone fade
+  const rInner = half * (1 - s);
+  const rOuter = half;
+  const gradient = ctx.createRadialGradient(half, half, rInner, half, half, rOuter);
+  const N = 30;
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    // smoothstep: t=0 at rInner → a=1, t=1 at rOuter → a=0
+    const x = t;
+    const a = x >= 1 ? 0 : x <= 0 ? 1 : 1 - x * x * (3 - 2 * x);
+    gradient.addColorStop(t, `rgba(255,255,255,${a.toFixed(4)})`);
+  }
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, size, size);
   const tex = new THREE.CanvasTexture(canvas);
@@ -302,19 +324,71 @@ function createRadialGradientTexture(size) {
   tex.needsUpdate = true;
   return tex;
 }
-const spotGobo = createRadialGradientTexture(512);
+const spotGobo = createRadialGradientTexture(512, 0.2);
 
 // Standard SpotLight — physically based, no cheats
+// SpotLight behind the backdrop, shining forward — physically can't hit the pineapple.
+// Backdrop is DoubleSide→FrontSide, so light from behind passes through? No.
+// Actually: place spotlight behind wall (z < -3), aim at wall back-face.
+// The wall FrontSide faces +Z (camera). BackSide faces -Z.
+// Light from behind hits the BACK of the wall → with FrontSide material, not visible.
+// 
+// Better: keep spotlight in front, but target it ONLY at the wall area.
+// Use narrow angle so the cone misses the pineapple entirely.
+// spotlight at (0, -1, 4), target at (0, -2, -3) → aims at lower part of wall, below pineapple
+
+// Simpler approach: spotlight at same level as pineapple but far enough that
+// with a small angle, the cone is tight on the wall behind the pineapple.
+// Pineapple at z≈0, radius≈1.5. Spotlight at (0, 0, 3), angle=0.15, target (0,0,-3).
+// At pineapple (z=0): cone radius = 3*tan(0.15) ≈ 0.45. Pineapple radius ≈1.5.
+// Most of pineapple is OUTSIDE the tight cone. Only center gets hit.
+// At wall (z=-3): cone radius = 6*tan(0.15) ≈ 0.9. Creates a tight circle.
+
 const spotLight = new THREE.SpotLight('#ff8844', 30.0);
 spotLight.angle = 0.40;
 spotLight.penumbra = 0.30;
-spotLight.decay = 2;             // inverse-square (standard)
-spotLight.distance = 0;          // 0 = unlimited
-spotLight.position.set(0, 0, 5);       // directly in front, same height as model
-spotLight.target.position.set(0, 0, -3.0); // shine straight back at backdrop
+spotLight.decay = 2;
+spotLight.distance = 0;
+spotLight.position.set(0, 0, 5);
+spotLight.target.position.set(0, 0, -3.0);
 spotLight.map = spotGobo;
 scene.add(spotLight);
 scene.add(spotLight.target);
+
+// ── Halo 光斑 (独立于追光灯，纯视觉叠加层) ──
+let haloGobo = createRadialGradientTexture(1024, 0.3);
+const haloGeo = new THREE.PlaneGeometry(6, 6);
+const haloMat = new THREE.MeshBasicMaterial({
+  map: haloGobo,
+  color: '#ffffff',
+  transparent: true,
+  blending: THREE.NormalBlending,
+  depthTest: true,
+  depthWrite: false,
+  opacity: 0.6,
+});
+const haloPlane = new THREE.Mesh(haloGeo, haloMat);
+haloPlane.position.set(0, 0, -2.99);
+haloPlane.renderOrder = 1;
+haloPlane.name = 'concertHalo';
+scene.add(haloPlane);
+
+let haloColor = '#ffffff', haloOpac = 1.0, haloSize = 6, haloSoft = 0.3, haloBright = 1.0;
+function updateHalo() {
+  const c = new THREE.Color(haloColor);
+  c.r = Math.min(1, c.r * haloBright);
+  c.g = Math.min(1, c.g * haloBright);
+  c.b = Math.min(1, c.b * haloBright);
+  haloMat.color.copy(c);
+  haloMat.opacity = haloOpac;
+  haloPlane.scale.setScalar(haloSize / 6);
+}
+function updateHaloTexture() {
+  if (haloGobo) haloGobo.dispose();
+  haloGobo = createRadialGradientTexture(1024, haloSoft);
+  haloMat.map = haloGobo;
+  haloMat.needsUpdate = true;
+}
 
 // Optional: visualize the spotlight helper
 // const spotHelper = new THREE.SpotLightHelper(spotLight);
@@ -425,6 +499,20 @@ $('cb_bd').onchange = e => {
     }
   }
 };
+
+// Halo sliders
+$('halo_color').oninput = function() { haloColor = this.value; updateHalo(); };
+$('halo_slb').oninput = function() { haloBright = +this.value; $('halo_sb').textContent = haloBright.toFixed(2); updateHalo(); };
+$('halo_slsf').oninput = function() { haloSoft = +this.value; $('halo_ssf').textContent = haloSoft.toFixed(2); updateHaloTexture(); };
+$('halo_slo').oninput = function() { haloOpac = +this.value; $('halo_so').textContent = haloOpac.toFixed(2); updateHalo(); };
+$('halo_slsz').oninput = function() { haloSize = +this.value; $('halo_ssz').textContent = haloSize; updateHalo(); };
+$('halo_sly').oninput = function() { haloPlane.position.y = +this.value; $('halo_svy').textContent = (+this.value).toFixed(1); };
+// Init halo
+$('halo_sb').textContent = haloBright.toFixed(2);
+$('halo_ssf').textContent = haloSoft.toFixed(2);
+$('halo_so').textContent = haloOpac.toFixed(2);
+$('halo_ssz').textContent = haloSize;
+updateHalo();
 
 // Spotlight sliders
 let spotHue = +($('spot_slh')?.value || 0);
