@@ -97,6 +97,26 @@ canvas { display:block; cursor:crosshair; }
  <label>亮度 <span class="val" id="sv_bb">0.70</span></label>
  <input type="range" id="sl_bb" min="0.1" max="2.0" step="0.01" value="0.70">
 
+ <h3>🖼 UI</h3>
+ <label>显示UI</label>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="ui_cb" checked style="accent-color:#44aaff;width:16px;height:16px;">
+  可见
+ </label>
+ <div class="row"><span>大小</span><input type="range" id="ui_sls" min="0.5" max="20" step="0.1" value="3"><span class="val" id="ui_sv">3</span></div>
+ <div class="row"><span>Y偏移</span><input type="range" id="ui_sly" min="-10" max="15" step="0.1" value="1"><span class="val" id="ui_svy">1</span></div>
+ <h3>⬛ 假阴影</h3>
+ <label>透明度 <span class="val" id="sd_so">0.40</span></label>
+ <input type="range" id="sd_slo" min="0" max="1.0" step="0.01" value="0.40">
+ <label>羽化 <span class="val" id="sd_ssf">0.40</span></label>
+ <input type="range" id="sd_slsf" min="0.02" max="1.0" step="0.01" value="0.40">
+ <label>大小 <span class="val" id="sd_ssz">1.0</span></label>
+ <input type="range" id="sd_slsz" min="0.2" max="5" step="0.1" value="1.0">
+ <div class="row"><span>宽度</span><input type="range" id="sd_slw" min="1" max="20" step="0.5" value="4"><span class="val" id="sd_sw">4</span></div>
+ <div class="row"><span>高度</span><input type="range" id="sd_slh" min="1" max="20" step="0.5" value="3"><span class="val" id="sd_sh">3</span></div>
+ <div class="row"><span>歪斜</span><input type="range" id="sd_slsk" min="-0.8" max="0.8" step="0.01" value="0"><span class="val" id="sd_ssk">0</span></div>
+ <div class="row"><span>Y位置</span><input type="range" id="sd_sly" min="-10" max="10" step="0.1" value="-2"><span class="val" id="sd_svy">-2</span></div>
+
  <h3>💡 光斑</h3>
  <label>颜色 <input type="color" id="halo_color" value="#ffffff" style="width:100%;height:28px;border:none;cursor:pointer;"></label>
  <label>亮度 <span class="val" id="halo_sb">1.00</span></label>
@@ -298,17 +318,16 @@ pmremGenerator.dispose();
 
 // ── Radial Gradient Texture (shared by spotlight + halo) ──
 // Mimics SpotLight penumbra: smoothstep from inner radius to outer radius
-function createRadialGradientTexture(size, softness) {
+function createRadialGradientTexture(size, softness, skewY = 0) {
   const canvas = document.createElement('canvas');
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext('2d');
   const half = size / 2;
   const s = Math.max(0.02, softness);
-  // inner=1-s: full white inside this radius. outer=1: transparent at edge.
-  // penumbra semantics: inner cone → outer cone fade
   const rInner = half * (1 - s);
   const rOuter = half;
-  const gradient = ctx.createRadialGradient(half, half, rInner, half, half, rOuter);
+  const cy = half + skewY * half; // offset inner circle center vertically
+  const gradient = ctx.createRadialGradient(half, cy, rInner, half, half, rOuter);
   const N = 30;
   for (let i = 0; i <= N; i++) {
     const t = i / N;
@@ -355,7 +374,66 @@ spotLight.map = spotGobo;
 scene.add(spotLight);
 scene.add(spotLight.target);
 
-// ── Halo 光斑 (独立于追光灯，纯视觉叠加层) ──
+// ── UI Plane (unlit, 贴在背墙上, 保持原图比例) ──
+let uiPlane = null, uiSize = 3;
+const uiGeoBase = new THREE.PlaneGeometry(1, 1); // placeholder, resized on load
+const uiMat = new THREE.MeshBasicMaterial({
+  color: '#ffffff',
+  transparent: true,
+  depthTest: false,
+  depthWrite: false,
+});
+const uiTexture = new THREE.TextureLoader().load('ui.png', function(tex) {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  uiMat.map = tex;
+  uiMat.needsUpdate = true;
+  // Size plane to match image aspect ratio (height=1, width=aspect)
+  const aspect = tex.image.width / tex.image.height;
+  uiGeoBase.dispose();
+  const geo = new THREE.PlaneGeometry(aspect, 1);
+  if (uiPlane) {
+    uiPlane.geometry = geo;
+    uiPlane.scale.setScalar(uiSize);
+  } else {
+    uiPlane = new THREE.Mesh(geo, uiMat);
+    uiPlane.scale.setScalar(uiSize);
+    uiPlane.position.set(0, 1, -2.97);
+    uiPlane.renderOrder = 3;
+    uiPlane.name = 'uiPlane';
+    scene.add(uiPlane);
+  }
+});
+
+// ── Fake Shadow ──
+let shadowGobo = createRadialGradientTexture(1024, 0.4, 0);
+const shadowGeo = new THREE.PlaneGeometry(6, 6);
+const shadowMat = new THREE.MeshBasicMaterial({
+  map: shadowGobo,
+  color: '#000000',
+  transparent: true,
+  blending: THREE.NormalBlending,
+  depthTest: true,
+  depthWrite: false,
+  opacity: 0.4,
+});
+const shadowPlane = new THREE.Mesh(shadowGeo, shadowMat);
+shadowPlane.position.set(0, -2, -2.98);
+shadowPlane.renderOrder = 2;
+shadowPlane.name = 'fakeShadow';
+scene.add(shadowPlane);
+
+let shadowOpac = 0.4, shadowW = 4, shadowH = 3, shadowSize = 1.0, shadowSoft = 0.4, shadowY = -2, shadowSkew = 0;
+function updateShadow() {
+  shadowMat.opacity = shadowOpac;
+  shadowPlane.scale.set(shadowSize * shadowW / 6, shadowSize * shadowH / 6, 1);
+  shadowPlane.position.y = shadowY;
+}
+function updateShadowTexture() {
+  if (shadowGobo) shadowGobo.dispose();
+  shadowGobo = createRadialGradientTexture(1024, shadowSoft, shadowSkew);
+  shadowMat.map = shadowGobo;
+  shadowMat.needsUpdate = true;
+}
 let haloGobo = createRadialGradientTexture(1024, 0.3);
 const haloGeo = new THREE.PlaneGeometry(6, 6);
 const haloMat = new THREE.MeshBasicMaterial({
@@ -513,6 +591,29 @@ $('halo_ssf').textContent = haloSoft.toFixed(2);
 $('halo_so').textContent = haloOpac.toFixed(2);
 $('halo_ssz').textContent = haloSize;
 updateHalo();
+
+// Shadow sliders
+$('sd_slo').oninput = function() { shadowOpac = +this.value; $('sd_so').textContent = shadowOpac.toFixed(2); updateShadow(); };
+$('sd_slsz').oninput = function() { shadowSize = +this.value; $('sd_ssz').textContent = shadowSize.toFixed(1); updateShadow(); };
+$('sd_slw').oninput = function() { shadowW = +this.value; $('sd_sw').textContent = shadowW; updateShadow(); };
+$('sd_slh').oninput = function() { shadowH = +this.value; $('sd_sh').textContent = shadowH; updateShadow(); };
+$('sd_slsf').oninput = function() { shadowSoft = +this.value; $('sd_ssf').textContent = shadowSoft.toFixed(2); updateShadowTexture(); };
+$('sd_slsk').oninput = function() { shadowSkew = +this.value; $('sd_ssk').textContent = shadowSkew.toFixed(2); updateShadowTexture(); };
+$('sd_sly').oninput = function() { shadowY = +this.value; $('sd_svy').textContent = (+this.value).toFixed(1); updateShadow(); };
+$('sd_so').textContent = shadowOpac.toFixed(2);
+$('sd_ssz').textContent = shadowSize.toFixed(1);
+$('sd_ssf').textContent = shadowSoft.toFixed(2);
+$('sd_sw').textContent = shadowW;
+$('sd_sh').textContent = shadowH;
+$('sd_svy').textContent = shadowY.toFixed(1);
+updateShadow();
+
+// UI sliders
+$('ui_cb').onchange = function() { if (uiPlane) uiPlane.visible = this.checked; };
+$('ui_sls').oninput = function() { uiSize = +this.value; $('ui_sv').textContent = uiSize; if (uiPlane) uiPlane.scale.setScalar(uiSize); };
+$('ui_sly').oninput = function() { if (uiPlane) { uiPlane.position.y = +this.value; $('ui_svy').textContent = (+this.value).toFixed(1); } };
+$('ui_sv').textContent = uiSize;
+$('ui_svy').textContent = '1.0';
 
 // Spotlight sliders
 let spotHue = +($('spot_slh')?.value || 0);
