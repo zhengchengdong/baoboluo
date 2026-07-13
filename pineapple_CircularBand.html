@@ -23,6 +23,8 @@ canvas { display:block; cursor:crosshair; }
 #panel .btn { margin-top:6px; width:100%; padding:4px 0; background:#333; color:#ff44cc; border:1px solid #ff44cc; border-radius:4px; cursor:pointer; font-size:11px; }
 #panel .btn:hover { background:#444; }
 #panel .kb { display:inline-block; background:#333; color:#ff4; padding:1px 5px; border-radius:3px; font-size:10px; margin:0 2px; }
+#flash { position:fixed; top:0; left:0; width:100%; height:100%; background:#fff; z-index:100; pointer-events:none; opacity:0; transition:opacity 0.05s; }
+#shakeHint { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:99; pointer-events:none; color:#ff4444; font-size:48px; font-weight:bold; font-family:monospace; opacity:0; text-shadow:0 0 30px #f00,0 0 60px #f80; }
 </style>
 </head>
 <body>
@@ -42,6 +44,8 @@ canvas { display:block; cursor:crosshair; }
 <div id="info">
  Click surface to bind band (normal dir) &nbsp; <span class="kb">R</span>=割一&nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">?GPU PBD + Three.js WebGPU</span>
 </div>
+<div id="flash"></div>
+<div id="shakeHint">💥</div>
 <div id="panel">
  <h3>🔧 PBD 参数</h3>
  <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
@@ -62,6 +66,12 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="sl_ab" min="0.5" max="100.0" step="0.5" value="2.0">
  <label>回弹时长 <span class="val" id="sv_ad">0.40</span>s</label>
  <input type="range" id="sl_ad" min="0.1" max="2.0" step="0.05" value="0.40">
+
+ <h3>💥 爆裂</h3>
+ <label>自动引爆体积比 <span class="val" id="sv_bt">55</span>%</label>
+ <input type="range" id="sl_bt" min="20" max="95" step="1" value="55">
+ <button class="btn" id="btn_burst" style="background:#600;color:#f44;border-color:#f44;font-size:15px;font-weight:bold;padding:8px 0;">💥 引爆!</button>
+ <button class="btn" id="btn_reset" style="color:#4af;border-color:#4af;">🔄 重置</button>
 
  <h3>🎯 最后皮筋<span class="val" id="lb_info">(空)</span></h3>
  <label>rest周长 <span class="val" id="sv_lr">--</span></label>
@@ -522,6 +532,9 @@ $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
 $('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUFF.toFixed(1);};
 $('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);};
+$('sl_bt').oninput=e=>{boomTriggerRatio=+e.target.value/100;$('sv_bt').textContent=(+e.target.value);};
+$('btn_burst').onclick=()=>{if(boomState==='idle'&&loaded)triggerBoom(_boomLastSrc||posA);};
+$('btn_reset').onclick=resetBoom;
 
 // Volume readback toggle
 let showVolumeReadback = true;
@@ -856,6 +869,22 @@ let showTargetLine=true;         // toggle for green reference circle
 let ANIM_BUFF = 2.0;             // stiffness buff multiplier during bind animation
 let ANIM_DURATION = 0.4;         // bind animation duration in seconds
 
+// ══════ 💥 Explosion System ══════
+let boomState = 'idle';           // 'idle' | 'primed' | 'booming' | 'done'
+let boomTime = 0;
+let boomTriggerRatio = 0.55;
+let boomParticles = [];           // {mesh, vel, angVel, life, maxLife}
+let boomJuice = [];               // small glowing juice droplets
+let boomHeroChunks = [];          // big dramatic chunks
+let boomCamShake = { active: false, intensity: 0, duration: 0, time: 0 };
+const BOOM_DURATION = 2.5;        // total animation time
+const BOOM_PARTICLE_COUNT = 100;  // small debris
+const BOOM_JUICE_COUNT = 60;      // juice spray
+const BOOM_HERO_COUNT = 8;        // big chunks
+const BOOM_FORCE = 12;            // explosion power
+const BOOM_GRAVITY = 6;           // gravity
+let _boomLastSrc = null;
+
 $('sl_tr').oninput=e=>{
   TUBE_RADIUS=+e.target.value;$('sv_tr').textContent=TUBE_RADIUS.toFixed(3);
   for(const b of circularBands)b.tubeRadius=TUBE_RADIUS;
@@ -868,6 +897,7 @@ $('sl_rs').oninput=e=>{
 
 // ══════.?Circular Band (Tube) add/remove ══════.?
 function addCircularBand(origin, normal){
+  if(boomState!=='idle')return;
   if(circularBands.length>=MAX_CIRC_BANDS){console.warn('max circular bands');return;}
   const nl=Math.sqrt(normal[0]**2+normal[1]**2+normal[2]**2);
   const nn=[normal[0]/nl,normal[1]/nl,normal[2]/nl];
@@ -2102,7 +2132,7 @@ function writeBandParams(){
 async function readbackProxyPositions(srcBuf){
   const size=proxyVertexCount*4*4;
   const cmd=device.createCommandEncoder();
-  cmd.copyBufferToBuffer(srcBuf===posA?posA:posB,0,staging,0,size);
+  cmd.copyBufferToBuffer(srcBuf,0,staging,0,size);
   device.queue.submit([cmd.finish()]);
   await staging.mapAsync(GPUMapMode.READ);
   const arr=new Float32Array(staging.getMappedRange(0,size));
@@ -2124,6 +2154,7 @@ async function readbackVolume(){
   const curVol=new Float32Array(volStaging.getMappedRange(0,4))[0];
   volStaging.unmap();
   const ratio=restVolume>0?Math.abs(curVol)/restVolume*100:100;
+  lastVol=Math.abs(curVol);
   H.vratio.textContent=ratio.toFixed(1);
 }
 
@@ -2693,6 +2724,245 @@ window.onresize=()=>{
   camera.updateProjectionMatrix();
 };
 
+// ══════ 💥 EXPLOSION SYSTEM ══════
+
+// Shared geometries and materials
+let _boomFragGeo = null, _boomFragMat = null;
+let _boomJuiceGeo = null, _boomJuiceMat = null;
+let _boomHeroMat = null;
+let _camBasePos = new THREE.Vector3();
+
+function createBoomFragmentGeo() {
+  const s = 0.04 + Math.random() * 0.08;
+  const j = () => (Math.random() - 0.5) * s * 1.5;
+  const v = [0, s*1.3, 0, -s*0.8+j(), -s*0.4+j(), s*0.6+j(), s*0.7+j(), -s*0.5+j(), -s*0.5+j(), j()*0.5, -s*0.3+j(), s*0.2+j()];
+  const idx = [0,1,2, 0,2,3, 0,3,1, 1,3,2];
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(v), 3));
+  geo.setIndex(idx); geo.computeVertexNormals();
+  return geo;
+}
+
+function initBoomAssets() {
+  if (_boomFragGeo) return;
+  _boomFragGeo = createBoomFragmentGeo();
+  _boomFragMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(0.13,0.8,0.5), roughness:0.4, metalness:0.05 });
+  _boomJuiceGeo = new THREE.SphereGeometry(0.02, 4, 3);
+  _boomJuiceMat = new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(0.15,1.0,0.65) });
+  _boomHeroMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(0.13,0.7,0.55), roughness:0.35, metalness:0.1, side:THREE.DoubleSide });
+}
+
+async function triggerBoom(srcBuf) {
+  if (boomState !== 'idle' || !loaded) return;
+  console.log('💥 BOOM!');
+  boomState = 'booming'; boomTime = 0;
+  initBoomAssets();
+
+  // Screen flash
+  const flash = document.getElementById('flash');
+  flash.style.opacity = '1'; flash.style.transition = 'opacity 0.05s';
+  setTimeout(() => { flash.style.transition = 'opacity 0.35s'; flash.style.opacity = '0'; }, 60);
+
+  // Shake hint
+  const hint = document.getElementById('shakeHint');
+  hint.style.opacity = '1'; hint.style.transform = 'translate(-50%,-50%) scale(2)';
+  hint.style.transition = 'transform 0.08s, opacity 0.5s';
+  setTimeout(() => { hint.style.transform = 'translate(-50%,-50%) scale(0.3)'; hint.style.opacity = '0'; }, 80);
+
+  // Camera shake
+  _camBasePos.copy(camera.position);
+  boomCamShake = { active: true, intensity: 0.25, duration: 0.5, time: 0 };
+
+  // Read deformed positions
+  if (srcBuf) await readbackProxyPositions(srcBuf);
+  else await readbackProxyPositions(posA);
+
+  // Explosion center from deformed mesh
+  let cx = 0, cy = 0, cz = 0;
+  for (let i = 0; i < proxyVertexCount; i++) {
+    cx += proxyCurPositions[i*3]; cy += proxyCurPositions[i*3+1]; cz += proxyCurPositions[i*3+2];
+  }
+  cx /= proxyVertexCount; cy /= proxyVertexCount; cz /= proxyVertexCount;
+
+  let bNormal = [0,1,0];
+  if (circularBands.length > 0) bNormal = circularBands[Math.floor(circularBands.length/2)].planeNormal;
+
+  // ── Debris (irregular tetrahedrons) ──
+  boomParticles = [];
+  for (let i = 0; i < BOOM_PARTICLE_COUNT; i++) {
+    const geo = createBoomFragmentGeo();
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color().setHSL(0.10+Math.random()*0.10, 0.7+Math.random()*0.3, 0.4+Math.random()*0.3),
+      roughness: 0.4, metalness: 0.05,
+    });
+    const mesh = new THREE.Mesh(geo, mat); mesh.castShadow = true; scene.add(mesh);
+    const theta = Math.random()*Math.PI*2, phi = Math.acos(2*Math.random()-1);
+    let dx = Math.sin(phi)*Math.cos(theta), dy = Math.sin(phi)*Math.sin(theta), dz = Math.cos(phi);
+    dy += bNormal[1]*(Math.random()-0.5)*0.3;
+    const dl = Math.sqrt(dx*dx+dy*dy+dz*dz); dx/=dl; dy/=dl; dz/=dl;
+    const speed = BOOM_FORCE*(0.3+Math.random()*1.2);
+    mesh.position.set(cx+(Math.random()-0.5)*0.2, cy+(Math.random()-0.5)*0.2, cz+(Math.random()-0.5)*0.2);
+    mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+    boomParticles.push({ mesh, vel: new THREE.Vector3(dx*speed, dy*speed, dz*speed),
+      angVel: new THREE.Vector3((Math.random()-0.5)*15,(Math.random()-0.5)*15,(Math.random()-0.5)*15),
+      life: 0, maxLife: 1.8+Math.random()*1.0 });
+  }
+
+  // ── Juice droplets ──
+  boomJuice = [];
+  for (let i = 0; i < BOOM_JUICE_COUNT; i++) {
+    const geo = new THREE.SphereGeometry(0.015+Math.random()*0.025, 4, 3);
+    const mat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color().setHSL(0.13+Math.random()*0.06, 0.9, 0.55+Math.random()*0.4),
+      transparent: true, opacity: 0.9,
+    });
+    const mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
+    const theta = Math.random()*Math.PI*2, phi = Math.acos(2*Math.random()-1);
+    const dx = Math.sin(phi)*Math.cos(theta), dy = Math.sin(phi)*Math.sin(theta), dz = Math.cos(phi);
+    const speed = BOOM_FORCE*(0.5+Math.random()*1.5);
+    mesh.position.set(cx+(Math.random()-0.5)*0.3, cy+(Math.random()-0.5)*0.3, cz+(Math.random()-0.5)*0.3);
+    boomJuice.push({ mesh, vel: new THREE.Vector3(dx*speed, dy*speed*1.3, dz*speed), life: 0, maxLife: 0.8+Math.random()*1.5 });
+  }
+
+  // ── Hero chunks (from mesh subsets) ──
+  boomHeroChunks = [];
+  if (highResCount > 0 && nearestProxyIdx) {
+    const seeds = [];
+    for (let s = 0; s < BOOM_HERO_COUNT; s++) {
+      const a1 = Math.random()*Math.PI*2, a2 = Math.acos(2*Math.random()-1), r = 0.3+Math.random()*0.6;
+      seeds.push({ x: cx+Math.sin(a2)*Math.cos(a1)*r, y: cy+Math.sin(a2)*Math.sin(a1)*r, z: cz+Math.cos(a2)*r });
+    }
+    const chunkIds = new Int32Array(proxyVertexCount);
+    for (let i = 0; i < proxyVertexCount; i++) {
+      const i3 = i*3; let bd = Infinity, bs = 0;
+      for (let s = 0; s < seeds.length; s++) {
+        const d = (proxyCurPositions[i3]-seeds[s].x)**2+(proxyCurPositions[i3+1]-seeds[s].y)**2+(proxyCurPositions[i3+2]-seeds[s].z)**2;
+        if (d < bd) { bd = d; bs = s; }
+      }
+      chunkIds[i] = bs;
+    }
+    const chunkTris = Array.from({length:BOOM_HERO_COUNT},()=>[]);
+    const chunkVerts = Array.from({length:BOOM_HERO_COUNT},()=>new Set());
+    for (let t = 0; t < highResIdxArr.length; t += 3) {
+      const a = highResIdxArr[t], b = highResIdxArr[t+1], c = highResIdxArr[t+2];
+      const ca = chunkIds[nearestProxyIdx[a]], cb = chunkIds[nearestProxyIdx[b]], cc = chunkIds[nearestProxyIdx[c]];
+      const cid = ca===cb&&cb===cc?ca:(ca>=0?ca:cb>=0?cb:cc);
+      if (cid >= 0) { chunkTris[cid].push(a,b,c); chunkVerts[cid].add(a); chunkVerts[cid].add(b); chunkVerts[cid].add(c); }
+    }
+    const hrCur = new Float32Array(highResCount*3);
+    for (let i = 0; i < highResCount; i++) {
+      const pi = nearestProxyIdx[i];
+      hrCur[i*3] = highResRestPositions[i*3]+proxyCurPositions[pi*3]-proxyRestPositions[pi*3];
+      hrCur[i*3+1] = highResRestPositions[i*3+1]+proxyCurPositions[pi*3+1]-proxyRestPositions[pi*3+1];
+      hrCur[i*3+2] = highResRestPositions[i*3+2]+proxyCurPositions[pi*3+2]-proxyRestPositions[pi*3+2];
+    }
+    const origUVs = pineappleMesh.geometry.attributes.uv?pineappleMesh.geometry.attributes.uv.array:null;
+    for (let k = 0; k < BOOM_HERO_COUNT; k++) {
+      const tris = chunkTris[k]; if (tris.length < 6) continue;
+      const vset = chunkVerts[k]; const vmap = new Map(); const nv=[]; const nuv=[]; const nidx=[]; let vc=0;
+      for (const vi of vset) {
+        vmap.set(vi, vc++);
+        nv.push(hrCur[vi*3], hrCur[vi*3+1], hrCur[vi*3+2]);
+        if (origUVs) nuv.push(origUVs[vi*2], origUVs[vi*2+1]);
+      }
+      for (let t=0;t<tris.length;t+=3) nidx.push(vmap.get(tris[t]),vmap.get(tris[t+1]),vmap.get(tris[t+2]));
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(nv),3));
+      if (origUVs) geo.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(nuv),2));
+      geo.setIndex(nidx); geo.computeVertexNormals();
+      const mat = _boomHeroMat.clone();
+      mat.color = new THREE.Color().setHSL(0.11+Math.random()*0.08, 0.6+Math.random()*0.4, 0.45+Math.random()*0.25);
+      const mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
+      let mx=0,my=0,mz=0,vcnt=0;
+      for (const vi of vset) { mx+=hrCur[vi*3]; my+=hrCur[vi*3+1]; mz+=hrCur[vi*3+2]; vcnt++; }
+      mx/=vcnt; my/=vcnt; mz/=vcnt;
+      const pa = geo.attributes.position.array;
+      for (let i=0;i<pa.length;i+=3){pa[i]-=mx;pa[i+1]-=my;pa[i+2]-=mz;}
+      geo.attributes.position.needsUpdate=true; geo.computeBoundingSphere();
+      mesh.position.set(mx,my,mz);
+      const rx=mx-cx,ry=my-cy,rz=mz-cz; const rd=Math.sqrt(rx*rx+ry*ry+rz*rz)||1;
+      let vx=rx/rd,vy=ry/rd,vz=rz/rd;
+      vx+=bNormal[0]*0.5; vy+=bNormal[1]*0.5; vz+=bNormal[2]*0.5;
+      const vl=Math.sqrt(vx*vx+vy*vy+vz*vz); vx/=vl;vy/=vl;vz/=vl;
+      const speed=BOOM_FORCE*(0.6+Math.random()*0.8);
+      boomHeroChunks.push({ mesh, vel: new THREE.Vector3(vx*speed,vy*speed,vz*speed),
+        angVel: new THREE.Vector3((Math.random()-0.5)*6,(Math.random()-0.5)*6,(Math.random()-0.5)*6), life:0, maxLife:2.0+Math.random()*1.0 });
+    }
+  }
+  console.log('💥 '+boomParticles.length+' debris + '+boomJuice.length+' juice + '+boomHeroChunks.length+' chunks');
+
+  for (const vis of circBandVisuals) { if (vis.lineTarget) vis.lineTarget.visible = false; }
+  if (_circSharedMesh) _circSharedMesh.visible = false;
+}
+
+function updateBoom(dt) {
+  if (boomState !== 'booming') return;
+  boomTime += dt; const cdt = Math.min(dt, 0.05);
+
+  // Camera shake
+  if (boomCamShake.active) {
+    boomCamShake.time += cdt;
+    if (boomCamShake.time >= boomCamShake.duration) {
+      boomCamShake.active = false;
+      camera.position.copy(_camBasePos);
+    } else {
+      const t = boomCamShake.time/boomCamShake.duration, decay = 1-t;
+      const i = boomCamShake.intensity*decay;
+      camera.position.set(_camBasePos.x+(Math.random()-0.5)*i*2, _camBasePos.y+(Math.random()-0.5)*i*2, _camBasePos.z+(Math.random()-0.5)*i);
+    }
+  }
+
+  // Main mesh shrink
+  if (pineappleMesh && boomTime < 0.2) {
+    const t = boomTime/0.2;
+    pineappleMesh.scale.setScalar(Math.max(0.01, 1-t*t));
+    if (pineappleMesh.material) { pineappleMesh.material.transparent=true; pineappleMesh.material.opacity=Math.max(0,1-t*1.5); pineappleMesh.material.needsUpdate=true; }
+  } else if (pineappleMesh && boomTime >= 0.2) { pineappleMesh.visible = false; }
+
+  // Debris
+  for (const p of boomParticles) {
+    p.life += cdt; if (p.life>p.maxLife){p.mesh.visible=false;continue;}
+    p.vel.y -= BOOM_GRAVITY*cdt;
+    p.mesh.position.x+=p.vel.x*cdt; p.mesh.position.y+=p.vel.y*cdt; p.mesh.position.z+=p.vel.z*cdt;
+    p.mesh.rotation.x+=p.angVel.x*cdt; p.mesh.rotation.y+=p.angVel.y*cdt; p.mesh.rotation.z+=p.angVel.z*cdt;
+    const lr=p.life/p.maxLife; if(lr>0.7){p.mesh.scale.setScalar(Math.max(0.01,1-(lr-0.7)/0.3));}
+  }
+  // Juice
+  for (const j of boomJuice) {
+    j.life += cdt; if (j.life>j.maxLife){j.mesh.visible=false;continue;}
+    j.vel.y -= BOOM_GRAVITY*0.8*cdt;
+    j.mesh.position.x+=j.vel.x*cdt; j.mesh.position.y+=j.vel.y*cdt; j.mesh.position.z+=j.vel.z*cdt;
+    const lr=j.life/j.maxLife; j.mesh.material.opacity=lr>0.6?1-(lr-0.6)/0.4:1;
+    j.mesh.scale.setScalar(lr>0.5?1-(lr-0.5):1);
+  }
+  // Hero chunks
+  for (const c of boomHeroChunks) {
+    c.life += cdt; if (c.life>c.maxLife){c.mesh.visible=false;continue;}
+    c.vel.y -= BOOM_GRAVITY*0.7*cdt;
+    c.mesh.position.x+=c.vel.x*cdt; c.mesh.position.y+=c.vel.y*cdt; c.mesh.position.z+=c.vel.z*cdt;
+    c.mesh.rotation.x+=c.angVel.x*cdt; c.mesh.rotation.y+=c.angVel.y*cdt; c.mesh.rotation.z+=c.angVel.z*cdt;
+  }
+
+  if (boomTime > BOOM_DURATION) cleanupBoom();
+}
+
+function cleanupBoom() {
+  for (const arr of [boomParticles, boomJuice, boomHeroChunks]) {
+    for (const o of arr) { if(o.mesh){o.mesh.geometry.dispose();o.mesh.material.dispose();scene.remove(o.mesh);} }
+  }
+  boomParticles=[]; boomJuice=[]; boomHeroChunks=[]; boomState='done'; boomCamShake.active=false;
+  console.log('💥 Cleanup done');
+}
+
+function resetBoom() {
+  cleanupBoom(); boomState='idle'; boomTime=0; boomCamShake.active=false;
+  if(pineappleMesh){pineappleMesh.visible=true;pineappleMesh.scale.setScalar(1);
+    if(pineappleMesh.material){pineappleMesh.material.transparent=false;pineappleMesh.material.opacity=1;pineappleMesh.material.needsUpdate=true;}}
+  removeAllCircularBands(); needsRestore=true; H.pbdtime.textContent='已重置';
+  document.getElementById('flash').style.opacity='0';
+  console.log('🔄 Reset');
+}
+
 // ══════.?Animation Loop ══════.?
 const clock={last:performance.now()};
 let fpsFrames=0,fpsTime=0;
@@ -2703,6 +2973,17 @@ async function animate(){
 
   const t0=performance.now();
 
+  // ══════ 💥 Boom handling ══════
+  if (boomState === 'booming') {
+    updateBoom(dt);
+    renderer.render(scene, camera);
+    fpsFrames++; fpsTime += dt;
+    if (fpsTime >= 1.0) { H.fps.textContent = Math.round(fpsFrames/fpsTime); H.framems.textContent = (performance.now()-t0).toFixed(1); fpsFrames=0; fpsTime=0; }
+    if (boomState === 'done') H.pbdtime.textContent = '已爆裂';
+    requestAnimationFrame(animate);
+    return;
+  }
+
   // Update band stiffness animations (deep-bite → ease-out)
   const anyAnimating = updateBandStiffnessAnimations(dt);
   if (anyAnimating) { pbdConverged = false; convergeFrames = 0; }
@@ -2710,6 +2991,7 @@ async function animate(){
   if(circularBands.length>0&&!pbdConverged){
     const pbdT0=performance.now();
     const finalSrc=await runGPUPBD();
+    _boomLastSrc = finalSrc;
     await runGPUPostPBD(finalSrc);
     const frameTime=performance.now()-pbdT0;
     pbdAccumTime+=frameTime;
@@ -2724,6 +3006,12 @@ async function animate(){
       if (doConverge) {
         pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
         if(showVolumeReadback)await readbackVolume();
+        // Auto-trigger boom
+        if (boomState==='idle' && circularBands.length>=3 && restVolume>0 && lastVol/restVolume < boomTriggerRatio) {
+          console.log('💥 Auto-boom! Vol: '+(lastVol/restVolume*100).toFixed(1)+'%');
+          await triggerBoom(finalSrc);
+          requestAnimationFrame(animate); return;
+        }
       }
       await runGPUCircularBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
     }
