@@ -58,6 +58,10 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
  <label>收敛帧数 <span class="val" id="sv_cf">5</span></label>
  <input type="range" id="sl_cf" min="1" max="20" step="1" value="5">
+ <label>勒深刚度倍率 <span class="val" id="sv_ab">2.0</span></label>
+ <input type="range" id="sl_ab" min="0.5" max="5.0" step="0.1" value="2.0">
+ <label>回弹时长 <span class="val" id="sv_ad">0.40</span>s</label>
+ <input type="range" id="sl_ad" min="0.1" max="2.0" step="0.05" value="0.40">
 
  <h3>🎯 最后皮筋<span class="val" id="lb_info">(空)</span></h3>
  <label>rest周长 <span class="val" id="sv_lr">--</span></label>
@@ -496,13 +500,14 @@ let SHAPE_STIFF=0.30, BAND_STIFF=0.50, VOL_STIFF=0.40, BAND_INFLU=0.60;
 let BAND_REST_CIRCUM=2.51, PBD_ITER=10;
 const DELTA_BUCKETS=256;
 let pbdAccumTime=0, pbdConverged=false, convergeFrames=0, needsRestore=false;
+let visUpdateCounter=0;          // independent counter for tube visual updates
 let CONVERGE_FRAMES=5;
 let lastVol=0;
-function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;}
+function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;visUpdateCounter=0;}
 
 // Slider wiring
 $('sl_ss').oninput=e=>{SHAPE_STIFF=+e.target.value;$('sv_ss').textContent=SHAPE_STIFF.toFixed(2);markPbdDirty();};
-$('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(3);for(const b of circularBands)b.stiffness=BAND_STIFF;markPbdDirty();};
+$('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(3);for(const b of circularBands)b.baseStiffness=BAND_STIFF;markPbdDirty();};
 $('sl_vs').oninput=e=>{VOL_STIFF=+e.target.value;$('sv_vs').textContent=VOL_STIFF.toFixed(2);markPbdDirty();};
 $('sl_bi').oninput=e=>{BAND_INFLU=+e.target.value;$('sv_bi').textContent=BAND_INFLU.toFixed(2);for(const b of circularBands)b.influRadius=BAND_INFLU;markPbdDirty();};
 $('sl_rc').oninput=e=>{
@@ -515,6 +520,8 @@ $('sl_rc').oninput=e=>{
 };
 $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
+$('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUFF.toFixed(1);};
+$('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);};
 
 // Volume readback toggle
 let showVolumeReadback = true;
@@ -846,6 +853,8 @@ const CIRC_BINS = 64;
 let circVisDirty = false;
 let _circGreenB=null;            // green target line staging
 let showTargetLine=true;         // toggle for green reference circle
+let ANIM_BUFF = 2.0;             // stiffness buff multiplier during bind animation
+let ANIM_DURATION = 0.4;         // bind animation duration in seconds
 
 $('sl_tr').oninput=e=>{
   TUBE_RADIUS=+e.target.value;$('sv_tr').textContent=TUBE_RADIUS.toFixed(3);
@@ -875,16 +884,38 @@ function addCircularBand(origin, normal){
     restRadii:pre.radii,
     restCentroid:pre.centroid,
     restPerimeter:pre.restPerimeter,
+    animProgress: 0,
+    animDuration: ANIM_DURATION,
+    buffStiffness: ANIM_BUFF,
+    baseStiffness: BAND_STIFF,
   };
   circularBands.push(band);
   const visTarget=makeBandLine('#33ff33',0.35);
   visTarget.visible=showTargetLine;
   circBandVisuals.push({lineTarget:visTarget});
   writeBandRestRadii(circularBands.length-1,pre.radii);
-  circVisDirty=true;markPbdDirty();
+  circVisDirty=true;markPbdDirty();visUpdateCounter=0;
   H.bcount.textContent=circularBands.length;
   updateLastBandPanel(circularBands.length-1);
 }
+
+// Update per-band stiffness animations (deep-bite then ease-out)
+function updateBandStiffnessAnimations(dt) {
+  let anyAnimating = false;
+  for (const band of circularBands) {
+    if (band.animProgress < 1) {
+      band.animProgress = Math.min(1, band.animProgress + dt / band.animDuration);
+      const t = band.animProgress;
+      // easeOutCubic: 1 - (1-t)³
+      const ease = 1 - (1 - t) * (1 - t) * (1 - t);
+      // effective = base * (1 + buff * (1 - ease)) — starts high, decays to base
+      band.stiffness = band.baseStiffness * (1 + band.buffStiffness * (1 - ease));
+      anyAnimating = true;
+    }
+  }
+  return anyAnimating;
+}
+
 function removeCircularBand(){
   if(circularBands.length===0)return;
   circularBands.pop();
@@ -918,7 +949,7 @@ function updateLastBandPanel(idx){
   $('sl_nx').value=b.planeNormal[0];$('sv_nx').textContent=b.planeNormal[0].toFixed(2);
   $('sl_ny').value=b.planeNormal[1];$('sv_ny').textContent=b.planeNormal[1].toFixed(2);
   $('sl_nz').value=b.planeNormal[2];$('sv_nz').textContent=b.planeNormal[2].toFixed(2);
-  $('sl_bk').value=b.stiffness;$('sv_bk').textContent=b.stiffness.toFixed(3);
+  $('sl_bk').value=b.baseStiffness;$('sv_bk').textContent=b.baseStiffness.toFixed(3);
 }
 $('sl_lr').oninput=()=>{
   const v=+$('sl_lr').value;$('sv_lr').textContent=v.toFixed(3);
@@ -934,7 +965,7 @@ $('sl_ny').oninput=()=>{$('sv_ny').textContent=(+$('sl_ny').value).toFixed(2);ap
 $('sl_nz').oninput=()=>{$('sv_nz').textContent=(+$('sl_nz').value).toFixed(2);applyLastNormal();};
 $('sl_bk').oninput=()=>{
   const v=+$('sl_bk').value;$('sv_bk').textContent=v.toFixed(3);
-  if(circularBands.length>0){circularBands[circularBands.length-1].stiffness=v;markPbdDirty();}
+  if(circularBands.length>0){circularBands[circularBands.length-1].baseStiffness=v;markPbdDirty();}
 };
 function applyLastNormal(){
   if(circularBands.length===0)return;
@@ -2672,6 +2703,10 @@ async function animate(){
 
   const t0=performance.now();
 
+  // Update band stiffness animations (deep-bite → ease-out)
+  const anyAnimating = updateBandStiffnessAnimations(dt);
+  if (anyAnimating) { pbdConverged = false; convergeFrames = 0; }
+
   if(circularBands.length>0&&!pbdConverged){
     const pbdT0=performance.now();
     const finalSrc=await runGPUPBD();
@@ -2679,12 +2714,23 @@ async function animate(){
     const frameTime=performance.now()-pbdT0;
     pbdAccumTime+=frameTime;
     convergeFrames++;
-    if(convergeFrames>=CONVERGE_FRAMES){
-      pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
-      if(showVolumeReadback)await readbackVolume();
+    visUpdateCounter++;
+    const allAnimsDone = !circularBands.some(b => b.animProgress < 1);
+    // Show tube every CONVERGE_FRAMES PBD iterations, independent of animation state
+    const doVis = (visUpdateCounter >= CONVERGE_FRAMES);
+    const doConverge = (allAnimsDone && convergeFrames >= CONVERGE_FRAMES);
+    if (doVis || doConverge) {
+      if (doVis) visUpdateCounter = 0;
+      if (doConverge) {
+        pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
+        if(showVolumeReadback)await readbackVolume();
+      }
       await runGPUCircularBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
     }
-    else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
+    if (!pbdConverged) {
+      if(anyAnimating){H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ⟳';}
+      else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
+    }
   }else if(circularBands.length>0&&pbdConverged){
     H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
   }else if(needsRestore){
