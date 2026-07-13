@@ -50,20 +50,20 @@ canvas { display:block; cursor:crosshair; }
  <h3>🔧 PBD 参数</h3>
  <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
  <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
- <label>皮筋刚度 <span class="val" id="sv_bs">0.500</span></label>
- <input type="range" id="sl_bs" min="0.001" max="1.0" step="0.001" value="0.500">
- <label>体积刚度 <span class="val" id="sv_vs">0.40</span></label>
- <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.40">
+ <label>皮筋刚度 <span class="val" id="sv_bs">0.001</span></label>
+ <input type="range" id="sl_bs" min="0.001" max="1.0" step="0.001" value="0.001">
+ <label>体积刚度 <span class="val" id="sv_vs">0.90</span></label>
+ <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.90">
  <label>影响范围 <span class="val" id="sv_bi">0.60</span></label>
  <input type="range" id="sl_bi" min="0.2" max="2.0" step="0.05" value="0.60">
- <label>目标周长 L₀ <span class="val" id="sv_rc">2.51</span></label>
- <input type="range" id="sl_rc" min="0.3" max="8.0" step="0.01" value="2.51">
+ <label>目标周长 L₀ <span class="val" id="sv_rc">0.72</span></label>
+ <input type="range" id="sl_rc" min="0.3" max="8.0" step="0.01" value="0.72">
  <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
  <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
- <label>收敛帧数 <span class="val" id="sv_cf">5</span></label>
- <input type="range" id="sl_cf" min="1" max="20" step="1" value="5">
- <label>勒深刚度倍率 <span class="val" id="sv_ab">2.0</span></label>
- <input type="range" id="sl_ab" min="0.5" max="100.0" step="0.5" value="2.0">
+ <label>收敛帧数 <span class="val" id="sv_cf">1</span></label>
+ <input type="range" id="sl_cf" min="1" max="20" step="1" value="1">
+ <label>勒深刚度倍率 <span class="val" id="sv_ab">100.0</span></label>
+ <input type="range" id="sl_ab" min="0.5" max="100.0" step="0.5" value="100.0">
  <label>回弹时长 <span class="val" id="sv_ad">0.40</span>s</label>
  <input type="range" id="sl_ad" min="0.1" max="2.0" step="0.05" value="0.40">
 
@@ -91,15 +91,15 @@ canvas { display:block; cursor:crosshair; }
   📊 读回体积保持率 (HUD)
  </label>
  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-  <input type="checkbox" id="cb_target" checked style="accent-color:#ff44cc;width:16px;height:16px;">
+  <input type="checkbox" id="cb_target" style="accent-color:#ff44cc;width:16px;height:16px;">
   🟢 显示目标周长参考线
  </label>
 
  <h3>🔴 圆皮筋</h3>
- <label>管半径 <span class="val" id="sv_tr">0.018</span></label>
- <input type="range" id="sl_tr" min="0.005" max="0.08" step="0.001" value="0.018">
- <label>截面细分 <span class="val" id="sv_rs">12</span></label>
- <input type="range" id="sl_rs" min="4" max="24" step="1" value="12">
+ <label>管半径 <span class="val" id="sv_tr">0.011</span></label>
+ <input type="range" id="sl_tr" min="0.005" max="0.08" step="0.001" value="0.011">
+ <label>截面细分 <span class="val" id="sv_rs">6</span></label>
+ <input type="range" id="sl_rs" min="4" max="24" step="1" value="6">
 
  <h3>� 绿幕背景</h3>
  <label>显示背景</label>
@@ -107,12 +107,12 @@ canvas { display:block; cursor:crosshair; }
   <input type="checkbox" id="cb_bd" checked style="accent-color:#2ecc40;width:16px;height:16px;">
   可见 (Cyclorama)
  </label>
- <label>色相 <span class="val" id="sv_bh">120°</span></label>
- <input type="range" id="sl_bh" min="0" max="360" step="1" value="120">
- <label>饱和度 <span class="val" id="sv_bsat">1.00</span></label>
- <input type="range" id="sl_bsat" min="0" max="2.0" step="0.01" value="1.00">
- <label>亮度 <span class="val" id="sv_bb">0.70</span></label>
- <input type="range" id="sl_bb" min="0.1" max="2.0" step="0.01" value="0.70">
+ <label>色相 <span class="val" id="sv_bh">139°</span></label>
+ <input type="range" id="sl_bh" min="0" max="360" step="1" value="139">
+ <label>饱和度 <span class="val" id="sv_bsat">1.41</span></label>
+ <input type="range" id="sl_bsat" min="0" max="2.0" step="0.01" value="1.41">
+ <label>亮度 <span class="val" id="sv_bb">0.10</span></label>
+ <input type="range" id="sl_bb" min="0.1" max="2.0" step="0.01" value="0.10">
 
  <h3>🖼 UI</h3>
  <label>显示UI</label>
@@ -120,39 +120,39 @@ canvas { display:block; cursor:crosshair; }
   <input type="checkbox" id="ui_cb" checked style="accent-color:#44aaff;width:16px;height:16px;">
   可见
  </label>
- <div class="row"><span>大小</span><input type="range" id="ui_sls" min="0.5" max="20" step="0.1" value="3"><span class="val" id="ui_sv">3</span></div>
- <div class="row"><span>Y偏移</span><input type="range" id="ui_sly" min="-10" max="15" step="0.1" value="1"><span class="val" id="ui_svy">1</span></div>
+ <div class="row"><span>大小</span><input type="range" id="ui_sls" min="0.5" max="20" step="0.1" value="9"><span class="val" id="ui_sv">9</span></div>
+ <div class="row"><span>Y偏移</span><input type="range" id="ui_sly" min="-10" max="15" step="0.1" value="-0.2"><span class="val" id="ui_svy">-0.2</span></div>
  <h3>⬛ 假阴影</h3>
- <label>透明度 <span class="val" id="sd_so">0.40</span></label>
- <input type="range" id="sd_slo" min="0" max="1.0" step="0.01" value="0.40">
- <label>羽化 <span class="val" id="sd_ssf">0.40</span></label>
- <input type="range" id="sd_slsf" min="0.02" max="1.0" step="0.01" value="0.40">
- <label>大小 <span class="val" id="sd_ssz">1.0</span></label>
- <input type="range" id="sd_slsz" min="0.2" max="5" step="0.1" value="1.0">
- <div class="row"><span>宽度</span><input type="range" id="sd_slw" min="1" max="20" step="0.5" value="4"><span class="val" id="sd_sw">4</span></div>
- <div class="row"><span>高度</span><input type="range" id="sd_slh" min="1" max="20" step="0.5" value="3"><span class="val" id="sd_sh">3</span></div>
- <div class="row"><span>歪斜</span><input type="range" id="sd_slsk" min="-0.8" max="0.8" step="0.01" value="0"><span class="val" id="sd_ssk">0</span></div>
- <div class="row"><span>Y位置</span><input type="range" id="sd_sly" min="-10" max="10" step="0.1" value="-2"><span class="val" id="sd_svy">-2</span></div>
+ <label>透明度 <span class="val" id="sd_so">0.37</span></label>
+ <input type="range" id="sd_slo" min="0" max="1.0" step="0.01" value="0.37">
+ <label>羽化 <span class="val" id="sd_ssf">0.54</span></label>
+ <input type="range" id="sd_slsf" min="0.02" max="1.0" step="0.01" value="0.54">
+ <label>大小 <span class="val" id="sd_ssz">0.7</span></label>
+ <input type="range" id="sd_slsz" min="0.2" max="5" step="0.1" value="0.7">
+ <div class="row"><span>宽度</span><input type="range" id="sd_slw" min="1" max="20" step="0.5" value="7"><span class="val" id="sd_sw">7</span></div>
+ <div class="row"><span>高度</span><input type="range" id="sd_slh" min="1" max="20" step="0.5" value="2"><span class="val" id="sd_sh">2</span></div>
+ <div class="row"><span>歪斜</span><input type="range" id="sd_slsk" min="-0.8" max="0.8" step="0.01" value="-0.20"><span class="val" id="sd_ssk">-0.20</span></div>
+ <div class="row"><span>Y位置</span><input type="range" id="sd_sly" min="-10" max="10" step="0.1" value="-1.9"><span class="val" id="sd_svy">-1.9</span></div>
 
  <h3>💡 光斑</h3>
- <label>颜色 <input type="color" id="halo_color" value="#ffffff" style="width:100%;height:28px;border:none;cursor:pointer;"></label>
- <label>亮度 <span class="val" id="halo_sb">1.00</span></label>
- <input type="range" id="halo_slb" min="0.1" max="3.0" step="0.01" value="1.00">
- <label>羽化 <span class="val" id="halo_ssf">0.30</span></label>
- <input type="range" id="halo_slsf" min="0.02" max="1.0" step="0.01" value="0.30">
+ <label>颜色 <input type="color" id="halo_color" value="#51d253" style="width:100%;height:28px;border:none;cursor:pointer;"></label>
+ <label>亮度 <span class="val" id="halo_sb">1.01</span></label>
+ <input type="range" id="halo_slb" min="0.1" max="3.0" step="0.01" value="1.01">
+ <label>羽化 <span class="val" id="halo_ssf">1.00</span></label>
+ <input type="range" id="halo_slsf" min="0.02" max="1.0" step="0.01" value="1.00">
  <label>透明度 <span class="val" id="halo_so">1.00</span></label>
  <input type="range" id="halo_slo" min="0" max="1.0" step="0.01" value="1.00">
- <label>大小 <span class="val" id="halo_ssz">6</span></label>
- <input type="range" id="halo_slsz" min="1" max="20" step="0.5" value="6">
- <div class="row"><span>Y偏移</span><input type="range" id="halo_sly" min="-5" max="10" step="0.1" value="0"><span class="val" id="halo_svy">0</span></div>
+ <label>大小 <span class="val" id="halo_ssz">7.5</span></label>
+ <input type="range" id="halo_slsz" min="1" max="20" step="0.5" value="7.5">
+ <div class="row"><span>Y偏移</span><input type="range" id="halo_sly" min="-5" max="10" step="0.1" value="-0.4"><span class="val" id="halo_svy">-0.4</span></div>
 
  <h3>�🔦 追光灯</h3>
  <label>色相 <span class="val" id="spot_sh">0°</span></label>
  <input type="range" id="spot_slh" min="0" max="360" step="1" value="0">
  <label>饱和度 <span class="val" id="spot_ss">0.00</span></label>
  <input type="range" id="spot_sls" min="0" max="1.0" step="0.01" value="1.00">
- <label>强度 <span class="val" id="sv_si">30</span></label>
- <input type="range" id="sl_si" min="0" max="100" step="1" value="30">
+ <label>强度 <span class="val" id="sv_si">0</span></label>
+ <input type="range" id="sl_si" min="0" max="100" step="1" value="0">
  <label>光圈角度 <span class="val" id="sv_sa">0.40</span></label>
  <input type="range" id="sl_sa" min="0.05" max="1.2" step="0.01" value="0.40">
  <label>边缘羽化 <span class="val" id="sv_sp">0.30</span></label>
@@ -166,11 +166,11 @@ canvas { display:block; cursor:crosshair; }
  <h3>�💡 光照</h3>
  <label>环境光强度<span class="val" id="sv_ai">0.50</span></label>
  <input type="range" id="sl_ai" min="0" max="3.0" step="0.01" value="0.50">
- <label>平行光强度<span class="val" id="sv_di">1.50</span></label>
- <input type="range" id="sl_di" min="0" max="5.0" step="0.01" value="1.50">
+ <label>平行光强度<span class="val" id="sv_di">5.00</span></label>
+ <input type="range" id="sl_di" min="0" max="5.0" step="0.01" value="5.00">
  <div class="row"><span>平行光X</span><input type="range" id="sl_dx" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dx">0</span></div>
- <div class="row"><span>平行光Y</span><input type="range" id="sl_dy" min="-10" max="10" step="0.1" value="5"><span class="val" id="sv_dy">5</span></div>
- <div class="row"><span>平行光Z</span><input type="range" id="sl_dz" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dz">0</span></div>
+ <div class="row"><span>平行光Y</span><input type="range" id="sl_dy" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dy">0</span></div>
+ <div class="row"><span>平行光Z</span><input type="range" id="sl_dz" min="-10" max="10" step="0.1" value="5"><span class="val" id="sv_dz">5</span></div>
 </div>
 
 <canvas id="canvas"></canvas>
@@ -209,9 +209,9 @@ await renderer.init();
 
 const scene = new THREE.Scene();
 // ── Green Screen Backdrop Color ──
-let BACKDROP_COLOR = '#2ecc40'; // classic green screen green
-let BACKDROP_SATURATION = 1.0;
-let BACKDROP_BRIGHTNESS = 0.7;
+let BACKDROP_COLOR; // initialized below from slider default via Three.js setHSL
+let BACKDROP_SATURATION = 1.41;
+let BACKDROP_BRIGHTNESS = 0.10;
 
 // ── Cyclorama Backdrop (seamless curved wall→floor) ──
 // Mimics a real green-screen studio: vertical wall behind, curved transition, horizontal floor
@@ -315,6 +315,14 @@ function createCycloramaBackdrop() {
   console.log('🟢 统一绿幕 (单mesh无缝, floor@y=' + FLOOR_Y.toFixed(1) + ' R=' + RADIUS.toFixed(1) + ' wall@z=' + Z_BACK.toFixed(1) + ')');
 }
 
+// Initialize backdrop color from slider defaults (must match hue slider's setHSL logic)
+(function() {
+  const hue = +($('sl_bh')?.value || 139);
+  const c = new THREE.Color();
+  c.setHSL(hue / 360, 1.0, 0.5);
+  BACKDROP_COLOR = '#' + c.getHexString();
+})();
+
 // Initialize backdrop
 createCycloramaBackdrop();
 
@@ -323,8 +331,8 @@ camera.position.set(1.5, 1.8, 3.5);
 camera.lookAt(0, 0, 0);
 const ambientLight = new THREE.AmbientLight('#fff', 0.5);
 scene.add(ambientLight);
-const dirLight = new THREE.DirectionalLight('#fff', 1.5);
-dirLight.position.set(0, 5, 0);
+const dirLight = new THREE.DirectionalLight('#fff', 5.0);
+dirLight.position.set(0, 0, 5);
 scene.add(dirLight);
 
 // Environment map for PBR (required for anisotropy)
@@ -381,7 +389,7 @@ const spotGobo = createRadialGradientTexture(512, 0.2);
 // Most of pineapple is OUTSIDE the tight cone. Only center gets hit.
 // At wall (z=-3): cone radius = 6*tan(0.15) ≈ 0.9. Creates a tight circle.
 
-const spotLight = new THREE.SpotLight('#ff8844', 30.0);
+const spotLight = new THREE.SpotLight('#ff8844', 0.0);
 spotLight.angle = 0.40;
 spotLight.penumbra = 0.30;
 spotLight.decay = 2;
@@ -393,7 +401,7 @@ scene.add(spotLight);
 scene.add(spotLight.target);
 
 // ── UI Plane (unlit, 贴在背墙上, 保持原图比例) ──
-let uiPlane = null, uiSize = 3;
+let uiPlane = null, uiSize = 9;
 const uiGeoBase = new THREE.PlaneGeometry(1, 1); // placeholder, resized on load
 const uiMat = new THREE.MeshBasicMaterial({
   color: '#ffffff',
@@ -415,7 +423,7 @@ const uiTexture = new THREE.TextureLoader().load('ui.png', function(tex) {
   } else {
     uiPlane = new THREE.Mesh(geo, uiMat);
     uiPlane.scale.setScalar(uiSize);
-    uiPlane.position.set(0, 1, -2.97);
+    uiPlane.position.set(0, -0.2, -2.97);
     uiPlane.renderOrder = 3;
     uiPlane.name = 'uiPlane';
     scene.add(uiPlane);
@@ -423,7 +431,7 @@ const uiTexture = new THREE.TextureLoader().load('ui.png', function(tex) {
 });
 
 // ── Fake Shadow ──
-let shadowGobo = createRadialGradientTexture(1024, 0.4, 0);
+let shadowGobo = createRadialGradientTexture(1024, 0.54, -0.20);
 const shadowGeo = new THREE.PlaneGeometry(6, 6);
 const shadowMat = new THREE.MeshBasicMaterial({
   map: shadowGobo,
@@ -432,15 +440,15 @@ const shadowMat = new THREE.MeshBasicMaterial({
   blending: THREE.NormalBlending,
   depthTest: true,
   depthWrite: false,
-  opacity: 0.4,
+  opacity: 0.37,
 });
 const shadowPlane = new THREE.Mesh(shadowGeo, shadowMat);
-shadowPlane.position.set(0, -2, -2.98);
+shadowPlane.position.set(0, -1.9, -2.98);
 shadowPlane.renderOrder = 2;
 shadowPlane.name = 'fakeShadow';
 scene.add(shadowPlane);
 
-let shadowOpac = 0.4, shadowW = 4, shadowH = 3, shadowSize = 1.0, shadowSoft = 0.4, shadowY = -2, shadowSkew = 0;
+let shadowOpac = 0.37, shadowW = 7, shadowH = 2, shadowSize = 0.7, shadowSoft = 0.54, shadowY = -1.9, shadowSkew = -0.20;
 function updateShadow() {
   shadowMat.opacity = shadowOpac;
   shadowPlane.scale.set(shadowSize * shadowW / 6, shadowSize * shadowH / 6, 1);
@@ -452,11 +460,11 @@ function updateShadowTexture() {
   shadowMat.map = shadowGobo;
   shadowMat.needsUpdate = true;
 }
-let haloGobo = createRadialGradientTexture(1024, 0.3);
+let haloGobo = createRadialGradientTexture(1024, 1.0);
 const haloGeo = new THREE.PlaneGeometry(6, 6);
 const haloMat = new THREE.MeshBasicMaterial({
   map: haloGobo,
-  color: '#ffffff',
+  color: '#51d253',
   transparent: true,
   blending: THREE.NormalBlending,
   depthTest: true,
@@ -464,12 +472,12 @@ const haloMat = new THREE.MeshBasicMaterial({
   opacity: 0.6,
 });
 const haloPlane = new THREE.Mesh(haloGeo, haloMat);
-haloPlane.position.set(0, 0, -2.99);
+haloPlane.position.set(0, -0.4, -2.99);
 haloPlane.renderOrder = 1;
 haloPlane.name = 'concertHalo';
 scene.add(haloPlane);
 
-let haloColor = '#ffffff', haloOpac = 1.0, haloSize = 6, haloSoft = 0.3, haloBright = 1.0;
+let haloColor = '#51d253', haloOpac = 1.0, haloSize = 7.5, haloSoft = 1.0, haloBright = 1.01;
 function updateHalo() {
   const c = new THREE.Color(haloColor);
   c.r = Math.min(1, c.r * haloBright);
@@ -510,12 +518,12 @@ let modelMinY=-1.5,modelMaxY=1.5; // Y range of proxy model (for delta field)
 let voxBMin=[0,0,0],voxGS=[0.1,0.1,0.1],VOX_TOTAL=64*64*64; // 64³ voxel grid
 
 // PBD params
-let SHAPE_STIFF=0.30, BAND_STIFF=0.50, VOL_STIFF=0.40, BAND_INFLU=0.60;
-let BAND_REST_CIRCUM=2.51, PBD_ITER=10;
+let SHAPE_STIFF=0.30, BAND_STIFF=0.001, VOL_STIFF=0.90, BAND_INFLU=0.60;
+let BAND_REST_CIRCUM=0.72, PBD_ITER=10;
 const DELTA_BUCKETS=256;
 let pbdAccumTime=0, pbdConverged=false, convergeFrames=0, needsRestore=false;
 let visUpdateCounter=0;          // independent counter for tube visual updates
-let CONVERGE_FRAMES=5;
+let CONVERGE_FRAMES=1;
 let lastVol=0;
 function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;visUpdateCounter=0;}
 
@@ -866,14 +874,14 @@ function updateBandLine(line,points3D){
 const MAX_CIRC_BANDS = 256;
 const circularBands = [];
 const circBandVisuals = [];
-let TUBE_RADIUS = 0.018;
-let TUBE_RADIAL_SEGS = 12;
+let TUBE_RADIUS = 0.011;
+let TUBE_RADIAL_SEGS = 6;
 let TUBE_RING_SEGS = 192;
 const CIRC_BINS = 64;
 let circVisDirty = false;
 let _circGreenB=null;            // green target line staging
-let showTargetLine=true;         // toggle for green reference circle
-let ANIM_BUFF = 2.0;             // stiffness buff multiplier during bind animation
+let showTargetLine=false;         // toggle for green reference circle
+let ANIM_BUFF = 100.0;             // stiffness buff multiplier during bind animation
 let ANIM_DURATION = 0.4;         // bind animation duration in seconds
 
 // ══════ 💥 Explosion System ══════
