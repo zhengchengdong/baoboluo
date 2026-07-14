@@ -1,7 +1,7 @@
 const { app, BrowserWindow, protocol, net, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { spawn, execFile } = require('child_process');
+const { spawn, execFile, execSync } = require('child_process');
 const iconv = require('iconv-lite');
 const { parseBarrage, MsgTypeName } = require('./barrageTypes');
 
@@ -138,9 +138,38 @@ function stopBarrageServer() {
   }
 
   if (barrageProcess && !barrageProcess.killed) {
-    console.log('[弹幕服务] 正在关闭...');
-    barrageProcess.kill();
+    const pid = barrageProcess.pid;
+    console.log(`[弹幕服务] 正在关闭... (PID=${pid})`);
+
+    // Step 1: 先尝试优雅关闭——发送 WM_CLOSE 给弹幕服务，让它有机会清理系统代理
+    try {
+      execSync(`taskkill /PID ${pid}`, { timeout: 3000, windowsHide: true });
+      console.log('[弹幕服务] 弹幕服务已优雅退出');
+    } catch (e) {
+      // 优雅关闭失败（进程可能已死或拒绝关闭），强制终止
+      console.log('[弹幕服务] 优雅关闭失败，强制终止...');
+      try {
+        barrageProcess.kill();
+      } catch (_) { /* ignore */ }
+    }
     barrageProcess = null;
+  }
+
+  // Step 2: 🔧 无论弹幕服务是否正常退出，同步清除系统代理（保证在 app 退出前一定执行）
+  clearSystemProxy();
+}
+
+// ── 同步清除 Windows 系统代理（用 execSync 确保 app 退出前一定执行完毕）──
+function clearSystemProxy() {
+  console.log('[弹幕服务] 正在清除系统代理...');
+  try {
+    execSync(
+      'powershell.exe -NoProfile -Command "Set-ItemProperty -Path \'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\' -Name ProxyEnable -Value 0 -Force"',
+      { timeout: 5000, windowsHide: true }
+    );
+    console.log('[弹幕服务] ✅ 系统代理已清除');
+  } catch (e) {
+    console.error('[弹幕服务] 清除系统代理失败:', e.message);
   }
 }
 
@@ -303,6 +332,9 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+
+  // 🔧 安全网：启动前先清除可能残留的系统代理（防止上次异常退出导致代理残留）
+  clearSystemProxy();
 
   // 启动弹幕抓取服务
   startBarrageServer();
