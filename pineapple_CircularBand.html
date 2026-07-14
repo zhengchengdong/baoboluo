@@ -94,6 +94,15 @@ canvas { display:block; cursor:crosshair; }
   <input type="checkbox" id="cb_rot" checked style="accent-color:#ffaa00;width:16px;height:16px;">
   🔄 自动旋转
  </label>
+
+ <h3>🌊 呼吸动画</h3>
+ <label>振幅 <span class="val" id="sv_ba">0.020</span></label>
+ <input type="range" id="sl_ba" min="0.002" max="0.30" step="0.002" value="0.020">
+ <label>频率 <span class="val" id="sv_bf">3.50</span></label>
+ <input type="range" id="sl_bf" min="0.2" max="8.0" step="0.1" value="3.5">
+ <label>相位差 <span class="val" id="sv_bp">2.00</span></label>
+ <input type="range" id="sl_bp" min="0.0" max="8.0" step="0.1" value="2.0">
+
  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
   <input type="checkbox" id="cb_target" style="accent-color:#ff44cc;width:16px;height:16px;">
   🟢 显示目标周长参考线
@@ -560,6 +569,24 @@ $('sl_bj').oninput=e=>{BOOM_JUICE_COUNT=+e.target.value;$('sv_bj').textContent=B
 $('sl_bhc').oninput=e=>{BOOM_HERO_COUNT=+e.target.value;_boomK=BOOM_HERO_COUNT;$('sv_bhc').textContent=BOOM_HERO_COUNT;};
 $('btn_burst').onclick=()=>{if(boomState==='idle'&&loaded)triggerBoom(convergedB||posA);};
 $('btn_reset').onclick=resetBoom;
+
+// 🌊 呼吸参数
+let BREATH_AMPLITUDE = 0.020, BREATH_FREQUENCY = 3.5, BREATH_PHASE_SCALE = 2.0;
+function updateBreathUniform() {
+  if (!breathUB) return;
+  const bu = new ArrayBuffer(32);
+  const f = new Float32Array(bu); const u = new Uint32Array(bu);
+  f[0] = 0; // time — 每帧独立更新
+  f[1] = BREATH_AMPLITUDE;
+  f[2] = BREATH_FREQUENCY;
+  f[3] = BREATH_PHASE_SCALE;
+  u[4] = proxyVertexCount;
+  f[5] = modelCentroid[0]; f[6] = modelCentroid[1]; f[7] = modelCentroid[2];
+  queue.writeBuffer(breathUB, 0, bu);
+}
+$('sl_ba').oninput = e => { BREATH_AMPLITUDE = +e.target.value; $('sv_ba').textContent = BREATH_AMPLITUDE.toFixed(3); updateBreathUniform(); };
+$('sl_bf').oninput = e => { BREATH_FREQUENCY = +e.target.value; $('sv_bf').textContent = BREATH_FREQUENCY.toFixed(2); updateBreathUniform(); };
+$('sl_bp').oninput = e => { BREATH_PHASE_SCALE = +e.target.value; $('sv_bp').textContent = BREATH_PHASE_SCALE.toFixed(2); updateBreathUniform(); };
 
 // Volume readback toggle
 let showVolumeReadback = true;
@@ -2353,11 +2380,7 @@ async function initGPU(){
   // 🌊 呼吸动画 uniform + bind group
   breathUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'breathU');
   // 初始写入一次
-  { const bu=new ArrayBuffer(32);const f=new Float32Array(bu);const u=new Uint32Array(bu);
-    f[0]=0;f[1]=0.015;f[2]=1.5;f[3]=2.0; // time, amplitude, frequency, phaseScale
-    u[4]=proxyVertexCount;f[5]=modelCentroid[0];f[6]=modelCentroid[1];f[7]=modelCentroid[2]; // vc, cx, cy, cz
-    queue.writeBuffer(breathUB,0,bu);
-  }
+  { updateBreathUniform(); }
   breathBG=device.createBindGroup({layout:breathPipe.bgl,entries:[
     {binding:0,resource:{buffer:restB}},
     {binding:1,resource:{buffer:posA}},
@@ -2820,11 +2843,11 @@ let _stackU8=null,_stackF32=null,_cutU8=null,_cutF32=null,_buildU8=null,_buildF3
 // ══════ GPU Circular Band (Tube) Visualization ══════
 let _circCutU8=null,_circCutF32=null,_circBuildU8=null,_circBuildF32=null,_circResU32=null,_circZeroBins=null;
 
-async function runGPUCircularBandVis(finalSrc){
+async function runGPUCircularBandVis(){
   if(!_circBinRB){return 0;}
   const bc=circularBands.length;
   if(bc===0){if(_circSharedMesh){_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}return 0;}
-  const t0=performance.now();const srcPos=(finalSrc===posA)?posA:posB;
+  const t0=performance.now();
   const ringSegs=TUBE_RING_SEGS,radialSegs=TUBE_RADIAL_SEGS,totalVerts=ringSegs*radialSegs*6;
   if(!_circCutU8){_circCutU8=new Uint32Array(new ArrayBuffer(48));_circCutF32=new Float32Array(_circCutU8.buffer);}
   if(!_circBuildU8){_circBuildU8=new Uint32Array(new ArrayBuffer(48));_circBuildF32=new Float32Array(_circBuildU8.buffer);}
@@ -2843,7 +2866,7 @@ async function runGPUCircularBandVis(finalSrc){
     _circCutF32[8]=band.tubeRadius;_circCutF32[9]=cx;_circCutF32[10]=cy;_circCutF32[11]=cz;
     queue.writeBuffer(_circCutUB,0,_circCutU8);
     const cutBG=device.createBindGroup({layout:circCutBinsPipe.bgl,entries:[
-      {binding:0,resource:{buffer:srcPos}},{binding:1,resource:{buffer:idxB}},
+      {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},
       {binding:2,resource:{buffer:_circBinRB}},{binding:3,resource:{buffer:_circBinRYB}},
       {binding:4,resource:{buffer:_circBinRZB}},{binding:5,resource:{buffer:_circBinCB}},
       {binding:6,resource:{buffer:_circCutUB}}]});
@@ -3444,7 +3467,7 @@ async function animate(){
           requestAnimationFrame(animate); return;
         }
       }
-      await runGPUCircularBandVis(finalSrc).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
+      await runGPUCircularBandVis().then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';}); // 读 posA（PBD+呼吸）
     }
     if (!pbdConverged) {
       if(anyAnimating){H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ⟳';}
@@ -3452,8 +3475,9 @@ async function animate(){
     }
   }else if(circularBands.length>0&&pbdConverged){
     H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
-    // 🌊 收敛后呼吸：convergedB 是稳定快照，每帧叠不同相位的呼吸
+    // 🌊 收敛后呼吸 + 更新皮筋管
     await overlayBreath();
+    await runGPUCircularBandVis().then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
   }else if(needsRestore){
     const pos4r=new Float32Array(proxyVertexCount*4);
     for(let i=0;i<proxyVertexCount;i++){pos4r[i*4]=proxyRestPositions[i*3];pos4r[i*4+1]=proxyRestPositions[i*3+1];pos4r[i*4+2]=proxyRestPositions[i*3+2];pos4r[i*4+3]=1;}
@@ -3468,7 +3492,7 @@ async function animate(){
     needsRestore=false;lastVol=restVolume;
     H.pbdtime.textContent='Restored';
     H.vratio.textContent='100.0';
-    await runGPUCircularBandVis(posA).then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
+    await runGPUCircularBandVis().then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
   }else{
     H.pbdtime.textContent='空闲';
     // 🌊 空闲呼吸：breathCS 从 restB 位移到 posA → scatter → postPBD
