@@ -1,0 +1,3796 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>皮筋游戏 GPU PBD + Three.js WebGPU</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#111; overflow:hidden; font-family:monospace; }
+canvas { display:block; cursor:crosshair; }
+#hud { position:fixed; top:12px; left:12px; z-index:10; color:#ccc; font-size:13px; line-height:1.7; pointer-events:none; }
+#hud .val { color:#0f0; }
+#info { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); color:#888; font-size:12px; z-index:10; pointer-events:none; }
+#panel { position:fixed; top:12px; right:12px; z-index:20; background:rgba(0,0,0,0.85); border:1px solid #555; border-radius:8px; padding:14px 18px; color:#ccc; font-size:12px; min-width:240px; pointer-events:all; user-select:none; max-height:90vh; overflow-y:auto; }
+#panel label { display:block; margin:6px 0 2px; color:#aaa; }
+#panel input[type=range] { width:100%; accent-color:#ff44cc; }
+#panel .val { color:#ff44cc; float:right; }
+#panel h3 { margin:8px 0 4px; color:#fff; font-size:13px; border-top:1px solid #444; padding-top:8px; }
+#panel h3:first-child { border-top:none; padding-top:0; }
+#panel .row { display:flex; gap:8px; align-items:center; }
+#panel .row span { flex:0 0 auto; color:#aaa; font-size:11px; }
+#panel .row input { flex:1; }
+#panel .btn { margin-top:6px; width:100%; padding:4px 0; background:#333; color:#ff44cc; border:1px solid #ff44cc; border-radius:4px; cursor:pointer; font-size:11px; }
+#panel .btn:hover { background:#444; }
+#panel .kb { display:inline-block; background:#333; color:#ff4; padding:1px 5px; border-radius:3px; font-size:10px; margin:0 2px; }
+#flash { position:fixed; top:0; left:0; width:100%; height:100%; background:#fff; z-index:100; pointer-events:none; opacity:0; transition:opacity 0.05s; }
+#shakeHint { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:99; pointer-events:none; color:#ff4444; font-size:48px; font-weight:bold; font-family:monospace; opacity:0; text-shadow:0 0 30px #f00,0 0 60px #f80; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+ <div>FPS: <span class="val" id="fps">--</span></div>
+ <div>帧耗时: <span class="val" id="framems">--</span> ms</div>
+ <div>代理顶点: <span class="val" id="vcount">--</span></div>
+ <div>高模顶点: <span class="val" id="hcount">--</span></div>
+ <div>皮筋: <span class="val" id="bcount">0</span></div>
+ <div>体积: <span class="val" id="vratio">100</span>%</div>
+ <div>周长比 <span class="val" id="cratio">--</span></div>
+ <div>PBD迭代: <span class="val" id="pbditer">10</span></div>
+ <div>PBD耗时: <span class="val" id="pbdtime">--</span> ms</div>
+ <div>皮筋耗时: <span class="val" id="bandtime">--</span> ms</div>
+</div>
+<div id="info">
+ Click surface to bind band (normal dir) &nbsp; <span class="kb">B</span>=快绑 &nbsp; <span class="kb">R</span>=割一&nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">?GPU PBD + Three.js WebGPU</span>
+</div>
+<div id="flash"></div>
+<div id="shakeHint">💥</div>
+<div id="panel">
+ <h3>🔧 PBD 参数</h3>
+ <label>形状刚度 <span class="val" id="sv_ss">0.30</span></label>
+ <input type="range" id="sl_ss" min="0.01" max="1.0" step="0.01" value="0.30">
+ <label>皮筋刚度 <span class="val" id="sv_bs">0.001</span></label>
+ <input type="range" id="sl_bs" min="0.001" max="1.0" step="0.001" value="0.001">
+ <label>体积刚度 <span class="val" id="sv_vs">0.90</span></label>
+ <input type="range" id="sl_vs" min="0.01" max="1.0" step="0.01" value="0.90">
+ <label>影响范围 <span class="val" id="sv_bi">0.60</span></label>
+ <input type="range" id="sl_bi" min="0.2" max="2.0" step="0.05" value="0.60">
+ <label>目标周长 L₀ <span class="val" id="sv_rc">0.72</span></label>
+ <input type="range" id="sl_rc" min="0.3" max="8.0" step="0.01" value="0.72">
+ <label>PBD迭代 <span class="val" id="sv_pi">10</span></label>
+ <input type="range" id="sl_pi" min="1" max="30" step="1" value="10">
+ <label>收敛帧数 <span class="val" id="sv_cf">1</span></label>
+ <input type="range" id="sl_cf" min="1" max="20" step="1" value="1">
+ <label>勒深刚度倍率 <span class="val" id="sv_ab">100.0</span></label>
+ <input type="range" id="sl_ab" min="0.5" max="100.0" step="0.5" value="100.0">
+ <label>回弹时长 <span class="val" id="sv_ad">0.40</span>s</label>
+ <input type="range" id="sl_ad" min="0.1" max="2.0" step="0.05" value="0.40">
+
+ <h3>⚡ 快绑皮筋 <span class="kb">B</span></h3>
+ <label>Y中心 <span class="val" id="sv_yc">-0.52</span></label>
+ <input type="range" id="sl_yc" min="-3.0" max="3.0" step="0.01" value="-0.52">
+ <label>Y散布σ <span class="val" id="sv_ys">0.15</span></label>
+ <input type="range" id="sl_ys" min="0.02" max="1.00" step="0.01" value="0.15">
+
+ <h3>💥 爆裂</h3>
+ <div class="row"><span>碎屑</span><input type="range" id="sl_bd" min="0" max="500" step="10" value="100"><span class="val" id="sv_bd">100</span></div>
+ <div class="row"><span>果汁</span><input type="range" id="sl_bj" min="0" max="300" step="10" value="60"><span class="val" id="sv_bj">60</span></div>
+ <div class="row"><span>大块</span><input type="range" id="sl_bhc" min="2" max="16" step="1" value="8"><span class="val" id="sv_bhc">8</span></div>
+ <label>触发皮筋数 <span class="val" id="sv_bt">5</span>根</label>
+ <input type="range" id="sl_bt" min="1" max="256" step="1" value="5">
+ <button class="btn" id="btn_burst" style="background:#600;color:#f44;border-color:#f44;font-size:15px;font-weight:bold;padding:8px 0;">💥 引爆!</button>
+ <button class="btn" id="btn_reset" style="color:#4af;border-color:#4af;">🔄 重置</button>
+
+ <h3>🎯 最后皮筋<span class="val" id="lb_info">(空)</span></h3>
+ <label>rest周长 <span class="val" id="sv_lr">--</span></label>
+ <input type="range" id="sl_lr" min="0.3" max="8.0" step="0.01" value="2.51">
+ <div class="row"><span>法向X</span><input type="range" id="sl_nx" min="-1" max="1" step="0.01" value="0"><span class="val" id="sv_nx">0</span></div>
+ <div class="row"><span>法向Y</span><input type="range" id="sl_ny" min="-1" max="1" step="0.01" value="1"><span class="val" id="sv_ny">1</span></div>
+ <div class="row"><span>法向Z</span><input type="range" id="sl_nz" min="-1" max="1" step="0.01" value="0"><span class="val" id="sv_nz">0</span></div>
+ <div class="row"><span>刚度</span><input type="range" id="sl_bk" min="0.001" max="1" step="0.001" value="0.500"><span class="val" id="sv_bk">0.500</span></div>
+ <button class="btn" id="btn_normalize">归一化法向量</button>
+ <button class="btn" id="btn_horiz">设为水平</button>
+
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="cb_vol" checked style="accent-color:#44aaff;width:16px;height:16px;">
+  📊 读回体积保持率 (HUD)
+ </label>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="cb_rot" checked style="accent-color:#ffaa00;width:16px;height:16px;">
+  🔄 自动旋转
+ </label>
+
+ <h3>🌊 呼吸动画</h3>
+ <label>振幅 <span class="val" id="sv_ba">0.020</span></label>
+ <input type="range" id="sl_ba" min="0.002" max="0.30" step="0.002" value="0.020">
+ <label>频率 <span class="val" id="sv_bf">3.50</span></label>
+ <input type="range" id="sl_bf" min="0.2" max="8.0" step="0.1" value="3.5">
+ <label>相位差 <span class="val" id="sv_bp">2.00</span></label>
+ <input type="range" id="sl_bp" min="0.0" max="8.0" step="0.1" value="2.0">
+
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="cb_target" style="accent-color:#ff44cc;width:16px;height:16px;">
+  🟢 显示目标周长参考线
+ </label>
+
+ <h3>🔴 圆皮筋</h3>
+ <label>管半径 <span class="val" id="sv_tr">0.011</span></label>
+ <input type="range" id="sl_tr" min="0.005" max="0.08" step="0.001" value="0.011">
+ <label>截面细分 <span class="val" id="sv_rs">6</span></label>
+ <input type="range" id="sl_rs" min="4" max="24" step="1" value="6">
+
+ <h3>� 绿幕背景</h3>
+ <label>显示背景</label>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="cb_bd" checked style="accent-color:#2ecc40;width:16px;height:16px;">
+  可见 (Cyclorama)
+ </label>
+ <label>色相 <span class="val" id="sv_bh">139°</span></label>
+ <input type="range" id="sl_bh" min="0" max="360" step="1" value="139">
+ <label>饱和度 <span class="val" id="sv_bsat">1.41</span></label>
+ <input type="range" id="sl_bsat" min="0" max="2.0" step="0.01" value="1.41">
+ <label>亮度 <span class="val" id="sv_bb">0.10</span></label>
+ <input type="range" id="sl_bb" min="0.1" max="2.0" step="0.01" value="0.10">
+
+ <h3>🖼 UI</h3>
+ <label>显示UI</label>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="ui_cb" checked style="accent-color:#44aaff;width:16px;height:16px;">
+  可见
+ </label>
+ <div class="row"><span>大小</span><input type="range" id="ui_sls" min="0.5" max="20" step="0.1" value="9"><span class="val" id="ui_sv">9</span></div>
+ <div class="row"><span>Y偏移</span><input type="range" id="ui_sly" min="-10" max="15" step="0.1" value="-0.2"><span class="val" id="ui_svy">-0.2</span></div>
+ <h3>⬛ 假阴影</h3>
+ <label>透明度 <span class="val" id="sd_so">0.37</span></label>
+ <input type="range" id="sd_slo" min="0" max="1.0" step="0.01" value="0.37">
+ <label>羽化 <span class="val" id="sd_ssf">0.54</span></label>
+ <input type="range" id="sd_slsf" min="0.02" max="1.0" step="0.01" value="0.54">
+ <label>大小 <span class="val" id="sd_ssz">0.7</span></label>
+ <input type="range" id="sd_slsz" min="0.2" max="5" step="0.1" value="0.7">
+ <div class="row"><span>宽度</span><input type="range" id="sd_slw" min="1" max="20" step="0.5" value="7"><span class="val" id="sd_sw">7</span></div>
+ <div class="row"><span>高度</span><input type="range" id="sd_slh" min="1" max="20" step="0.5" value="2"><span class="val" id="sd_sh">2</span></div>
+ <div class="row"><span>歪斜</span><input type="range" id="sd_slsk" min="-0.8" max="0.8" step="0.01" value="-0.20"><span class="val" id="sd_ssk">-0.20</span></div>
+ <div class="row"><span>Y位置</span><input type="range" id="sd_sly" min="-10" max="10" step="0.1" value="-1.9"><span class="val" id="sd_svy">-1.9</span></div>
+
+ <h3>💡 光斑</h3>
+ <label>颜色 <input type="color" id="halo_color" value="#51d253" style="width:100%;height:28px;border:none;cursor:pointer;"></label>
+ <label>亮度 <span class="val" id="halo_sb">1.01</span></label>
+ <input type="range" id="halo_slb" min="0.1" max="3.0" step="0.01" value="1.01">
+ <label>羽化 <span class="val" id="halo_ssf">1.00</span></label>
+ <input type="range" id="halo_slsf" min="0.02" max="1.0" step="0.01" value="1.00">
+ <label>透明度 <span class="val" id="halo_so">1.00</span></label>
+ <input type="range" id="halo_slo" min="0" max="1.0" step="0.01" value="1.00">
+ <label>大小 <span class="val" id="halo_ssz">7.5</span></label>
+ <input type="range" id="halo_slsz" min="1" max="20" step="0.5" value="7.5">
+ <div class="row"><span>Y偏移</span><input type="range" id="halo_sly" min="-5" max="10" step="0.1" value="-0.4"><span class="val" id="halo_svy">-0.4</span></div>
+
+ <h3>�🔦 追光灯</h3>
+ <label>色相 <span class="val" id="spot_sh">0°</span></label>
+ <input type="range" id="spot_slh" min="0" max="360" step="1" value="0">
+ <label>饱和度 <span class="val" id="spot_ss">0.00</span></label>
+ <input type="range" id="spot_sls" min="0" max="1.0" step="0.01" value="1.00">
+ <label>强度 <span class="val" id="sv_si">0</span></label>
+ <input type="range" id="sl_si" min="0" max="100" step="1" value="0">
+ <label>光圈角度 <span class="val" id="sv_sa">0.40</span></label>
+ <input type="range" id="sl_sa" min="0.05" max="1.2" step="0.01" value="0.40">
+ <label>边缘羽化 <span class="val" id="sv_sp">0.30</span></label>
+ <input type="range" id="sl_sp" min="0" max="1.0" step="0.01" value="0.30">
+ <label>衰减 <span class="val" id="sv_sd">2</span></label>
+ <input type="range" id="sl_sd" min="0" max="5" step="0.5" value="2">
+ <div class="row"><span>目标Y</span><input type="range" id="sl_sty" min="-3" max="3" step="0.1" value="0"><span class="val" id="sv_sty">0</span></div>
+ <div class="row"><span>位置Y</span><input type="range" id="sl_sy" min="-5" max="10" step="0.1" value="0"><span class="val" id="sv_sy">0</span></div>
+ <div class="row"><span>位置Z</span><input type="range" id="sl_sz" min="-5" max="15" step="0.1" value="5"><span class="val" id="sv_sz">5</span></div>
+
+ <h3>�💡 光照</h3>
+ <label>环境光强度<span class="val" id="sv_ai">0.50</span></label>
+ <input type="range" id="sl_ai" min="0" max="3.0" step="0.01" value="0.50">
+ <label>平行光强度<span class="val" id="sv_di">5.00</span></label>
+ <input type="range" id="sl_di" min="0" max="5.0" step="0.01" value="5.00">
+ <div class="row"><span>平行光X</span><input type="range" id="sl_dx" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dx">0</span></div>
+ <div class="row"><span>平行光Y</span><input type="range" id="sl_dy" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dy">0</span></div>
+ <div class="row"><span>平行光Z</span><input type="range" id="sl_dz" min="-10" max="10" step="0.1" value="5"><span class="val" id="sv_dz">5</span></div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.webgpu.js", "three/addons/loaders/GLTFLoader.js": "./vendor/jsm/loaders/GLTFLoader.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ══════.?DOM ══════.?
+const $=id=>document.getElementById(id);
+const H={
+  fps:$('fps'),framems:$('framems'),vcount:$('vcount'),hcount:$('hcount'),
+  bcount:$('bcount'),vratio:$('vratio'),cratio:$('cratio'),
+  pbditer:$('pbditer'),pbdtime:$('pbdtime'),bandtime:$('bandtime'),
+};
+const canvas=$('canvas');
+
+// ═══════ WebGPU adapter ═══════
+if(!navigator.gpu){
+  const msg='❌ navigator.gpu 不可用。\n\n'+
+    'GPU 信息:\n'+
+    '  WebGL: '+(document.createElement('canvas').getContext('webgl2')?'✅ 可用':'❌ 不可用')+'\n'+
+    '  UserAgent: '+navigator.userAgent+'\n\n'+
+    '可能原因: 显卡驱动过旧 / 显卡不支持 Vulkan/D3D12\n'+
+    '尝试: 更新显卡驱动到最新版';
+  alert(msg);
+  console.error(msg);
+  throw new Error('No WebGPU');
+}
+let adapter=null;for(let i=0;i<3&&!adapter;i++){adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!adapter&&i<2)await new Promise(r=>setTimeout(r,500));}
+if(!adapter){alert('无法获取GPU适配器');throw new Error('No adapter');}
+const device=await adapter.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:10}});
+device.addEventListener('uncapturederror',ev=>console.error('GPU error:',ev.error));
+const queue=device.queue;
+
+// ══════.?Three.js WebGPU Renderer ══════.?
+const renderer = new THREE.WebGPURenderer({ canvas, device, antialias: true, alpha: false, depth: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+await renderer.init();
+
+const scene = new THREE.Scene();
+// ── Green Screen Backdrop Color ──
+let BACKDROP_COLOR; // initialized below from slider default via Three.js setHSL
+let BACKDROP_SATURATION = 1.41;
+let BACKDROP_BRIGHTNESS = 0.10;
+
+// ── Cyclorama Backdrop (seamless curved wall→floor) ──
+// Mimics a real green-screen studio: vertical wall behind, curved transition, horizontal floor
+let backdropMesh = null;
+
+function createCycloramaBackdrop() {
+  const WIDTH = 30;
+  const WALL_H = 20;
+  const FLOOR_L = 5;
+  const RADIUS = 2.5;
+  const Z_BACK = -3.0;
+  const FLOOR_Y = -10.0;
+  const CURVE_SEG = 24;
+  const W_SEG = 30;
+  const halfW = WIDTH / 2;
+
+  // Build row data: wall top → wall bottom → curve → floor end
+  // Single continuous surface, tangent-continuous at all junctions.
+  // Curve: quarter-circle centered at (FLOOR_Y+R, Z_BACK+R), arc 3π/2→π
+  //   tangent at wall: DOWN (0,-1,0)  ← matches wall
+  //   tangent at floor: FORWARD (0,0,1) ← matches floor
+  const rowData = [];
+  // Row 0: top of wall
+  rowData.push({ y: FLOOR_Y + RADIUS + WALL_H, z: Z_BACK });
+  // Row 1: bottom of wall / curve start
+  rowData.push({ y: FLOOR_Y + RADIUS, z: Z_BACK });
+  // Curve rows: quarter-circle 3π/2 → π
+  for (let i = 1; i <= CURVE_SEG; i++) {
+    const t = i / CURVE_SEG;
+    const θ = (3 * Math.PI / 2) - t * (Math.PI / 2); // 3π/2 down to π
+    const y = (FLOOR_Y + RADIUS) + RADIUS * Math.cos(θ);
+    const z = (Z_BACK + RADIUS) + RADIUS * Math.sin(θ);
+    rowData.push({ y, z });
+  }
+  // Last row: floor end
+  rowData.push({ y: FLOOR_Y, z: Z_BACK + RADIUS + FLOOR_L });
+
+  const totalRows = rowData.length;
+  const verts = [];
+  for (let r = 0; r < totalRows; r++) {
+    const { y, z } = rowData[r];
+    for (let j = 0; j <= W_SEG; j++) {
+      verts.push(-halfW + (j / W_SEG) * WIDTH, y, z);
+    }
+  }
+  const idx = [];
+  for (let r = 0; r < totalRows - 1; r++) {
+    for (let j = 0; j < W_SEG; j++) {
+      const a = r * (W_SEG + 1) + j;
+      const b = a + 1;
+      const c = a + (W_SEG + 1);
+      const d = c + 1;
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(verts), 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+
+  // Build material
+  const fc = getBackdropFinalColor();
+  const mat = new THREE.MeshStandardMaterial({ color: fc, roughness: 0.9, metalness: 0.0, side: THREE.FrontSide });
+
+  backdropMesh = new THREE.Mesh(geo, mat);
+  backdropMesh.renderOrder = -1;
+  backdropMesh.receiveShadow = true;
+  backdropMesh.name = 'cycloramaUnified';
+  backdropMesh.layers.enable(1); // also receive spotlight (layer 1)
+  scene.add(backdropMesh);
+
+  // ── Side walls (separate, DoubleSide) ──
+  const floorZ1 = Z_BACK + RADIUS + FLOOR_L;
+  const totalH = RADIUS + WALL_H;
+  backdropMesh.userData.sideWalls = [];
+  function addSideWall(xPos) {
+    const swVerts = new Float32Array([
+      xPos, FLOOR_Y, Z_BACK,
+      xPos, FLOOR_Y + totalH, Z_BACK,
+      xPos, FLOOR_Y, floorZ1,
+      xPos, FLOOR_Y + totalH, floorZ1,
+    ]);
+    const swIdx = new Uint32Array([0, 2, 1, 1, 2, 3]);
+    const sg = new THREE.BufferGeometry();
+    sg.setAttribute('position', new THREE.Float32BufferAttribute(swVerts, 3));
+    sg.setIndex(new THREE.BufferAttribute(swIdx, 1));
+    sg.computeVertexNormals();
+    const sm = new THREE.MeshStandardMaterial({ color: fc, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide });
+    const sw = new THREE.Mesh(sg, sm);
+    sw.renderOrder = -1; sw.receiveShadow = true;
+    sw.name = 'sideWall'; sw.userData.isBackdropPart = true;
+    sw.layers.enable(1); // also receive spotlight
+    scene.add(sw);
+    backdropMesh.userData.sideWalls.push(sw);
+  }
+  addSideWall(-halfW);
+  addSideWall(halfW);
+
+  scene.background = new THREE.Color(fc).multiplyScalar(0.6);
+  console.log('🟢 统一绿幕 (单mesh无缝, floor@y=' + FLOOR_Y.toFixed(1) + ' R=' + RADIUS.toFixed(1) + ' wall@z=' + Z_BACK.toFixed(1) + ')');
+}
+
+// Initialize backdrop color from slider defaults (must match hue slider's setHSL logic)
+(function() {
+  const hue = +($('sl_bh')?.value || 139);
+  const c = new THREE.Color();
+  c.setHSL(hue / 360, 1.0, 0.5);
+  BACKDROP_COLOR = '#' + c.getHexString();
+})();
+
+// Initialize backdrop
+createCycloramaBackdrop();
+
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 50);
+camera.position.set(1.5, 1.8, 3.5);
+camera.lookAt(0, 0, 0);
+const ambientLight = new THREE.AmbientLight('#fff', 0.5);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight('#fff', 5.0);
+dirLight.position.set(0, 0, 5);
+scene.add(dirLight);
+
+// Environment map for PBR (required for anisotropy)
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+const envMap = pmremGenerator.fromScene(scene, 0.5).texture;
+// IBL disabled — green backdrop was tinting everything
+// scene.environment = envMap;
+pmremGenerator.dispose();
+
+// 🌟 父级Group — 所有菠萝相关对象挂在下面，方便统一旋转
+const pineappleGroup = new THREE.Group();
+scene.add(pineappleGroup);
+
+// ── Radial Gradient Texture (shared by spotlight + halo) ──
+// Mimics SpotLight penumbra: smoothstep from inner radius to outer radius
+function createRadialGradientTexture(size, softness, skewY = 0) {
+  const canvas = document.createElement('canvas');
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const half = size / 2;
+  const s = Math.max(0.02, softness);
+  const rInner = half * (1 - s);
+  const rOuter = half;
+  const cy = half + skewY * half; // offset inner circle center vertically
+  const gradient = ctx.createRadialGradient(half, cy, rInner, half, half, rOuter);
+  const N = 30;
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    // smoothstep: t=0 at rInner → a=1, t=1 at rOuter → a=0
+    const x = t;
+    const a = x >= 1 ? 0 : x <= 0 ? 1 : 1 - x * x * (3 - 2 * x);
+    gradient.addColorStop(t, `rgba(255,255,255,${a.toFixed(4)})`);
+  }
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+const spotGobo = createRadialGradientTexture(512, 0.2);
+
+// Standard SpotLight — physically based, no cheats
+// SpotLight behind the backdrop, shining forward — physically can't hit the pineapple.
+// Backdrop is DoubleSide→FrontSide, so light from behind passes through? No.
+// Actually: place spotlight behind wall (z < -3), aim at wall back-face.
+// The wall FrontSide faces +Z (camera). BackSide faces -Z.
+// Light from behind hits the BACK of the wall → with FrontSide material, not visible.
+// 
+// Better: keep spotlight in front, but target it ONLY at the wall area.
+// Use narrow angle so the cone misses the pineapple entirely.
+// spotlight at (0, -1, 4), target at (0, -2, -3) → aims at lower part of wall, below pineapple
+
+// Simpler approach: spotlight at same level as pineapple but far enough that
+// with a small angle, the cone is tight on the wall behind the pineapple.
+// Pineapple at z≈0, radius≈1.5. Spotlight at (0, 0, 3), angle=0.15, target (0,0,-3).
+// At pineapple (z=0): cone radius = 3*tan(0.15) ≈ 0.45. Pineapple radius ≈1.5.
+// Most of pineapple is OUTSIDE the tight cone. Only center gets hit.
+// At wall (z=-3): cone radius = 6*tan(0.15) ≈ 0.9. Creates a tight circle.
+
+const spotLight = new THREE.SpotLight('#ff8844', 0.0);
+spotLight.angle = 0.40;
+spotLight.penumbra = 0.30;
+spotLight.decay = 2;
+spotLight.distance = 0;
+spotLight.position.set(0, 0, 5);
+spotLight.target.position.set(0, 0, -3.0);
+spotLight.map = spotGobo;
+scene.add(spotLight);
+scene.add(spotLight.target);
+
+// ── UI Plane (unlit, 贴在背墙上, 保持原图比例) ──
+let uiPlane = null, uiSize = 9;
+const uiGeoBase = new THREE.PlaneGeometry(1, 1); // placeholder, resized on load
+const uiMat = new THREE.MeshBasicMaterial({
+  color: '#ffffff',
+  transparent: true,
+  depthTest: false,
+  depthWrite: false,
+});
+const uiTexture = new THREE.TextureLoader().load('ui.png', function(tex) {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  uiMat.map = tex;
+  uiMat.needsUpdate = true;
+  // Size plane to match image aspect ratio (height=1, width=aspect)
+  const aspect = tex.image.width / tex.image.height;
+  uiGeoBase.dispose();
+  const geo = new THREE.PlaneGeometry(aspect, 1);
+  if (uiPlane) {
+    uiPlane.geometry = geo;
+    uiPlane.scale.setScalar(uiSize);
+  } else {
+    uiPlane = new THREE.Mesh(geo, uiMat);
+    uiPlane.scale.setScalar(uiSize);
+    uiPlane.position.set(0, -0.2, -2.97);
+    uiPlane.renderOrder = 3;
+    uiPlane.name = 'uiPlane';
+    scene.add(uiPlane);
+  }
+});
+
+// ── Fake Shadow ──
+let shadowGobo = createRadialGradientTexture(1024, 0.54, -0.20);
+const shadowGeo = new THREE.PlaneGeometry(6, 6);
+const shadowMat = new THREE.MeshBasicMaterial({
+  map: shadowGobo,
+  color: '#000000',
+  transparent: true,
+  blending: THREE.NormalBlending,
+  depthTest: true,
+  depthWrite: false,
+  opacity: 0.37,
+});
+const shadowPlane = new THREE.Mesh(shadowGeo, shadowMat);
+shadowPlane.position.set(0, -1.9, -2.98);
+shadowPlane.renderOrder = 2;
+shadowPlane.name = 'fakeShadow';
+scene.add(shadowPlane);
+
+let shadowOpac = 0.37, shadowW = 7, shadowH = 2, shadowSize = 0.7, shadowSoft = 0.54, shadowY = -1.9, shadowSkew = -0.20;
+function updateShadow() {
+  shadowMat.opacity = shadowOpac;
+  shadowPlane.scale.set(shadowSize * shadowW / 6, shadowSize * shadowH / 6, 1);
+  shadowPlane.position.y = shadowY;
+}
+function updateShadowTexture() {
+  if (shadowGobo) shadowGobo.dispose();
+  shadowGobo = createRadialGradientTexture(1024, shadowSoft, shadowSkew);
+  shadowMat.map = shadowGobo;
+  shadowMat.needsUpdate = true;
+}
+let haloGobo = createRadialGradientTexture(1024, 1.0);
+const haloGeo = new THREE.PlaneGeometry(6, 6);
+const haloMat = new THREE.MeshBasicMaterial({
+  map: haloGobo,
+  color: '#51d253',
+  transparent: true,
+  blending: THREE.NormalBlending,
+  depthTest: true,
+  depthWrite: false,
+  opacity: 0.6,
+});
+const haloPlane = new THREE.Mesh(haloGeo, haloMat);
+haloPlane.position.set(0, -0.4, -2.99);
+haloPlane.renderOrder = 1;
+haloPlane.name = 'concertHalo';
+scene.add(haloPlane);
+
+let haloColor = '#51d253', haloOpac = 1.0, haloSize = 7.5, haloSoft = 1.0, haloBright = 1.01;
+function updateHalo() {
+  const c = new THREE.Color(haloColor);
+  c.r = Math.min(1, c.r * haloBright);
+  c.g = Math.min(1, c.g * haloBright);
+  c.b = Math.min(1, c.b * haloBright);
+  haloMat.color.copy(c);
+  haloMat.opacity = haloOpac;
+  haloPlane.scale.setScalar(haloSize / 6);
+}
+function updateHaloTexture() {
+  if (haloGobo) haloGobo.dispose();
+  haloGobo = createRadialGradientTexture(1024, haloSoft);
+  haloMat.map = haloGobo;
+  haloMat.needsUpdate = true;
+}
+
+// Optional: visualize the spotlight helper
+// const spotHelper = new THREE.SpotLightHelper(spotLight);
+// scene.add(spotHelper);
+
+// ══════.?State ══════.?
+let proxyVertexCount=0, proxyTriCount=0, restVolume=0, restSurfaceArea=0;
+let proxyRestPositions=null;     // CPU: proxy rest positions (flat float32)
+let proxyCurPositions=null;      // CPU: proxy current positions (for CPU PBD)
+let proxyIdxArr=null;            // CPU: proxy indices
+let proxyRestNormals=null;       // CPU: proxy rest normals (gradient directions)
+let highResCount=0;
+let highResRestPositions=null;   // CPU: high-res rest positions
+let highResIdxArr=null;          // CPU: high-res index array
+let highResRestNormals=null;     // CPU: high-res rest normals
+let nearestProxyIdx=null;        // CPU: nearest proxy vertex for each high-res vertex
+// Spatial hash for fast surface projection
+let _hashGrid=24, _hashBmin=null, _hashGs=null, _hashCells=null, _vertTris=null;
+let pineappleMesh=null;
+let proxyWireMesh=null;
+let showProxyWire=false;
+let modelMinY=-1.5,modelMaxY=1.5; // Y range of proxy model (for delta field)
+let voxBMin=[0,0,0],voxGS=[0.1,0.1,0.1],VOX_TOTAL=64*64*64; // 64³ voxel grid
+
+let BAND_Y_CENTER = -0.52;   // 快绑正态分布中心Y
+let BAND_Y_SPREAD = 0.15;   // σ for quick-bind normal distribution (Y axis)
+
+// PBD params
+let SHAPE_STIFF=0.30, BAND_STIFF=0.001, VOL_STIFF=0.90, BAND_INFLU=0.60;
+let BAND_REST_CIRCUM=0.72, PBD_ITER=10;
+const DELTA_BUCKETS=256;
+let pbdAccumTime=0, pbdConverged=false, convergeFrames=0, needsRestore=false;
+let visUpdateCounter=0;          // independent counter for tube visual updates
+let CONVERGE_FRAMES=1;
+let lastVol=0;
+// 🌊 呼吸动画：模型质心（用于径向位移基准）
+let modelCentroid=[0,0,0];
+function markPbdDirty(){pbdConverged=false;convergeFrames=0;pbdAccumTime=0;visUpdateCounter=0;}
+
+// Slider wiring
+$('sl_ss').oninput=e=>{SHAPE_STIFF=+e.target.value;$('sv_ss').textContent=SHAPE_STIFF.toFixed(2);markPbdDirty();};
+$('sl_bs').oninput=e=>{BAND_STIFF=+e.target.value;$('sv_bs').textContent=BAND_STIFF.toFixed(3);for(const b of circularBands){b.baseStiffness=BAND_STIFF;if(b.animProgress>=1)b.stiffness=BAND_STIFF;}markPbdDirty();};
+$('sl_vs').oninput=e=>{VOL_STIFF=+e.target.value;$('sv_vs').textContent=VOL_STIFF.toFixed(2);markPbdDirty();};
+$('sl_bi').oninput=e=>{BAND_INFLU=+e.target.value;$('sv_bi').textContent=BAND_INFLU.toFixed(2);for(const b of circularBands)b.influRadius=BAND_INFLU;markPbdDirty();};
+$('sl_rc').oninput=e=>{
+  BAND_REST_CIRCUM=+e.target.value;$('sv_rc').textContent=BAND_REST_CIRCUM.toFixed(2);
+  for(const b of circularBands){
+    b.restCircum=BAND_REST_CIRCUM;
+    if(b.restPerimeter>0)b.preScale=BAND_REST_CIRCUM/b.restPerimeter;
+  }
+  markPbdDirty();
+};
+$('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
+$('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
+$('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUFF.toFixed(1);for(const b of circularBands)b.buffStiffness=ANIM_BUFF;};
+$('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);for(const b of circularBands)b.animDuration=ANIM_DURATION;};
+$('sl_yc').oninput=e=>{BAND_Y_CENTER=+e.target.value;$('sv_yc').textContent=BAND_Y_CENTER.toFixed(2);};
+$('sl_ys').oninput=e=>{BAND_Y_SPREAD=+e.target.value;$('sv_ys').textContent=BAND_Y_SPREAD.toFixed(2);};
+$('sl_bt').oninput=e=>{boomTriggerBandCount=+e.target.value;$('sv_bt').textContent=boomTriggerBandCount;};
+$('sl_bd').oninput=e=>{BOOM_DEBRIS_COUNT=+e.target.value;$('sv_bd').textContent=BOOM_DEBRIS_COUNT;};
+$('sl_bj').oninput=e=>{BOOM_JUICE_COUNT=+e.target.value;$('sv_bj').textContent=BOOM_JUICE_COUNT;};
+$('sl_bhc').oninput=e=>{BOOM_HERO_COUNT=+e.target.value;_boomK=BOOM_HERO_COUNT;$('sv_bhc').textContent=BOOM_HERO_COUNT;};
+$('btn_burst').onclick=()=>{if(boomState==='idle'&&loaded)triggerBoom(convergedB||posA);};
+$('btn_reset').onclick=resetBoom;
+
+// 🌊 呼吸参数
+let BREATH_AMPLITUDE = 0.020, BREATH_FREQUENCY = 3.5, BREATH_PHASE_SCALE = 2.0;
+function updateBreathUniform() {
+  if (!breathUB) return;
+  const bu = new ArrayBuffer(32);
+  const f = new Float32Array(bu); const u = new Uint32Array(bu);
+  f[0] = 0; // time — 每帧独立更新
+  f[1] = BREATH_AMPLITUDE;
+  f[2] = BREATH_FREQUENCY;
+  f[3] = BREATH_PHASE_SCALE;
+  u[4] = proxyVertexCount;
+  f[5] = modelCentroid[0]; f[6] = modelCentroid[1]; f[7] = modelCentroid[2];
+  queue.writeBuffer(breathUB, 0, bu);
+}
+$('sl_ba').oninput = e => { BREATH_AMPLITUDE = +e.target.value; $('sv_ba').textContent = BREATH_AMPLITUDE.toFixed(3); updateBreathUniform(); };
+$('sl_bf').oninput = e => { BREATH_FREQUENCY = +e.target.value; $('sv_bf').textContent = BREATH_FREQUENCY.toFixed(2); updateBreathUniform(); };
+$('sl_bp').oninput = e => { BREATH_PHASE_SCALE = +e.target.value; $('sv_bp').textContent = BREATH_PHASE_SCALE.toFixed(2); updateBreathUniform(); };
+
+// Volume readback toggle
+let showVolumeReadback = true;
+$('cb_vol').onchange = e => { showVolumeReadback = e.target.checked; };
+// Auto-rotation toggle
+let autoRotate = true;
+$('cb_rot').onchange = e => { autoRotate = e.target.checked; };
+$('cb_target').onchange = e => {
+  showTargetLine = e.target.checked;
+  for(const vis of circBandVisuals){if(vis.lineTarget)vis.lineTarget.visible=showTargetLine;}
+};
+
+// Backdrop controls
+function getBackdropFinalColor() {
+  const baseColor = new THREE.Color(BACKDROP_COLOR);
+  const gray = baseColor.r * 0.299 + baseColor.g * 0.587 + baseColor.b * 0.114;
+  const satColor = new THREE.Color(
+    gray + (baseColor.r - gray) * BACKDROP_SATURATION,
+    gray + (baseColor.g - gray) * BACKDROP_SATURATION,
+    gray + (baseColor.b - gray) * BACKDROP_SATURATION
+  );
+  return new THREE.Color(
+    satColor.r * BACKDROP_BRIGHTNESS,
+    satColor.g * BACKDROP_BRIGHTNESS,
+    satColor.b * BACKDROP_BRIGHTNESS
+  );
+}
+
+function updateBackdropMaterial() {
+  if (!backdropMesh) return;
+  const fc = getBackdropFinalColor();
+  backdropMesh.material.color.copy(fc);
+  if (backdropMesh.userData.sideWalls) {
+    for (const sw of backdropMesh.userData.sideWalls) sw.material.color.copy(fc);
+  }
+  scene.background = new THREE.Color(fc).multiplyScalar(0.6);
+}
+
+$('sl_bh').oninput = e => {
+  const hue = +e.target.value;
+  $('sv_bh').textContent = hue + '°';
+  const color = new THREE.Color();
+  color.setHSL(hue / 360, 1.0, 0.5);
+  BACKDROP_COLOR = '#' + color.getHexString();
+  updateBackdropMaterial();
+};
+$('sl_bsat').oninput = e => {
+  BACKDROP_SATURATION = +e.target.value;
+  $('sv_bsat').textContent = BACKDROP_SATURATION.toFixed(2);
+  updateBackdropMaterial();
+};
+$('sl_bb').oninput = e => {
+  BACKDROP_BRIGHTNESS = +e.target.value;
+  $('sv_bb').textContent = BACKDROP_BRIGHTNESS.toFixed(2);
+  updateBackdropMaterial();
+};
+$('cb_bd').onchange = e => {
+  const vis = e.target.checked;
+  if (backdropMesh) {
+    backdropMesh.visible = vis;
+    if (backdropMesh.userData.sideWalls) {
+      for (const sw of backdropMesh.userData.sideWalls) sw.visible = vis;
+    }
+  }
+};
+
+// Halo sliders
+$('halo_color').oninput = function() { haloColor = this.value; updateHalo(); };
+$('halo_slb').oninput = function() { haloBright = +this.value; $('halo_sb').textContent = haloBright.toFixed(2); updateHalo(); };
+$('halo_slsf').oninput = function() { haloSoft = +this.value; $('halo_ssf').textContent = haloSoft.toFixed(2); updateHaloTexture(); };
+$('halo_slo').oninput = function() { haloOpac = +this.value; $('halo_so').textContent = haloOpac.toFixed(2); updateHalo(); };
+$('halo_slsz').oninput = function() { haloSize = +this.value; $('halo_ssz').textContent = haloSize; updateHalo(); };
+$('halo_sly').oninput = function() { haloPlane.position.y = +this.value; $('halo_svy').textContent = (+this.value).toFixed(1); };
+// Init halo
+$('halo_sb').textContent = haloBright.toFixed(2);
+$('halo_ssf').textContent = haloSoft.toFixed(2);
+$('halo_so').textContent = haloOpac.toFixed(2);
+$('halo_ssz').textContent = haloSize;
+updateHalo();
+
+// Shadow sliders
+$('sd_slo').oninput = function() { shadowOpac = +this.value; $('sd_so').textContent = shadowOpac.toFixed(2); updateShadow(); };
+$('sd_slsz').oninput = function() { shadowSize = +this.value; $('sd_ssz').textContent = shadowSize.toFixed(1); updateShadow(); };
+$('sd_slw').oninput = function() { shadowW = +this.value; $('sd_sw').textContent = shadowW; updateShadow(); };
+$('sd_slh').oninput = function() { shadowH = +this.value; $('sd_sh').textContent = shadowH; updateShadow(); };
+$('sd_slsf').oninput = function() { shadowSoft = +this.value; $('sd_ssf').textContent = shadowSoft.toFixed(2); updateShadowTexture(); };
+$('sd_slsk').oninput = function() { shadowSkew = +this.value; $('sd_ssk').textContent = shadowSkew.toFixed(2); updateShadowTexture(); };
+$('sd_sly').oninput = function() { shadowY = +this.value; $('sd_svy').textContent = (+this.value).toFixed(1); updateShadow(); };
+$('sd_so').textContent = shadowOpac.toFixed(2);
+$('sd_ssz').textContent = shadowSize.toFixed(1);
+$('sd_ssf').textContent = shadowSoft.toFixed(2);
+$('sd_sw').textContent = shadowW;
+$('sd_sh').textContent = shadowH;
+$('sd_svy').textContent = shadowY.toFixed(1);
+updateShadow();
+
+// UI sliders
+$('ui_cb').onchange = function() { if (uiPlane) uiPlane.visible = this.checked; };
+$('ui_sls').oninput = function() { uiSize = +this.value; $('ui_sv').textContent = uiSize; if (uiPlane) uiPlane.scale.setScalar(uiSize); };
+$('ui_sly').oninput = function() { if (uiPlane) { uiPlane.position.y = +this.value; $('ui_svy').textContent = (+this.value).toFixed(1); } };
+$('ui_sv').textContent = uiSize;
+$('ui_svy').textContent = '1.0';
+
+// Spotlight sliders
+let spotHue = +($('spot_slh')?.value || 0);
+let spotSat = +($('spot_sls')?.value || 0);
+function updateSpotColor() {
+  const h = spotHue / 360, s = spotSat, l = 0.5;
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const hue2rgb = (t) => {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1/6) return p + (q - p) * 6 * t;
+    if (t < 1/2) return q;
+    if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+    return p;
+  };
+  spotLight.color.setRGB(hue2rgb(h + 1/3), hue2rgb(h), hue2rgb(h - 1/3));
+}
+$('spot_slh').oninput = function() { spotHue = +this.value; $('spot_sh').textContent = spotHue + '°'; updateSpotColor(); };
+$('spot_sls').oninput = function() { spotSat = +this.value; $('spot_ss').textContent = spotSat.toFixed(2); updateSpotColor(); };
+// Sync labels and color with slider defaults
+$('spot_sh').textContent = spotHue + '°';
+$('spot_ss').textContent = spotSat.toFixed(2);
+updateSpotColor();
+$('sl_si').oninput = e => { const v = +e.target.value; spotLight.intensity = v; $('sv_si').textContent = v; };
+$('sl_sa').oninput = e => { const v = +e.target.value; spotLight.angle = v; $('sv_sa').textContent = v.toFixed(2); };
+$('sl_sp').oninput = e => { const v = +e.target.value; spotLight.penumbra = v; $('sv_sp').textContent = v.toFixed(2); };
+$('sl_sd').oninput = e => { const v = +e.target.value; spotLight.decay = v; $('sv_sd').textContent = v.toFixed(1); };
+$('sl_sty').oninput = e => { const v = +e.target.value; spotLight.target.position.y = v; $('sv_sty').textContent = v.toFixed(1); };
+$('sl_sy').oninput = e => { const v = +e.target.value; spotLight.position.y = v; $('sv_sy').textContent = v.toFixed(1); };
+$('sl_sz').oninput = e => { const v = +e.target.value; spotLight.position.z = v; $('sv_sz').textContent = v.toFixed(1); };
+
+// Lighting sliders
+$('sl_ai').oninput=e=>{const v=+e.target.value;ambientLight.intensity=v;$('sv_ai').textContent=v.toFixed(2);};
+$('sl_di').oninput=e=>{const v=+e.target.value;dirLight.intensity=v;$('sv_di').textContent=v.toFixed(2);};
+$('sl_dx').oninput=e=>{const v=+e.target.value;dirLight.position.x=v;$('sv_dx').textContent=v.toFixed(1);};
+$('sl_dy').oninput=e=>{const v=+e.target.value;dirLight.position.y=v;$('sv_dy').textContent=v.toFixed(1);};
+$('sl_dz').oninput=e=>{const v=+e.target.value;dirLight.position.z=v;$('sv_dz').textContent=v.toFixed(1);};
+
+// ── Ribbon mesh (PBR: copy proxy triangles in band .?offset for thickness) ──
+
+// Per-vertex stack computation for a single band.
+// For each proxy vertex, determines which other bands cover it,
+// then computes cumulative stack below + this band's thickness after squash.
+// Returns {offLo: Float32Array(proxyVertexCount), offHi: Float32Array(proxyVertexCount)}
+function computePerVertexOffsets(bandIndex) {
+  const vc = proxyVertexCount;
+  const offLoArr = new Float32Array(vc);
+  const offHiArr = new Float32Array(vc);
+  const bc = bands.length;
+  if (bc <= 1) {
+    // Only one band .?uniform offset
+    offLoArr.fill(RIBBON_SURFACE_OFFSET);
+    offHiArr.fill(RIBBON_SURFACE_OFFSET + RIBBON_THICKNESS);
+    return {offLo: offLoArr, offHi: offHiArr};
+  }
+
+  // Pre-compute per-vertex coverage: coveredByVert[b][v] = bool
+  // Use bit mask stored in Uint8Array for compactness
+  const coveredByVert = new Uint8Array(vc * bc); // 0 or 1
+  for (let b = 0; b < bc; b++) {
+    const band = bands[b];
+    const ox = band.planeOrigin[0], oy = band.planeOrigin[1], oz = band.planeOrigin[2];
+    const nx = band.planeNormal[0], ny = band.planeNormal[1], nz = band.planeNormal[2];
+    const tol = RIBBON_HALF_WIDTH * 2.5;
+    const off = b * vc;
+    for (let v = 0; v < vc; v++) {
+      const i3 = v * 3;
+      const d = Math.abs((proxyCurPositions[i3] - ox) * nx + (proxyCurPositions[i3+1] - oy) * ny + (proxyCurPositions[i3+2] - oz) * nz);
+      coveredByVert[off + v] = (d < tol) ? 1 : 0;
+    }
+  }
+
+  // For each vertex, compute per-band effective thickness (accounting for bands above)
+  // effThickness[b][v] = RIBBON_THICKNESS / (1 + count_of_bands_above_covering_v * COMPRESSION)
+  const effThick = new Float32Array(vc * bc);
+  for (let b = 0; b < bc; b++) {
+    const offB = b * vc;
+    for (let v = 0; v < vc; v++) {
+      if (coveredByVert[offB + v]) {
+        let aboveCount = 0;
+        for (let k = b + 1; k < bc; k++) {
+          if (coveredByVert[k * vc + v]) aboveCount++;
+        }
+        effThick[offB + v] = RIBBON_THICKNESS / (1.0 + aboveCount * BAND_COMPRESSION_PER_LAYER);
+      }
+    }
+  }
+
+  // Now compute offLo/offHi for the target band at each vertex
+  for (let v = 0; v < vc; v++) {
+    // Stack below: sum of effective thicknesses of bands j < bandIndex covering this vertex
+    let stackBelow = 0;
+    for (let j = 0; j < bandIndex; j++) {
+      if (coveredByVert[j * vc + v]) {
+        stackBelow += effThick[j * vc + v];
+      }
+    }
+
+    // This band's own effective thickness at this vertex
+    const myEff = effThick[bandIndex * vc + v] || RIBBON_THICKNESS;
+
+    // Count bands above covering this vertex (for HUD/debug)
+    let aboveCount = 0;
+    for (let k = bandIndex + 1; k < bc; k++) {
+      if (coveredByVert[k * vc + v]) aboveCount++;
+    }
+    const myThick = RIBBON_THICKNESS / (1.0 + aboveCount * BAND_COMPRESSION_PER_LAYER);
+
+    offLoArr[v] = RIBBON_SURFACE_OFFSET + stackBelow;
+    offHiArr[v] = offLoArr[v] + myThick;
+  }
+
+  return {offLo: offLoArr, offHi: offHiArr};
+}
+
+// ══════.?Band add/remove ══════.?
+// Precompute 64 angle-bin rest radii + preScale for radius-based constraint
+function getExactCrossSectionPolyline(posArr,idxArr,origin,normal){
+  const EPS=1e-7;const pts=[];
+  for(let t=0;t<idxArr.length;t+=3){
+    const ai=idxArr[t]*3,bi=idxArr[t+1]*3,ci=idxArr[t+2]*3;
+    const ax=posArr[ai],ay=posArr[ai+1],az=posArr[ai+2];
+    const bx=posArr[bi],by=posArr[bi+1],bz=posArr[bi+2];
+    const cx=posArr[ci],cy=posArr[ci+1],cz=posArr[ci+2];
+    const dA=(ax-origin[0])*normal[0]+(ay-origin[1])*normal[1]+(az-origin[2])*normal[2];
+    const dB=(bx-origin[0])*normal[0]+(by-origin[1])*normal[1]+(bz-origin[2])*normal[2];
+    const dC=(cx-origin[0])*normal[0]+(cy-origin[1])*normal[1]+(cz-origin[2])*normal[2];
+    const sA=dA>EPS?1:(dA<-EPS?-1:0),sB=dB>EPS?1:(dB<-EPS?-1:0),sC=dC>EPS?1:(dC<-EPS?-1:0);
+    if(sA===sB&&sB===sC&&sA!==0)continue;
+    if(sA===0)pts.push([ax,ay,az]);if(sB===0)pts.push([bx,by,bz]);if(sC===0)pts.push([cx,cy,cz]);
+    const edges=[{a:[ax,ay,az],b:[bx,by,bz],da:dA,db:dB},{a:[bx,by,bz],b:[cx,cy,cz],da:dB,db:dC},{a:[cx,cy,cz],b:[ax,ay,az],da:dC,db:dA}];
+    for(const e of edges){if((e.da>EPS&&e.db<-EPS)||(e.da<-EPS&&e.db>EPS)){const t=e.da/(e.da-e.db);pts.push([e.a[0]+t*(e.b[0]-e.a[0]),e.a[1]+t*(e.b[1]-e.a[1]),e.a[2]+t*(e.b[2]-e.a[2])]);}}
+  }
+  if(pts.length<3)return{points3D:[],centroid:origin.slice(),perimeter:0};
+  let cx=0,cy=0,cz=0;for(const p of pts){cx+=p[0];cy+=p[1];cz+=p[2];}cx/=pts.length;cy/=pts.length;cz/=pts.length;
+  let ux,uy,uz;if(Math.abs(normal[0])<0.9){ux=1;uy=0;uz=0;}else{ux=0;uy=0;uz=1;}
+  {const dot=ux*normal[0]+uy*normal[1]+uz*normal[2];ux-=dot*normal[0];uy-=dot*normal[1];uz-=dot*normal[2];}
+  {const ul=Math.sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;}
+  const vx=normal[1]*uz-normal[2]*uy,vy=normal[2]*ux-normal[0]*uz,vz=normal[0]*uy-normal[1]*ux;
+  const polar=[];for(const p of pts){const rx=p[0]-cx,ry=p[1]-cy,rz=p[2]-cz;polar.push({ang:Math.atan2(rx*vx+ry*vy+rz*vz,rx*ux+ry*uy+rz*uz),p});}
+  polar.sort((a,b)=>a.ang-b.ang);
+  const pts3D=[];const DEDUP=1e-6;
+  for(const{ang,p}of polar){if(pts3D.length>=3){const l=pts3D.length-3;if(Math.hypot(p[0]-pts3D[l],p[1]-pts3D[l+1],p[2]-pts3D[l+2])<DEDUP)continue;}pts3D.push(p[0],p[1],p[2]);}
+  let perim=0;for(let i=0;i<pts3D.length/3;i++){const i3=i*3,j3=((i+1)%(pts3D.length/3))*3;perim+=Math.hypot(pts3D[j3]-pts3D[i3],pts3D[j3+1]-pts3D[i3+1],pts3D[j3+2]-pts3D[i3+2]);}
+  return{points3D:pts3D,centroid:[cx,cy,cz],perimeter:perim};
+}
+function computeBandRestRadii(origin,normal,restPos,restIdx){
+  const exact=getExactCrossSectionPolyline(restPos,restIdx,origin,normal);
+  if(exact.points3D.length<9)return null;
+  const cx=exact.centroid[0],cy=exact.centroid[1],cz=exact.centroid[2];
+  // Build 2D basis on plane (same as WGSL shader)
+  var ux,uy,uz;
+  if(Math.abs(normal[0])<0.9){ux=1;uy=0;uz=0;}else{ux=0;uy=0;uz=1;}
+  const du=ux*normal[0]+uy*normal[1]+uz*normal[2];ux-=du*normal[0];uy-=du*normal[1];uz-=du*normal[2];
+  const ul=Math.sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;
+  const vx=normal[1]*uz-normal[2]*uy,vy=normal[2]*ux-normal[0]*uz,vz=normal[0]*uy-normal[1]*ux;
+  // Bin 64 angles, accumulate radius per bin
+  const radii=new Float32Array(64);
+  const counts=new Uint32Array(64);
+  for(let i=0;i<exact.points3D.length;i+=3){
+    const px=exact.points3D[i],py=exact.points3D[i+1],pz=exact.points3D[i+2];
+    const dx=px-cx,dy=py-cy,dz=pz-cz;
+    const ru=dx*ux+dy*uy+dz*uz,rv=dx*vx+dy*vy+dz*vz;
+    const ang=Math.atan2(rv,ru);
+    const binIdx=Math.floor((ang+Math.PI)/(2*Math.PI)*64)%64;
+    const r=Math.sqrt(dx*dx+dy*dy+dz*dz);
+    radii[binIdx]+=r;counts[binIdx]++;
+  }
+  // Average and fill empty bins from neighbors
+  for(let i=0;i<64;i++){
+    if(counts[i]>0){radii[i]/=counts[i];}
+  }
+  for(let i=0;i<64;i++){
+    if(counts[i]===0){
+      for(let d=1;d<32;d++){
+        const j=(i+d)%64;if(counts[j]>0){radii[i]=radii[j];break;}
+        const k=(i-d+64)%64;if(counts[k]>0){radii[i]=radii[k];break;}
+      }
+    }
+  }
+  // Compute rest perimeter from chord lengths
+  let perim=0;
+  for(let i=0;i<64;i++){
+    const j=(i+1)%64;
+    const da=2*Math.PI/64;
+    const r1=radii[i],r2=radii[j];
+    perim+=Math.sqrt(r1*r1+r2*r2-2*r1*r2*Math.cos(da));
+  }
+  const preScale=exact.perimeter>0?BAND_REST_CIRCUM/exact.perimeter:1.0;
+  console.log('📏 band precompute: exactPerimeter='+exact.perimeter.toFixed(3)+' binPerim='+perim.toFixed(3)+' L₀='+BAND_REST_CIRCUM.toFixed(3)+' preScale='+preScale.toFixed(4)+' radii range=['+Math.min(...radii).toFixed(3)+','+Math.max(...radii).toFixed(3)+']');
+  return{radii,centroid:[cx,cy,cz],preScale,restPerimeter:exact.perimeter};
+}
+
+// Write precomputed rest radii for one band to GPU
+function writeBandRestRadii(bIdx,radii){
+  if(!bandRestRadiiB||!radii)return;
+  queue.writeBuffer(bandRestRadiiB,bIdx*64*4,radii);
+}
+
+// ── Line helpers (for green target line) ──
+function makeBandLine(color,opacity){
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(2048*3),3));
+  geo.setDrawRange(0,0);
+  const mat=new THREE.LineBasicMaterial({color,transparent:true,opacity,depthTest:false,depthWrite:false});
+  const line=new THREE.Line(geo,mat);
+  line.renderOrder=2;line.frustumCulled=false;line.visible=false;
+  pineappleGroup.add(line);return line;
+}
+function updateBandLine(line,points3D){
+  const nPts=points3D.length/3;
+  if(nPts===0){line.visible=false;return;}
+  line.visible=true;
+  const posAttr=line.geometry.attributes.position;
+  if((nPts+1)*3>posAttr.array.length)return;
+  posAttr.array.set(points3D);
+  posAttr.array[nPts*3]=points3D[0];posAttr.array[nPts*3+1]=points3D[1];posAttr.array[nPts*3+2]=points3D[2];
+  posAttr.needsUpdate=true;
+  line.geometry.setDrawRange(0,nPts+1);
+}
+
+// ══════.? Circular Band (Tube) Parameters ══════.?
+const MAX_CIRC_BANDS = 256;
+const circularBands = [];
+const circBandVisuals = [];
+let TUBE_RADIUS = 0.011;
+let TUBE_RADIAL_SEGS = 6;
+let TUBE_RING_SEGS = 192;
+const CIRC_BINS = 64 * MAX_CIRC_BANDS; // 每根64角度bin × 256根
+let circVisDirty = false;
+let _circGreenB=null;            // green target line staging
+let showTargetLine=false;         // toggle for green reference circle
+let ANIM_BUFF = 100.0;             // stiffness buff multiplier during bind animation
+let ANIM_DURATION = 0.4;         // bind animation duration in seconds
+
+// ══════ 💥 Explosion System ══════
+let boomState = 'idle';           // 'idle' | 'booming' | 'done'
+let boomTime = 0;
+let boomTriggerBandCount = 5;    // trigger when band count reaches this
+let boomDebrisMesh = null;        // THREE.InstancedMesh
+let boomDebrisData = [];          // [{pos,vel,rot,angVel,scale,life,maxLife}]
+let boomJuiceMesh = null;         // THREE.InstancedMesh
+let boomJuiceData = [];
+let boomHeroChunks = [];          // individual meshes
+let boomCamShake = { active: false, intensity: 0, duration: 0, time: 0 };
+const BOOM_DURATION = 2.5;
+let BOOM_DEBRIS_COUNT = 100;
+let BOOM_JUICE_COUNT = 60;
+let BOOM_HERO_COUNT = 8;
+const BOOM_FORCE = 12;
+const BOOM_GRAVITY = 6;
+let _boomLastSrc = null;
+let _boomK = BOOM_HERO_COUNT;     // active GPU chunk count
+
+$('sl_tr').oninput=e=>{
+  TUBE_RADIUS=+e.target.value;$('sv_tr').textContent=TUBE_RADIUS.toFixed(3);
+  for(const b of circularBands)b.tubeRadius=TUBE_RADIUS;
+  circVisDirty=true;
+};
+$('sl_rs').oninput=e=>{
+  TUBE_RADIAL_SEGS=+e.target.value|0;$('sv_rs').textContent=TUBE_RADIAL_SEGS;
+  circVisDirty=true;
+};
+
+// ══════.?Circular Band (Tube) add/remove ══════.?
+// ══════⚡ Quick-bind helper ══════
+// Box-Muller: generate normally-distributed random number
+function randomNormal(mean, std) {
+  let u1, u2;
+  do { u1 = Math.random(); } while (u1 === 0); // avoid log(0)
+  u2 = Math.random();
+  const z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+  return mean + z * std;
+}
+
+function quickBindBand() {
+  if (!loaded || boomState !== 'idle') return;
+  const centerY = BAND_Y_CENTER;
+  // Clamp Y within model bounds
+  const minY = modelMinY + 0.05;
+  const maxY = modelMaxY - 0.05;
+  let y;
+  for (let tries = 0; tries < 50; tries++) {
+    y = randomNormal(centerY, BAND_Y_SPREAD);
+    if (y >= minY && y <= maxY) break;
+    if (tries === 49) y = Math.max(minY, Math.min(maxY, y)); // fallback clamp
+  }
+  const origin = [modelCentroid[0], y, modelCentroid[2]];
+  addCircularBand(origin, [0, 1, 0]);
+}
+
+// ══════.?Circular Band (Tube) add/remove ══════.?
+function addCircularBand(origin, normal){
+  if(boomState!=='idle')return;
+  if(circularBands.length>=MAX_CIRC_BANDS){console.warn('max circular bands');return;}
+  const nl=Math.sqrt(normal[0]**2+normal[1]**2+normal[2]**2);
+  const nn=[normal[0]/nl,normal[1]/nl,normal[2]/nl];
+  const pre=computeBandRestRadii(origin,nn,proxyRestPositions,proxyIdxArr);
+  if(!pre){console.warn('cross-section too small');return;}
+  const band={
+    planeOrigin:[...origin],
+    planeNormal:[...nn],
+    tubeRadius:TUBE_RADIUS,
+    restCircum:BAND_REST_CIRCUM,
+    stiffness:BAND_STIFF,
+    influRadius:BAND_INFLU,
+    preScale:pre.preScale,
+    restRadii:pre.radii,
+    restCentroid:pre.centroid,
+    restPerimeter:pre.restPerimeter,
+    animProgress: 0,
+    animDuration: ANIM_DURATION,
+    buffStiffness: ANIM_BUFF,
+    baseStiffness: BAND_STIFF,
+  };
+  circularBands.push(band);
+  const visTarget=makeBandLine('#33ff33',0.35);
+  visTarget.visible=showTargetLine;
+  circBandVisuals.push({lineTarget:visTarget});
+  writeBandRestRadii(circularBands.length-1,pre.radii);
+  circVisDirty=true;markPbdDirty();visUpdateCounter=0;
+  H.bcount.textContent=circularBands.length;
+  updateLastBandPanel(circularBands.length-1);
+}
+
+// Update per-band stiffness animations (deep-bite then ease-out)
+function updateBandStiffnessAnimations(dt) {
+  let anyAnimating = false;
+  for (const band of circularBands) {
+    if (band.animProgress < 1) {
+      band.animProgress = Math.min(1, band.animProgress + dt / band.animDuration);
+      const t = band.animProgress;
+      // easeOutCubic: 1 - (1-t)³
+      const ease = 1 - (1 - t) * (1 - t) * (1 - t);
+      // effective = base * (1 + buff * (1 - ease)) — starts high, decays to base
+      band.stiffness = band.baseStiffness * (1 + band.buffStiffness * (1 - ease));
+      anyAnimating = true;
+    }
+  }
+  return anyAnimating;
+}
+
+function removeCircularBand(){
+  if(circularBands.length===0)return;
+  circularBands.pop();
+  const vis=circBandVisuals.pop();
+  if(vis&&vis.lineTarget){vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();pineappleGroup.remove(vis.lineTarget);}
+  needsRestore=true;markPbdDirty();circVisDirty=true;
+  H.bcount.textContent=circularBands.length;
+  if(circularBands.length>0)updateLastBandPanel(circularBands.length-1);
+  else{$('lb_info').textContent='(none)';}
+  if(circularBands.length===0&&_circSharedMesh){
+    _circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;
+  }
+}
+function removeAllCircularBands(){
+  while(circularBands.length>0){
+    circularBands.pop();
+    const vis=circBandVisuals.pop();
+    if(vis&&vis.lineTarget){vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();pineappleGroup.remove(vis.lineTarget);}
+  }
+  needsRestore=true;markPbdDirty();circVisDirty=true;
+  H.bcount.textContent=0;
+  if(_circSharedMesh){_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}
+}
+
+// ══════.?Last band panel ══════.?
+function updateLastBandPanel(idx){
+  if(idx<0||idx>=circularBands.length){$('lb_info').textContent='(none)';return;}
+  const b=circularBands[idx];
+  $('lb_info').textContent='#'+(idx+1);
+  $('sl_lr').value=b.restCircum;$('sv_lr').textContent=b.restCircum.toFixed(3);
+  $('sl_nx').value=b.planeNormal[0];$('sv_nx').textContent=b.planeNormal[0].toFixed(2);
+  $('sl_ny').value=b.planeNormal[1];$('sv_ny').textContent=b.planeNormal[1].toFixed(2);
+  $('sl_nz').value=b.planeNormal[2];$('sv_nz').textContent=b.planeNormal[2].toFixed(2);
+  $('sl_bk').value=b.baseStiffness;$('sv_bk').textContent=b.baseStiffness.toFixed(3);
+}
+$('sl_lr').oninput=()=>{
+  const v=+$('sl_lr').value;$('sv_lr').textContent=v.toFixed(3);
+  if(circularBands.length>0){
+    const b=circularBands[circularBands.length-1];
+    b.restCircum=v;
+    if(b.restPerimeter>0)b.preScale=v/b.restPerimeter;
+    markPbdDirty();
+  }
+};
+$('sl_nx').oninput=()=>{$('sv_nx').textContent=(+$('sl_nx').value).toFixed(2);applyLastNormal();};
+$('sl_ny').oninput=()=>{$('sv_ny').textContent=(+$('sl_ny').value).toFixed(2);applyLastNormal();};
+$('sl_nz').oninput=()=>{$('sv_nz').textContent=(+$('sl_nz').value).toFixed(2);applyLastNormal();};
+$('sl_bk').oninput=()=>{
+  const v=+$('sl_bk').value;$('sv_bk').textContent=v.toFixed(3);
+  if(circularBands.length>0){
+    const b=circularBands[circularBands.length-1];
+    b.baseStiffness=v;
+    if(b.animProgress>=1)b.stiffness=v;
+    markPbdDirty();
+  }
+};
+function applyLastNormal(){
+  if(circularBands.length===0)return;
+  const nx=+$('sl_nx').value,ny=+$('sl_ny').value,nz=+$('sl_nz').value;
+  const nl=Math.sqrt(nx*nx+ny*ny+nz*nz);
+  if(nl<1e-6)return;
+  circularBands[circularBands.length-1].planeNormal=[nx/nl,ny/nl,nz/nl];
+  markPbdDirty();
+}
+
+
+// ══════.?Model Loading (dual: proxy + high-res) ══════.?
+let loaded=false;
+
+async function loadModel(name, doProcess, refTransform=null){
+  const loader=new GLTFLoader();
+  const gltf=await new Promise((res,rej)=>loader.load(name,res,undefined,rej));
+  let srcMesh=null;gltf.scene.traverse(c=>{if(c.isMesh&&!srcMesh)srcMesh=c;});
+  if(!srcMesh)throw new Error('No mesh in '+name);
+  const srcGeo=srcMesh.geometry;
+  srcGeo.computeBoundingBox();
+  const cen=new THREE.Vector3();srcGeo.boundingBox.getCenter(cen);
+  const siz=new THREE.Vector3();srcGeo.boundingBox.getSize(siz);
+  const sc=refTransform?refTransform.sc:(3.0/siz.y);
+  const offX=refTransform?refTransform.cen.x:cen.x;
+  const offY=refTransform?refTransform.cen.y:cen.y;
+  const offZ=refTransform?refTransform.cen.z:cen.z;
+  const pa=srcGeo.attributes.position.array;
+  const vc=srcGeo.attributes.position.count;
+  const pos=new Float32Array(vc*3);
+  for(let i=0;i<vc;i++){pos[i*3]=(pa[i*3]-offX)*sc;pos[i*3+1]=(pa[i*3+1]-offY)*sc;pos[i*3+2]=(pa[i*3+2]-offZ)*sc;}
+  const idxArr=srcGeo.index?new Uint32Array(srcGeo.index.array):(()=>{const a=new Uint32Array(vc);for(let i=0;i<vc;i++)a[i]=i;return a;})();
+  // Extract original normals from GLB (uniform scaling preserves direction)
+  let origNormals=null;
+  if(srcGeo.attributes.normal){
+    const na=srcGeo.attributes.normal.array;
+    origNormals=new Float32Array(vc*3);
+    for(let i=0;i<vc;i++){
+      origNormals[i*3]=na[i*3];origNormals[i*3+1]=na[i*3+1];origNormals[i*3+2]=na[i*3+2];
+    }
+  }
+  return{pos,idxArr,srcGeo,srcMesh,transform:{cen:{x:offX,y:offY,z:offZ},sc},origNormals};
+}
+
+async function loadModels(){
+  // Load proxy (small mesh for PBD)
+  const proxyResult=await loadModel('pineapple_py.glb', true);
+  // Load high-res (display mesh) .?use proxy's transform for alignment
+  const hr=await loadModel('pineapple.glb', false, proxyResult.transform);
+  const srcGeo=hr.srcGeo;const hrPos=hr.pos;const hrIdx=hr.idxArr;
+  const srcMesh=hr.srcMesh;
+
+  // ── Proxy setup ──
+  proxyVertexCount=proxyResult.pos.length/3;
+  proxyTriCount=proxyResult.idxArr.length/3;
+  proxyRestPositions=new Float32Array(proxyResult.pos);
+  proxyCurPositions=new Float32Array(proxyResult.pos);
+  proxyIdxArr=proxyResult.idxArr;
+
+  // 🌊 计算模型质心（呼吸动画用）
+  { let cx=0,cy=0,cz=0;
+    for(let i=0;i<proxyVertexCount;i++){const i3=i*3;cx+=proxyRestPositions[i3];cy+=proxyRestPositions[i3+1];cz+=proxyRestPositions[i3+2];}
+    cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+    modelCentroid=[cx,cy,cz];
+    console.log('📍 模型质心: ('+cx.toFixed(3)+','+cy.toFixed(3)+','+cz.toFixed(3)+')');
+  }
+
+  // Compute proxy rest normals (gradient directions for volume constraint)
+  const pvc=proxyVertexCount;
+  proxyRestNormals=new Float32Array(pvc*3);
+  {
+    const grad=new Float32Array(pvc*3);
+    for(let i=0;i<proxyIdxArr.length;i+=3){
+      const ai=proxyIdxArr[i]*3,bi=proxyIdxArr[i+1]*3,ci=proxyIdxArr[i+2]*3;
+      const ax=proxyRestPositions[ai],ay=proxyRestPositions[ai+1],az=proxyRestPositions[ai+2];
+      const bx=proxyRestPositions[bi],by=proxyRestPositions[bi+1],bz=proxyRestPositions[bi+2];
+      const cx=proxyRestPositions[ci],cy=proxyRestPositions[ci+1],cz=proxyRestPositions[ci+2];
+      grad[ai]+=(by*cz-bz*cy)/6;grad[ai+1]+=(bz*cx-bx*cz)/6;grad[ai+2]+=(bx*cy-by*cx)/6;
+      grad[bi]+=(cy*az-cz*ay)/6;grad[bi+1]+=(cz*ax-cx*az)/6;grad[bi+2]+=(cx*ay-cy*ax)/6;
+      grad[ci]+=(ay*bz-az*by)/6;grad[ci+1]+=(az*bx-ax*bz)/6;grad[ci+2]+=(ax*by-ay*bx)/6;
+    }
+    for(let i=0;i<pvc;i++){
+      const i3=i*3;
+      let gx=grad[i3],gy=grad[i3+1],gz=grad[i3+2];
+      const px=proxyRestPositions[i3],py=proxyRestPositions[i3+1],pz=proxyRestPositions[i3+2];
+      if(px*gx+py*gy+pz*gz<0){gx=-gx;gy=-gy;gz=-gz;}
+      const gm=Math.sqrt(gx*gx+gy*gy+gz*gz);
+      if(gm>1e-9){proxyRestNormals[i3]=gx/gm;proxyRestNormals[i3+1]=gy/gm;proxyRestNormals[i3+2]=gz/gm;}
+    }
+  }
+
+  // Compute proxy rest volume + surface area
+  restVolume=0;restSurfaceArea=0;
+  for(let t=0;t<proxyIdxArr.length;t+=3){
+    const ai=proxyIdxArr[t]*3,bi=proxyIdxArr[t+1]*3,ci=proxyIdxArr[t+2]*3;
+    const ax=proxyRestPositions[ai],ay=proxyRestPositions[ai+1],az=proxyRestPositions[ai+2];
+    const bx=proxyRestPositions[bi],by=proxyRestPositions[bi+1],bz=proxyRestPositions[bi+2];
+    const cx=proxyRestPositions[ci],cy=proxyRestPositions[ci+1],cz=proxyRestPositions[ci+2];
+    restVolume+=(ax*(by*cz-bz*cy)+ay*(bz*cx-bx*cz)+az*(bx*cy-by*cx))/6;
+    const abx=bx-ax,aby=by-ay,abz=bz-az,acx=cx-ax,acy=cy-ay,acz=cz-az;
+    restSurfaceArea+=0.5*Math.sqrt((aby*acz-abz*acy)**2+(abz*acx-abx*acz)**2+(abx*acy-aby*acx)**2);
+  }
+  restVolume=Math.abs(restVolume);
+  lastVol=restVolume;
+  H.vcount.textContent=proxyVertexCount.toLocaleString();
+  H.vratio.textContent='100.0';
+  console.log('Proxy model:',proxyVertexCount.toLocaleString(),'verts,',Math.round(proxyTriCount).toLocaleString(),'tris');
+  console.log('   restVolume:',restVolume.toFixed(4),'restSurfaceArea:',restSurfaceArea.toFixed(2));
+
+  // ── High-res setup ──
+  highResCount=hrPos.length/3;
+  highResRestPositions=new Float32Array(hrPos);
+  highResIdxArr=hrIdx;
+  highResRestNormals=hr.origNormals;
+  H.hcount.textContent=highResCount.toLocaleString();
+
+  // Compute Y range for delta field (from proxy model)
+  modelMinY=Infinity;modelMaxY=-Infinity;
+  for(let i=0;i<proxyVertexCount;i++){const y=proxyRestPositions[i*3+1];if(y<modelMinY)modelMinY=y;if(y>modelMaxY)modelMaxY=y;}
+  if(!isFinite(modelMinY)){modelMinY=-1.5;modelMaxY=1.5;}
+  console.log('📏 代理Y范围:',modelMinY.toFixed(3),'~',modelMaxY.toFixed(3));
+  // 更新快绑滑块范围为模型实际Y范围
+  $('sl_yc').min = modelMinY; $('sl_yc').max = modelMaxY;
+
+  // Compute voxel grid bounds (3D bounding box, expanded 5%)
+  const vpad=0.05;
+  voxBMin=[Infinity,Infinity,Infinity];const vBMax=[-Infinity,-Infinity,-Infinity];
+  for(let i=0;i<proxyVertexCount;i++){for(let k=0;k<3;k++){const v=proxyRestPositions[i*3+k];if(v<voxBMin[k])voxBMin[k]=v;if(v>vBMax[k])vBMax[k]=v;}}
+  for(let k=0;k<3;k++){const r=vBMax[k]-voxBMin[k];voxBMin[k]-=r*vpad;vBMax[k]+=r*vpad;voxGS[k]=(vBMax[k]-voxBMin[k])/64;}
+  console.log('📦 体素网格: bmin=('+voxBMin.map(v=>v.toFixed(2)).join(',')+') gs=('+voxGS.map(v=>v.toFixed(3)).join(',')+')');
+
+  // ── CPU nearest-proxy with spatial hash ──
+  nearestProxyIdx=new Uint32Array(highResCount);
+  const tHash=performance.now();
+  // Build 3D spatial hash grid for proxy vertices .?make global for fast projection
+  _hashGrid=24;
+  _hashBmin=[Infinity,Infinity,Infinity];const _hbmax=[-Infinity,-Infinity,-Infinity];
+  for(let i=0;i<proxyVertexCount;i++){
+    for(let k=0;k<3;k++){const v=proxyRestPositions[i*3+k];if(v<_hashBmin[k])_hashBmin[k]=v;if(v>_hbmax[k])_hbmax[k]=v;}
+  }
+  _hashGs=[(_hbmax[0]-_hashBmin[0])/_hashGrid+1e-6,(_hbmax[1]-_hashBmin[1])/_hashGrid+1e-6,(_hbmax[2]-_hashBmin[2])/_hashGrid+1e-6];
+  _hashCells=Array.from({length:_hashGrid*_hashGrid*_hashGrid},()=>[]);
+  for(let i=0;i<proxyVertexCount;i++){
+    const ix=Math.min(_hashGrid-1,Math.floor((proxyRestPositions[i*3]-_hashBmin[0])/_hashGs[0]));
+    const iy=Math.min(_hashGrid-1,Math.floor((proxyRestPositions[i*3+1]-_hashBmin[1])/_hashGs[1]));
+    const iz=Math.min(_hashGrid-1,Math.floor((proxyRestPositions[i*3+2]-_hashBmin[2])/_hashGs[2]));
+    _hashCells[(ix*_hashGrid+iy)*_hashGrid+iz].push(i);
+  }
+  // Build vertex→triangle adjacency
+  _vertTris=Array.from({length:proxyVertexCount},()=>[]);
+  for(let t=0;t<proxyIdxArr.length;t+=3){
+    _vertTris[proxyIdxArr[t]].push(t/3);
+    _vertTris[proxyIdxArr[t+1]].push(t/3);
+    _vertTris[proxyIdxArr[t+2]].push(t/3);
+  }
+  // For each high-res vertex, search 27 neighboring cells
+  let fallbackCount=0;
+  for(let i=0;i<highResCount;i++){
+    const hx=highResRestPositions[i*3],hy=highResRestPositions[i*3+1],hz=highResRestPositions[i*3+2];
+    const ix=Math.min(_hashGrid-1,Math.max(0,Math.floor((hx-_hashBmin[0])/_hashGs[0])));
+    const iy=Math.min(_hashGrid-1,Math.max(0,Math.floor((hy-_hashBmin[1])/_hashGs[1])));
+    const iz=Math.min(_hashGrid-1,Math.max(0,Math.floor((hz-_hashBmin[2])/_hashGs[2])));
+    let bestD=Infinity,bestJ=0;
+    for(let radius=1;radius<=_hashGrid&&bestD===Infinity;radius++){
+      for(let dx=-radius;dx<=radius;dx++){for(let dy=-radius;dy<=radius;dy++){for(let dz=-radius;dz<=radius;dz++){
+        if(Math.abs(dx)<radius&&Math.abs(dy)<radius&&Math.abs(dz)<radius)continue;
+        const cx=ix+dx,cy=iy+dy,cz=iz+dz;
+        if(cx<0||cx>=_hashGrid||cy<0||cy>=_hashGrid||cz<0||cz>=_hashGrid)continue;
+        for(const j of _hashCells[(cx*_hashGrid+cy)*_hashGrid+cz]){
+          const px=proxyRestPositions[j*3],py=proxyRestPositions[j*3+1],pz=proxyRestPositions[j*3+2];
+          const d=(hx-px)**2+(hy-py)**2+(hz-pz)**2;
+          if(d<bestD){bestD=d;bestJ=j;}
+        }
+      }}}
+      if(radius>1&&bestD<Infinity)fallbackCount++;
+    }
+    nearestProxyIdx[i]=bestJ;
+  }
+  console.log('🔗 CPU最近邻映射:',(performance.now()-tHash).toFixed(0),'ms (grid',_hashGrid+'³, fallback:',fallbackCount+'/'+highResCount+')');
+
+  // Create Three.js high-res mesh
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(hrPos),3));
+  geo.setAttribute('normal',new THREE.Float32BufferAttribute(new Float32Array(highResRestNormals),3));
+  if(srcGeo.attributes.uv)geo.setAttribute('uv',srcGeo.attributes.uv.clone());
+  geo.setIndex(new THREE.BufferAttribute(hrIdx,1));
+  const mat=srcMesh.material||new THREE.MeshStandardMaterial({color:'#cc9944',roughness:0.6,metalness:0.0});
+  pineappleMesh=new THREE.Mesh(geo,mat);
+  pineappleGroup.add(pineappleMesh);
+
+  // Proxy wireframe overlay
+  const edgeMap=new Map();
+  for(let t=0;t<proxyIdxArr.length;t+=3){
+    for(let e=0;e<3;e++){
+      const a=proxyIdxArr[t+e],b=proxyIdxArr[t+(e+1)%3];
+      const key=Math.min(a,b)*proxyVertexCount+Math.max(a,b);
+      if(!edgeMap.has(key))edgeMap.set(key,[a,b]);
+    }
+  }
+  const edgeIdx=new Uint32Array(edgeMap.size*2);let ei=0;
+  for(const[a,b]of edgeMap.values()){edgeIdx[ei++]=a;edgeIdx[ei++]=b;}
+  const wireGeo=new THREE.BufferGeometry();
+  wireGeo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(proxyRestPositions),3));
+  wireGeo.setIndex(new THREE.BufferAttribute(edgeIdx,1));
+  proxyWireMesh=new THREE.LineSegments(wireGeo,new THREE.LineBasicMaterial({color:'#ff44ff',transparent:true,opacity:0.7,depthTest:false,depthWrite:false}));
+  proxyWireMesh.visible=false;proxyWireMesh.renderOrder=999;
+  pineappleGroup.add(proxyWireMesh);
+
+  // ── TEST: offset vertices along direction to centroid ──
+  if(false){
+    // Mesh centroid
+    let cx=0,cy=0,cz=0;
+    for(let i=0;i<proxyVertexCount;i++){
+      const i3=i*3;
+      cx+=proxyRestPositions[i3];cy+=proxyRestPositions[i3+1];cz+=proxyRestPositions[i3+2];
+    }
+    cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+    const offset=0.30;
+    const enlargedPos=new Float32Array(proxyVertexCount*3);
+    for(let i=0;i<proxyVertexCount;i++){
+      const i3=i*3;
+      const px=proxyRestPositions[i3],py=proxyRestPositions[i3+1],pz=proxyRestPositions[i3+2];
+      let nx=px-cx,ny=py-cy,nz=pz-cz;
+      const nl=Math.sqrt(nx*nx+ny*ny+nz*nz)||1;
+      enlargedPos[i3]=px+nx/nl*offset;
+      enlargedPos[i3+1]=py+ny/nl*offset;
+      enlargedPos[i3+2]=pz+nz/nl*offset;
+    }
+    const bigWireGeo=new THREE.BufferGeometry();
+    bigWireGeo.setAttribute('position',new THREE.Float32BufferAttribute(enlargedPos,3));
+    bigWireGeo.setIndex(new THREE.BufferAttribute(edgeIdx,1));
+    bigWireGeo.computeBoundingSphere();
+    const bigWire=new THREE.LineSegments(bigWireGeo,new THREE.LineBasicMaterial({color:'#00ffff',transparent:true,opacity:0.8,depthTest:true,depthWrite:true}));
+    bigWire.renderOrder=998;
+    bigWire.name='enlargedProxyWire';
+    pineappleGroup.add(bigWire);
+    console.log('🔵 青色线框 = 每个顶点沿质心方向推0.3单位，centroid:('+cx.toFixed(2)+','+cy.toFixed(2)+','+cz.toFixed(2)+')');
+  }
+
+  // Toggle wire button
+  const btnWire=document.createElement('button');
+  btnWire.className='btn';btnWire.textContent='🔍 代理线框: OFF';
+  btnWire.onclick=()=>{showProxyWire=!showProxyWire;proxyWireMesh.visible=showProxyWire;btnWire.textContent='🔍 代理线框: '+(showProxyWire?'ON':'OFF');};
+  $('panel').appendChild(btnWire);
+
+  console.log('Hi-res:',highResCount.toLocaleString(),'顶点, 代理:',proxyVertexCount.toLocaleString(),'顶点');
+  // Diagnostic: check high-res rest normals (should be outward)
+  {let inCnt=0;for(let i=0;i<Math.min(highResCount,1000);i++){
+    const px=hrPos[i*3],py=hrPos[i*3+1],pz=hrPos[i*3+2];
+    const nx=highResRestNormals[i*3],ny=highResRestNormals[i*3+1],nz=highResRestNormals[i*3+2];
+    if(px*nx+py*ny+pz*nz<0)inCnt++;
+  }console.log('🔍 高模法线朝内比例:',(inCnt/Math.min(highResCount,1000)*100).toFixed(1),'% (应为0%)');}
+  console.log('Delta Y range:',modelMinY.toFixed(3),'~',modelMaxY.toFixed(3));
+
+  await initGPU();
+  loaded=true;
+}
+loadModels().catch(e=>console.error('加载失败:',e));
+
+// ══════.?Utility ══════.?
+function mkBuf(size,usage,label){return device.createBuffer({size,usage,label});}
+
+// ══════.?WGSL Compute Shaders ══════.?
+const shapeCS=device.createShaderModule({label:'shape',code:`
+struct P{stiffness:f32,vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let cur=src[i];let r=rest[i];let d=r.xyz-cur.xyz;
+  dst[i]=vec4(cur.xyz+d*p.stiffness,1.0);
+}
+`});
+
+const volAccCS=device.createShaderModule({label:'volAcc',code:`
+struct P{tc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>indices:array<u32>;
+@group(0)@binding(2)var<storage,read_write>volOut:array<f32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let t=gid.x;if(t>=p.tc){return;}
+  let i0=indices[t*3u];let i1=indices[t*3u+1u];let i2=indices[t*3u+2u];
+  let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
+  volOut[t]=(p0.x*(p1.y*p2.z-p1.z*p2.y)+p0.y*(p1.z*p2.x-p1.x*p2.z)+p0.z*(p1.x*p2.y-p1.y*p2.x))/6.0;
+}
+`});
+
+const volReduceCS=device.createShaderModule({label:'volReduce',code:`
+struct P{count:u32}
+@group(0)@binding(0)var<storage,read>src:array<f32>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+var<workgroup>sdata:array<f32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  sdata[lid.x]=select(0.0,src[gid.x],gid.x<p.count);workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sdata[lid.x]+=sdata[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){dst[wg.x]=sdata[0];}
+}
+`});
+
+const volApCS=device.createShaderModule({label:'volAp',code:`
+struct P{vc:u32,rest:f32,stiff:f32,surface:f32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>volTotal:array<f32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let cur=src[i];
+  let r=length(cur.xyz);
+  if(r<1e-6){dst[i]=cur;return;}
+  let curVol=abs(volTotal[0]);let deficit=p.rest-curVol;
+  let push=select(p.stiff*deficit/p.surface,0.0,abs(deficit)<1e-9);
+  let s=clamp((r+push)/r,0.7,1.3);
+  dst[i]=vec4(cur.x*s,cur.y*s,cur.z*s,1.0);
+}
+`});
+
+// ── 3D Voxel Delta Field ──
+// Voxel grid: 32³ cells, each stores accumulated displacement + weight (fixed-point u32)
+// WGSL constants VOX=32, FIXED_SCALE=1048576.0 are inlined in shader code below
+
+// Pass 1: scatter proxy displacement to 8 neighboring voxels via trilinear weights
+const voxelScatterCS=device.createShaderModule({label:'voxelScatter',code:`
+const FIXED_SCALE=1048576.0;
+struct P{vc:u32,grid:u32,bminX:f32,bminY:f32,bminZ:f32,gsX:f32,gsY:f32,gsZ:f32}
+@group(0)@binding(0)var<storage,read>cur:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read_write>voxDx:array<atomic<i32>>;
+@group(0)@binding(3)var<storage,read_write>voxDy:array<atomic<i32>>;
+@group(0)@binding(4)var<storage,read_write>voxDz:array<atomic<i32>>;
+@group(0)@binding(5)var<storage,read_write>voxW:array<atomic<u32>>;
+@group(0)@binding(6)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let disp=cur[i].xyz-rest[i].xyz;
+  let rp=rest[i].xyz;
+  // Voxel coordinate
+  let vx=(rp.x-p.bminX)/p.gsX-0.5;let vy=(rp.y-p.bminY)/p.gsY-0.5;let vz=(rp.z-p.bminZ)/p.gsZ-0.5;
+  let ix0=clamp(i32(floor(vx))-1,0,i32(p.grid)-4);let iy0=clamp(i32(floor(vy))-1,0,i32(p.grid)-4);let iz0=clamp(i32(floor(vz))-1,0,i32(p.grid)-4);
+  let fx=vx-f32(ix0+1);let fy=vy-f32(iy0+1);let fz=vz-f32(iz0+1);
+  let g=p.grid;
+  // Quadratic B-spline kernel (4 points per dim, C1 continuous, 64 total)
+  for(var dx=0u;dx<4u;dx++){for(var dy=0u;dy<4u;dy++){for(var dz=0u;dz<4u;dz++){
+    // Quadratic B-spline basis: b(-1)=0.5*(0.5-f)², b(0)=0.75-f², b(1)=0.75-(1-f)², b(2)=0.5*(f-0.5)²
+    var wx=0.0;
+    if(dx==0u){wx=select(0.5*(0.5-fx)*(0.5-fx),0.0,fx<0.5);}
+    else if(dx==1u){wx=select(0.75-fx*fx,0.5*(1.5-fx)*(1.5-fx),fx<0.5);}
+    else if(dx==2u){wx=select(0.5*(0.5+fx)*(0.5+fx),0.75-(1.0-fx)*(1.0-fx),fx<0.5);}
+    else{wx=select(0.5*(fx-0.5)*(fx-0.5),0.0,fx>=0.5);}
+    var wy=0.0;
+    if(dy==0u){wy=select(0.5*(0.5-fy)*(0.5-fy),0.0,fy<0.5);}
+    else if(dy==1u){wy=select(0.75-fy*fy,0.5*(1.5-fy)*(1.5-fy),fy<0.5);}
+    else if(dy==2u){wy=select(0.5*(0.5+fy)*(0.5+fy),0.75-(1.0-fy)*(1.0-fy),fy<0.5);}
+    else{wy=select(0.5*(fy-0.5)*(fy-0.5),0.0,fy>=0.5);}
+    var wz=0.0;
+    if(dz==0u){wz=select(0.5*(0.5-fz)*(0.5-fz),0.0,fz<0.5);}
+    else if(dz==1u){wz=select(0.75-fz*fz,0.5*(1.5-fz)*(1.5-fz),fz<0.5);}
+    else if(dz==2u){wz=select(0.5*(0.5+fz)*(0.5+fz),0.75-(1.0-fz)*(1.0-fz),fz<0.5);}
+    else{wz=select(0.5*(fz-0.5)*(fz-0.5),0.0,fz>=0.5);}
+    let w=wx*wy*wz;if(w<0.0001){continue;}
+    let ix=u32(ix0)+dx;let iy=u32(iy0)+dy;let iz=u32(iz0)+dz;
+    let vi=(ix*g+iy)*g+iz;
+    let ws=u32(w*FIXED_SCALE);
+    atomicAdd(&voxDx[vi],i32(disp.x*FIXED_SCALE*w));
+    atomicAdd(&voxDy[vi],i32(disp.y*FIXED_SCALE*w));
+    atomicAdd(&voxDz[vi],i32(disp.z*FIXED_SCALE*w));
+    atomicAdd(&voxW[vi],ws);
+  }}}
+}
+`});
+
+// Pass 2: normalize voxel grid (divide accumulated displacement by weight)
+const voxelNormCS=device.createShaderModule({label:'voxelNorm',code:`
+const FIXED_SCALE=1048576.0;
+struct P{grid:u32}
+@group(0)@binding(0)var<storage,read>voxDx:array<i32>;
+@group(0)@binding(1)var<storage,read>voxDy:array<i32>;
+@group(0)@binding(2)var<storage,read>voxDz:array<i32>;
+@group(0)@binding(3)var<storage,read>voxW:array<u32>;
+@group(0)@binding(4)var<storage,read_write>voxOut:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;let total=p.grid*p.grid*p.grid;if(i>=total){return;}
+  let w=f32(voxW[i])/FIXED_SCALE;
+  if(w>0.001){
+    voxOut[i]=vec4(f32(voxDx[i])/FIXED_SCALE/w,f32(voxDy[i])/FIXED_SCALE/w,f32(voxDz[i])/FIXED_SCALE/w,1.0);
+  }else{
+    voxOut[i]=vec4(0.0,0.0,0.0,0.0);
+  }
+}
+`});
+
+// Pass 3: apply voxel displacement to high-res mesh via trilinear interpolation
+const voxelApplyCS=device.createShaderModule({label:'voxelApply',code:`
+struct P{vc:u32,grid:u32,bminX:f32,bminY:f32,bminZ:f32,gsX:f32,gsY:f32,gsZ:f32}
+@group(0)@binding(0)var<storage,read>restPos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>voxOut:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read_write>outPos:array<vec4<f32>>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let rp=restPos[i].xyz;
+  let vx=(rp.x-p.bminX)/p.gsX-0.5;let vy=(rp.y-p.bminY)/p.gsY-0.5;let vz=(rp.z-p.bminZ)/p.gsZ-0.5;
+  let ix0=clamp(i32(floor(vx)),0,i32(p.grid)-1);let iy0=clamp(i32(floor(vy)),0,i32(p.grid)-1);let iz0=clamp(i32(floor(vz)),0,i32(p.grid)-1);
+  let fx=vx-f32(ix0);let fy=vy-f32(iy0);let fz=vz-f32(iz0);
+  let g=p.grid;
+  var interpD=vec3(0.0);var totalW=0.0;
+  for(var dx=0u;dx<2u;dx++){for(var dy=0u;dy<2u;dy++){for(var dz=0u;dz<2u;dz++){
+    let wx=select(1.0-fx,fx,dx==1u);let wy=select(1.0-fy,fy,dy==1u);let wz=select(1.0-fz,fz,dz==1u);
+    let w=wx*wy*wz;if(w<0.001){continue;}
+    let ix=u32(ix0)+dx;let iy=u32(iy0)+dy;let iz=u32(iz0)+dz;
+    if(ix>=g||iy>=g||iz>=g){continue;}
+    let vi=(ix*g+iy)*g+iz;
+    let vd=voxOut[vi];
+    if(vd.w>0.0){interpD+=vd.xyz*w;totalW+=w;}
+  }}}
+  let disp=select(vec3(0.0),interpD/totalW,totalW>0.001);
+  outPos[i]=vec4(rp+disp,1.0);
+}
+`});
+
+// 3D voxel smoothing: only fill empty voxels from neighbors, leave filled ones untouched
+const voxelSmoothCS=device.createShaderModule({label:'voxelSmooth',code:`
+struct P{grid:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;let g=p.grid;let total=g*g*g;if(i>=total){return;}
+  let sv=src[i];
+  if(sv.w>0.001){
+    // Filled voxel: preserve original displacement exactly
+    dst[i]=sv;
+  }else{
+    // Empty voxel: gather from 26 neighbors (distance-weighted)
+    let iz=i%g;let iy=(i/g)%g;let ix=i/(g*g);
+    var sumD=vec3(0.0);var sumW=0.0;
+    for(var dx=i32(-1);dx<=1;dx++){for(var dy=i32(-1);dy<=1;dy++){for(var dz=i32(-1);dz<=1;dz++){
+      if(dx==0&&dy==0&&dz==0){continue;}
+      let nx=i32(ix)+dx;let ny=i32(iy)+dy;let nz=i32(iz)+dz;
+      if(nx<0||nx>=i32(g)||ny<0||ny>=i32(g)||nz<0||nz>=i32(g)){continue;}
+      let nv=src[(u32(nx)*g+u32(ny))*g+u32(nz)];
+      if(nv.w>0.001){let w=1.0/(1.0+f32(abs(dx)+abs(dy)+abs(dz)));sumD+=nv.xyz*w;sumW+=w;}
+    }}}
+    dst[i]=select(vec4(0.0),vec4(sumD/sumW,1.0),sumW>0.001);
+  }
+}
+`});
+const nearestCS=device.createShaderModule({label:'nearest',code:`
+struct P{proxyCount:u32,hrCount:u32}
+@group(0)@binding(0)var<storage,read>proxyPos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>hrPos:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read_write>nearest:array<u32>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let hi=gid.x;if(hi>=p.hrCount){return;}
+  let hp=hrPos[hi].xyz;
+  var bestDist=1.0e30;var bestIdx=0u;
+  for(var pi=0u;pi<p.proxyCount;pi++){
+    let pp=proxyPos[pi].xyz;
+    let dx=hp.x-pp.x;let dy=hp.y-pp.y;let dz=hp.z-pp.z;
+    let d=dx*dx+dy*dy+dz*dz;
+    if(d<bestDist){bestDist=d;bestIdx=pi;}
+  }
+  nearest[hi]=bestIdx;
+}
+`});
+
+// ── Band constraint GPU shaders (merged: 1 dispatch per phase) ──
+// Phase A1: weighted centroid for ALL bands (bc workgroups, each handles one band)
+const bandReduceAllCS=device.createShaderModule({label:'bandReduceAll',code:`
+struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
+struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
+struct P{vc:u32,bc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>params:array<BandParam>;
+@group(0)@binding(2)var<storage,read_write>state:array<BandState>;
+@group(0)@binding(3)var<uniform>p:P;
+var<workgroup>sGx:array<f32,256>;var<workgroup>sGy:array<f32,256>;var<workgroup>sGz:array<f32,256>;
+var<workgroup>sW:array<f32,256>;
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
+  let param=params[b];
+  var myGx=0.0;var myGy=0.0;var myGz=0.0;var myW=0.0;var vi=lid.x;
+  while(vi<p.vc){
+    let P=pos[vi].xyz;
+    let signedD=(P.x-param.ox)*param.nx+(P.y-param.oy)*param.ny+(P.z-param.oz)*param.nz;
+    let absD=abs(signedD);
+    if(absD<param.influ_radius){
+      let t=absD/param.influ_radius;let w=1.0-t*t*(3.0-2.0*t);
+      let projX=P.x-signedD*param.nx;let projY=P.y-signedD*param.ny;let projZ=P.z-signedD*param.nz;
+      myGx+=w*projX;myGy+=w*projY;myGz+=w*projZ;myW+=w;
+    }
+    vi+=256u;
+  }
+  sGx[lid.x]=myGx;sGy[lid.x]=myGy;sGz[lid.x]=myGz;sW[lid.x]=myW;workgroupBarrier();
+  for(var s=128u;s>0u;s>>=1){if(lid.x<s){sGx[lid.x]+=sGx[lid.x+s];sGy[lid.x]+=sGy[lid.x+s];sGz[lid.x]+=sGz[lid.x+s];sW[lid.x]+=sW[lid.x+s];}workgroupBarrier();}
+  if(lid.x==0u){
+    let Gx=sGx[0]/max(sW[0],0.001);let Gy=sGy[0]/max(sW[0],0.001);let Gz=sGz[0]/max(sW[0],0.001);
+    state[b]=BandState(Gx,Gy,Gz,1.0);
+  }
+}
+`});
+
+// Phase A2: triangle-plane intersection for ALL bands (each triangle loops over all bands)
+const bandPerimAllCS=device.createShaderModule({label:'bandPerimAll',code:`
+struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32}
+struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
+struct P{triCount:u32,bc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read>params:array<BandParam>;
+@group(0)@binding(3)var<storage,read>state:array<BandState>;
+@group(0)@binding(4)var<storage,read_write>binR:array<atomic<u32>>;
+@group(0)@binding(5)var<storage,read_write>binC:array<atomic<u32>>;
+@group(0)@binding(6)var<uniform>p:P;
+
+fn addBinPoint(px:f32,py:f32,pz:f32,Gx:f32,Gy:f32,Gz:f32,ux:f32,uy:f32,uz:f32,vx:f32,vy:f32,vz:f32,b:u32){
+  let rx=px-Gx;let ry=py-Gy;let rz=pz-Gz;
+  let ru=rx*ux+ry*uy+rz*uz;let rv=rx*vx+ry*vy+rz*vz;
+  let ang=atan2(rv,ru);
+  let binIdx=u32(floor((ang+3.14159265)/6.28318531*64.0))%64u;
+  let dist=sqrt(ru*ru+rv*rv);
+  atomicAdd(&binR[b*64u+binIdx],u32(dist*1048576.0));
+  atomicAdd(&binC[b*64u+binIdx],1u);
+}
+
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let ti=gid.x;if(ti>=p.triCount){return;}
+  let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+  let v0=pos[i0].xyz;let v1=pos[i1].xyz;let v2=pos[i2].xyz;
+  for(var b=0u;b<256u;b++){
+    if(b>=p.bc){break;}
+    let param=params[b];let st=state[b];
+    let ox=param.ox;let oy=param.oy;let oz=param.oz;
+    let nx=param.nx;let ny=param.ny;let nz=param.nz;
+    let d0=(v0.x-ox)*nx+(v0.y-oy)*ny+(v0.z-oz)*nz;
+    let d1=(v1.x-ox)*nx+(v1.y-oy)*ny+(v1.z-oz)*nz;
+    let d2=(v2.x-ox)*nx+(v2.y-oy)*ny+(v2.z-oz)*nz;
+    let eps=1e-7;
+    let s0=select(0,select(1,-1,d0>eps),abs(d0)>eps);
+    let s1=select(0,select(1,-1,d1>eps),abs(d1)>eps);
+    let s2=select(0,select(1,-1,d2>eps),abs(d2)>eps);
+    if(s0==s1&&s1==s2&&s0!=0){continue;}
+    // Build 2D basis on plane
+    var ux:f32;var uy:f32;var uz:f32;
+    if(abs(nx)<0.9){ux=1.0;uy=0.0;uz=0.0;}else{ux=0.0;uy=0.0;uz=1.0;}
+    let du=ux*nx+uy*ny+uz*nz;ux-=du*nx;uy-=du*ny;uz-=du*nz;
+    let ul=sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;
+    let vx=ny*uz-nz*uy;let vy=nz*ux-nx*uz;let vz=nx*uy-ny*ux;
+    let Gx=st.gx;let Gy=st.gy;let Gz=st.gz;
+    // Edge 0-1
+    if((d0>eps&&d1<-eps)||(d0<-eps&&d1>eps)){
+      let t=d0/(d0-d1);
+      addBinPoint(v0.x+t*(v1.x-v0.x),v0.y+t*(v1.y-v0.y),v0.z+t*(v1.z-v0.z),Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);
+    }
+    // Edge 1-2
+    if((d1>eps&&d2<-eps)||(d1<-eps&&d2>eps)){
+      let t=d1/(d1-d2);
+      addBinPoint(v1.x+t*(v2.x-v1.x),v1.y+t*(v2.y-v1.y),v1.z+t*(v2.z-v1.z),Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);
+    }
+    // Edge 2-0
+    if((d2>eps&&d0<-eps)||(d2<-eps&&d0>eps)){
+      let t=d2/(d2-d0);
+      addBinPoint(v2.x+t*(v0.x-v2.x),v2.y+t*(v0.y-v2.y),v2.z+t*(v0.z-v2.z),Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);
+    }
+    // Vertices exactly on plane
+    if(abs(d0)<=eps){addBinPoint(v0.x,v0.y,v0.z,Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);}
+    if(abs(d1)<=eps){addBinPoint(v1.x,v1.y,v1.z,Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);}
+    if(abs(d2)<=eps){addBinPoint(v2.x,v2.y,v2.z,Gx,Gy,Gz,ux,uy,uz,vx,vy,vz,b);}
+  }
+}
+`});
+
+// Phase B: apply ALL bands per vertex with internal GS loop (radius-based, REST centroid)
+const bandApplyRadiusCS=device.createShaderModule({label:'bandApplyRadius',code:`
+struct BandParam{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,rest_circum:f32,stiffness:f32,influ_radius:f32,preScale:f32,rest_cx:f32,rest_cy:f32,rest_cz:f32}
+struct P{vc:u32,bc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>params:array<BandParam>;
+@group(0)@binding(3)var<storage,read>radii:array<f32>;
+@group(0)@binding(4)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  var cur=src[i];
+  for(var b=0u;b<256u;b++){
+    if(b>=p.bc){break;}
+    let param=params[b];
+    let signedD=(cur.x-param.ox)*param.nx+(cur.y-param.oy)*param.ny+(cur.z-param.oz)*param.nz;
+    let absD=abs(signedD);
+    if(absD>=param.influ_radius){continue;}
+    let t=absD/param.influ_radius;
+    let blend=t*t*(3.0-2.0*t);
+    let projX=cur.x-signedD*param.nx;let projY=cur.y-signedD*param.ny;let projZ=cur.z-signedD*param.nz;
+    let dx=projX-param.rest_cx;let dy=projY-param.rest_cy;let dz=projZ-param.rest_cz;
+    let r_cur=sqrt(dx*dx+dy*dy+dz*dz);
+    if(r_cur<1e-6){continue;}
+    var ux:f32;var uy:f32;var uz:f32;
+    if(abs(param.nx)<0.9){ux=1.0;uy=0.0;uz=0.0;}else{ux=0.0;uy=0.0;uz=1.0;}
+    let du=ux*param.nx+uy*param.ny+uz*param.nz;ux-=du*param.nx;uy-=du*param.ny;uz-=du*param.nz;
+    let ul=sqrt(ux*ux+uy*uy+uz*uz);ux/=ul;uy/=ul;uz/=ul;
+    let vx=param.ny*uz-param.nz*uy;let vy=param.nz*ux-param.nx*uz;let vz=param.nx*uy-param.ny*ux;
+    let ru=dx*ux+dy*uy+dz*uz;let rv=dx*vx+dy*vy+dz*vz;
+    let ang=atan2(rv,ru);
+    let binIdx=u32(floor((ang+3.14159265)/6.28318531*64.0))%64u;
+    let r0=radii[b*64u+binIdx];
+    if(r0<1e-6){continue;}
+    let targetR=r0*param.preScale;
+    let eff_target=targetR+(r_cur-targetR)*blend;
+    if(r_cur>eff_target){
+      let s_target=eff_target/max(r_cur,0.0001);
+      let s_raw=1.0-param.stiffness*(1.0-s_target);
+      let s=max(s_raw, 0.0); // 🔒 防止过推穿透质心
+      cur.x=param.rest_cx+dx*s+signedD*param.nx;
+      cur.y=param.rest_cy+dy*s+signedD*param.ny;
+      cur.z=param.rest_cz+dz*s+signedD*param.nz;
+    }
+  }
+  dst[i]=cur;
+}
+`});
+
+// Phase 0: GPU-side bin clear (avoids CPU writeBuffer stall), bc*64 u32 entries each
+const bandBinClearCS=device.createShaderModule({label:'bandBinClear',code:`
+struct P{total:u32}
+@group(0)@binding(0)var<storage,read_write>binR:array<u32>;
+@group(0)@binding(1)var<storage,read_write>binC:array<u32>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.total){return;}
+  binR[i]=0u;binC[i]=0u;
+}
+`});
+
+// Pass 5 (post-PBD): generate target (green) polyline by scaling red points toward centroid
+const bandVisTargetCS=device.createShaderModule({label:'bandVisTarget',code:`
+struct BandState{gx:f32,gy:f32,gz:f32,scale:f32}
+struct P{bc:u32}
+@group(0)@binding(0)var<storage,read>visPts:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>visCnt:array<u32>;
+@group(0)@binding(2)var<storage,read>state:array<BandState>;
+@group(0)@binding(3)var<storage,read_write>visTgt:array<vec4<f32>>;
+@group(0)@binding(4)var<uniform>p:P;
+@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let b=wg.x;if(b>=p.bc){return;}
+  let cnt=visCnt[b];if(lid.x>=cnt){return;}
+  let pt=visPts[b*256u+lid.x];
+  if(pt.w<0.5){return;}
+  let st=state[b];
+  if(st.scale<1.0){
+    visTgt[b*256u+lid.x]=vec4(st.gx+(pt.x-st.gx)*st.scale,st.gy+(pt.y-st.gy)*st.scale,st.gz+(pt.z-st.gz)*st.scale,1.0);
+  }else{
+    visTgt[b*256u+lid.x]=vec4(0.0,0.0,0.0,0.0);
+  }
+}
+`});
+
+
+// 🌊 呼吸动画 — Y-相位差径向微位移（GPU compute shader）
+const breathCS=device.createShaderModule({label:'breath',code:`
+struct BreathP {
+  time:f32, amplitude:f32, frequency:f32, phaseScale:f32,
+  vc:u32, cx:f32, cy:f32, cz:f32,
+}
+@group(0)@binding(0)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<uniform>p:BreathP;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let r=rest[i];
+  let dx=r.x-p.cx;let dy=r.y-p.cy;let dz=r.z-p.cz;
+  let dist=sqrt(dx*dx+dy*dy+dz*dz);
+  if(dist<1e-6){dst[i]=r;return;}
+  // 顶部和底部呼吸相位不同 → 有机体的波动感
+  let phase=p.time*p.frequency+r.y*p.phaseScale;
+  let displacement=p.amplitude*sin(phase);
+  let nx=dx/dist;let ny=dy/dist;let nz=dz/dist;
+  dst[i]=vec4(r.x+nx*displacement,r.y+ny*displacement,r.z+nz*displacement,1.0);
+}
+`});
+
+// 🌊 呼吸叠加版 — 在当前（可能已被PBD变形）位置上叠加径向微位移
+const breathAddCS=device.createShaderModule({label:'breathAdd',code:`
+struct BreathP {
+  time:f32, amplitude:f32, frequency:f32, phaseScale:f32,
+  vc:u32, cx:f32, cy:f32, cz:f32,
+}
+@group(0)@binding(0)var<storage,read>cur:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<vec4<f32>>;
+@group(0)@binding(2)var<uniform>p:BreathP;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let c=cur[i];
+  let dx=c.x-p.cx;let dy=c.y-p.cy;let dz=c.z-p.cz;
+  let dist=sqrt(dx*dx+dy*dy+dz*dz);
+  if(dist<1e-6){dst[i]=c;return;}
+  let phase=p.time*p.frequency+c.y*p.phaseScale;
+  let displacement=p.amplitude*sin(phase);
+  let nx=dx/dist;let ny=dy/dist;let nz=dz/dist;
+  dst[i]=vec4(c.x+nx*displacement,c.y+ny*displacement,c.z+nz*displacement,1.0);
+}
+`});
+
+
+// ═══════ 💥 FULL GPU BOOM SHADERS ═══════
+// A: Voronoi on proxy → chunk_id + per-chunk COM/strain via atomics
+const boomVorCS=device.createShaderModule({label:'bVor',code:`
+struct Seed{x:f32,y:f32,z:f32}
+struct P{vc:u32,kc:u32}
+const F:u32=1024u;
+@group(0)@binding(0)var<storage,read>cur:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>rest:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read>seeds:array<Seed>;
+@group(0)@binding(3)var<storage,read_write>cid:array<u32>;
+@group(0)@binding(4)var<storage,read_write>sx:array<atomic<i32>>;
+@group(0)@binding(5)var<storage,read_write>sy:array<atomic<i32>>;
+@group(0)@binding(6)var<storage,read_write>sz:array<atomic<i32>>;
+@group(0)@binding(7)var<storage,read_write>st:array<atomic<i32>>;
+@group(0)@binding(8)var<storage,read_write>ct:array<atomic<u32>>;
+@group(0)@binding(9)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let vi=gid.x;if(vi>=p.vc){return;}
+  let cp=cur[vi].xyz;let rp=rest[vi].xyz;
+  var bd=1e30;var bs=0u;
+  for(var s=0u;s<p.kc;s++){let sd=seeds[s];let d=(cp.x-sd.x)*(cp.x-sd.x)+(cp.y-sd.y)*(cp.y-sd.y)+(cp.z-sd.z)*(cp.z-sd.z);if(d<bd){bd=d;bs=s;}}
+  cid[vi]=bs;
+  let disp=cp-rp;let strain=sqrt(disp.x*disp.x+disp.y*disp.y+disp.z*disp.z);
+  atomicAdd(&sx[bs],i32(cp.x*f32(F)));atomicAdd(&sy[bs],i32(cp.y*f32(F)));atomicAdd(&sz[bs],i32(cp.z*f32(F)));
+  atomicAdd(&st[bs],i32(strain*f32(F)));atomicAdd(&ct[bs],1u);
+}
+`});
+const boomVorNormCS=device.createShaderModule({label:'bVNorm',code:`
+struct P{kc:u32}
+const F:f32=1024.0;
+@group(0)@binding(0)var<storage,read>sx:array<i32>;@group(0)@binding(1)var<storage,read>sy:array<i32>;
+@group(0)@binding(2)var<storage,read>sz:array<i32>;@group(0)@binding(3)var<storage,read>st:array<i32>;
+@group(0)@binding(4)var<storage,read>ct:array<u32>;
+@group(0)@binding(5)var<storage,read_write>out:array<vec4<f32>>;@group(0)@binding(6)var<uniform>p:P;
+@compute@workgroup_size(64)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let ci=gid.x;if(ci>=p.kc){return;}
+  let n=ct[ci];if(n==0u){out[ci]=vec4(0);return;}
+  out[ci]=vec4(f32(sx[ci])/F/f32(n),f32(sy[ci])/F/f32(n),f32(sz[ci])/F/f32(n),f32(st[ci])/F/f32(n));
+}
+`});
+
+// B: Assign chunk_id to each high-res triangle (via nearest proxy vertex)
+const boomTriAssignCS=device.createShaderModule({label:'bTriA',code:`
+struct P{tc:u32,kc:u32}
+@group(0)@binding(0)var<storage,read>proxyCid:array<u32>;
+@group(0)@binding(1)var<storage,read>npx:array<u32>;
+@group(0)@binding(2)var<storage,read>hrIdx:array<u32>;
+@group(0)@binding(3)var<storage,read_write>triCid:array<u32>;
+@group(0)@binding(4)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let ti=gid.x;if(ti>=p.tc){return;}
+  let i0=hrIdx[ti*3u];let i1=hrIdx[ti*3u+1u];let i2=hrIdx[ti*3u+2u];
+  let c0=proxyCid[npx[i0]];let c1=proxyCid[npx[i1]];let c2=proxyCid[npx[i2]];
+  // Majority vote: if all 3 agree, use that; else pick first valid
+  var cid=c0;
+  if(c0==c1 && c1==c2){cid=c0;}
+  else if(c1<p.kc){cid=c1;}
+  else if(c2<p.kc){cid=c2;}
+  else{cid=c0;}
+  triCid[ti]=cid;
+}
+`});
+
+// C: Emit per-chunk vertex data via atomic scatter — no sort, no dedup
+const boomEmitCS=device.createShaderModule({label:'bEmit',code:`
+struct P{tc:u32,kc:u32}
+@group(0)@binding(0)var<storage,read>triCid:array<u32>;
+@group(0)@binding(1)var<storage,read>hrIdx:array<u32>;
+@group(0)@binding(2)var<storage,read>hrCurPos:array<vec4<f32>>;
+@group(0)@binding(3)var<storage,read>hrCurNorm:array<vec4<f32>>;
+@group(0)@binding(4)var<storage,read>chunkVtxOff:array<u32>;
+@group(0)@binding(5)var<storage,read_write>cursor:array<atomic<u32>>;
+@group(0)@binding(6)var<storage,read_write>outPos:array<f32>;
+@group(0)@binding(7)var<storage,read_write>outNorm:array<f32>;
+@group(0)@binding(8)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let ti=gid.x;if(ti>=p.tc){return;}
+  let cid=triCid[ti];
+  let slot=atomicAdd(&cursor[cid],1u);
+  let vbase=chunkVtxOff[cid]+slot*3u;
+  for(var j=0u;j<3u;j++){
+    let vi=hrIdx[ti*3u+j];
+    let cp=hrCurPos[vi];let cn=hrCurNorm[vi];
+    outPos[vbase*3u+j*3u]=cp.x;outPos[vbase*3u+j*3u+1u]=cp.y;outPos[vbase*3u+j*3u+2u]=cp.z;
+    outNorm[vbase*3u+j*3u]=cn.x;outNorm[vbase*3u+j*3u+1u]=cn.y;outNorm[vbase*3u+j*3u+2u]=cn.z;
+  }
+}
+`});
+
+// D: Fragment physics per frame (Euler integration)
+const boomPhysCS=device.createShaderModule({label:'bPhys',code:`
+struct P{kc:u32,dt:f32,grav:f32,damp:f32}
+@group(0)@binding(0)var<storage,read_write>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>vel:array<vec4<f32>>;
+@group(0)@binding(2)var<storage,read_write>ang:array<vec4<f32>>;
+@group(0)@binding(3)var<uniform>p:P;
+@compute@workgroup_size(64)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let ci=gid.x;if(ci>=p.kc){return;}
+  var v=vel[ci];v.y-=p.grav*p.dt;
+  v*=p.damp;
+  var p_=pos[ci];p_.x+=v.x*p.dt;p_.y+=v.y*p.dt;p_.z+=v.z*p.dt;
+  vel[ci]=v;pos[ci]=p_;
+  var a=ang[ci];a.x+=a.w*p.dt; // w is angular speed around axis
+  ang[ci]=a;
+}
+`});
+
+
+// ═══════ GPU Circular Band (Tube) Shaders ═══════
+
+const circCutBinsCS=device.createShaderModule({label:'circCutBins',code:`
+struct P{triCount:u32,vc:u32,ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,tubeR:f32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read_write>binRX:array<atomic<u32>>;
+@group(0)@binding(3)var<storage,read_write>binRY:array<atomic<u32>>;
+@group(0)@binding(4)var<storage,read_write>binRZ:array<atomic<u32>>;
+@group(0)@binding(5)var<storage,read_write>binC:array<atomic<u32>>;
+@group(0)@binding(6)var<uniform>p:P;
+const FIXED=1048576.0;const BINS=64u;
+fn addToBin(px:f32,py:f32,pz:f32){
+  var ux_:f32;var uy_:f32;var uz_:f32;
+  if(abs(p.nx)<0.9){ux_=1.0;uy_=0.0;uz_=0.0;}else{ux_=0.0;uy_=0.0;uz_=1.0;}
+  let du=ux_*p.nx+uy_*p.ny+uz_*p.nz;ux_-=du*p.nx;uy_-=du*p.ny;uz_-=du*p.nz;
+  let ul=sqrt(ux_*ux_+uy_*uy_+uz_*uz_);ux_/=ul;uy_/=ul;uz_/=ul;
+  let vx=p.ny*uz_-p.nz*uy_;let vy=p.nz*ux_-p.nx*uz_;let vz=p.nx*uy_-p.ny*ux_;
+  let rx=px-p.cx;let ry=py-p.cy;let rz=pz-p.cz;
+  let ru=rx*ux_+ry*uy_+rz*uz_;let rv=rx*vx+ry*vy+rz*vz;
+  let ang=atan2(rv,ru);let bi=u32(floor((ang+3.14159265)/6.28318531*64.0))%BINS;
+  atomicAdd(&binRX[bi],u32((px+4.0)*FIXED));atomicAdd(&binRY[bi],u32((py+4.0)*FIXED));
+  atomicAdd(&binRZ[bi],u32((pz+4.0)*FIXED));atomicAdd(&binC[bi],1u);
+}
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let ti=gid.x;if(ti>=p.triCount){return;}
+  let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+  let rd0=normalize(pos[i0].xyz-vec3(p.cx,p.cy,p.cz));
+  let rd1=normalize(pos[i1].xyz-vec3(p.cx,p.cy,p.cz));
+  let rd2=normalize(pos[i2].xyz-vec3(p.cx,p.cy,p.cz));
+  let v0=pos[i0].xyz+rd0*p.tubeR;let v1=pos[i1].xyz+rd1*p.tubeR;let v2=pos[i2].xyz+rd2*p.tubeR;
+  let ox=p.ox;let oy=p.oy;let oz=p.oz;let nx=p.nx;let ny=p.ny;let nz=p.nz;
+  let d0=(v0.x-ox)*nx+(v0.y-oy)*ny+(v0.z-oz)*nz;
+  let d1=(v1.x-ox)*nx+(v1.y-oy)*ny+(v1.z-oz)*nz;
+  let d2=(v2.x-ox)*nx+(v2.y-oy)*ny+(v2.z-oz)*nz;
+  let eps=1e-7;
+  let s0=select(0,select(1,-1,d0>eps),abs(d0)>eps);
+  let s1=select(0,select(1,-1,d1>eps),abs(d1)>eps);
+  let s2=select(0,select(1,-1,d2>eps),abs(d2)>eps);
+  if(s0==s1&&s1==s2&&s0!=0){return;}
+  if(s0==0){addToBin(v0.x,v0.y,v0.z);}if(s1==0){addToBin(v1.x,v1.y,v1.z);}if(s2==0){addToBin(v2.x,v2.y,v2.z);}
+  if((d0>eps&&d1<-eps)||(d0<-eps&&d1>eps)){let t=d0/(d0-d1);addToBin(v0.x+t*(v1.x-v0.x),v0.y+t*(v1.y-v0.y),v0.z+t*(v1.z-v0.z));}
+  if((d1>eps&&d2<-eps)||(d1<-eps&&d2>eps)){let t=d1/(d1-d2);addToBin(v1.x+t*(v2.x-v1.x),v1.y+t*(v2.y-v1.y),v1.z+t*(v2.z-v1.z));}
+  if((d2>eps&&d0<-eps)||(d2<-eps&&d0>eps)){let t=d2/(d2-d0);addToBin(v2.x+t*(v0.x-v2.x),v2.y+t*(v0.y-v2.y),v2.z+t*(v0.z-v2.z));}
+}
+`});
+
+const circResolveCS=device.createShaderModule({label:'circResolve',code:`
+struct P{ringSegs:u32}
+@group(0)@binding(0)var<storage,read>binRX:array<u32>;
+@group(0)@binding(1)var<storage,read>binRY:array<u32>;
+@group(0)@binding(2)var<storage,read>binRZ:array<u32>;
+@group(0)@binding(3)var<storage,read>binC:array<u32>;
+@group(0)@binding(4)var<storage,read_write>polyPts:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+const FIXED=1048576.0;const BINS=64u;
+@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>){
+  let base=lid.x;let sx=binRX[base];let sy=binRY[base];let sz=binRZ[base];let c=binC[base];
+  if(c>0u){polyPts[base]=vec4(f32(sx)/FIXED/f32(c)-4.0,f32(sy)/FIXED/f32(c)-4.0,f32(sz)/FIXED/f32(c)-4.0,1.0);}
+  else{polyPts[base]=vec4(0.0,0.0,0.0,0.0);}
+}
+`});
+
+const circBuildTubeCS=device.createShaderModule({label:'circBuildTube',code:`
+struct P{ringSegs:u32,radialSegs:u32,tubeR:f32,nx:f32,ny:f32,nz:f32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>polyPts:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>outPos:array<f32>;
+@group(0)@binding(2)var<storage,read_write>outNorm:array<f32>;
+@group(0)@binding(3)var<storage,read_write>outUV:array<f32>;
+@group(0)@binding(4)var<uniform>p:P;
+const BINS=64u;
+var<workgroup>wsX:array<f32,256>;var<workgroup>wsY:array<f32,256>;var<workgroup>wsZ:array<f32,256>;
+var<workgroup>sX:array<f32,256>;var<workgroup>sY:array<f32,256>;var<workgroup>sZ:array<f32,256>;
+fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32){
+  let i3=vi*3u;outPos[i3]=x;outPos[i3+1u]=y;outPos[i3+2u]=z;
+  outNorm[i3]=nx_;outNorm[i3+1u]=ny_;outNorm[i3+2u]=nz_;outUV[vi*2u]=u_;outUV[vi*2u+1u]=v_;
+}
+fn fakeNormal(px:f32,py:f32,pz:f32)->vec3<f32>{
+  let dx=px-p.cx;let dy=py-p.cy;let dz=pz-p.cz;let len=sqrt(dx*dx+dy*dy+dz*dz)+1e-9;
+  return vec3(dx/len,dy/len,dz/len);
+}
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>){
+  let N=p.ringSegs;let R=p.radialSegs;let r=p.tubeR;
+  let bnX=p.nx;let bnY=p.ny;let bnZ=p.nz;
+  for(var idx=lid.x;idx<N;idx+=256u){
+    let frac=f32(idx)/f32(N)*64.0;let b0=u32(floor(frac))%BINS;let b1=(b0+1u)%BINS;let t=frac-f32(b0);
+    let pt0=polyPts[b0];let pt1=polyPts[b1];var x0=pt0.x;var y0=pt0.y;var z0=pt0.z;var x1=pt1.x;var y1=pt1.y;var z1=pt1.z;
+    if(pt0.w<0.5){for(var d=1u;d<64u;d++){let nb=(b0+BINS-d)%BINS;let pt=polyPts[nb];if(pt.w>0.5){x0=pt.x;y0=pt.y;z0=pt.z;break;}}}
+    if(pt1.w<0.5){for(var d=1u;d<64u;d++){let nb=(b1+d)%BINS;let pt=polyPts[nb];if(pt.w>0.5){x1=pt.x;y1=pt.y;z1=pt.z;break;}}}
+    wsX[idx]=mix(x0,x1,t);wsY[idx]=mix(y0,y1,t);wsZ[idx]=mix(z0,z1,t);
+  }
+  workgroupBarrier();
+  for(var sp=0u;sp<3u;sp++){
+    for(var idx=lid.x;idx<N;idx+=256u){
+      var sx_:f32=0.0;var sy_:f32=0.0;var sz_:f32=0.0;var sw:f32=0.0;
+      for(var di:i32=-2;di<=2;di++){
+        let ni=u32((i32(idx)+di+i32(N))%i32(N));let w=3.0-f32(abs(di));
+        sx_+=wsX[ni]*w;sy_+=wsY[ni]*w;sz_+=wsZ[ni]*w;sw+=w;
+      }
+      sX[idx]=sx_/sw;sY[idx]=sy_/sw;sZ[idx]=sz_/sw;
+    }
+    workgroupBarrier();
+    for(var idx=lid.x;idx<N;idx+=256u){wsX[idx]=sX[idx];wsY[idx]=sY[idx];wsZ[idx]=sZ[idx];}
+    workgroupBarrier();
+  }
+  let vertsPerRing=R*6u;
+  for(var seg=lid.x;seg<N;seg+=256u){
+    let j=(seg+1u)%N;let cx=wsX[seg];let cy=wsY[seg];let cz=wsZ[seg];let nx_=wsX[j];let ny_=wsY[j];let nz_=wsZ[j];
+    var tx=nx_-cx;var ty=ny_-cy;var tz=nz_-cz;let tl=sqrt(tx*tx+ty*ty+tz*tz);
+    if(tl<1e-6){tx=1.0;ty=0.0;tz=0.0;}else{tx/=tl;ty/=tl;tz/=tl;}
+    var Nx=bnY*tz-bnZ*ty;var Ny=bnZ*tx-bnX*tz;var Nz=bnX*ty-bnY*tx;let Nl=sqrt(Nx*Nx+Ny*Ny+Nz*Nz);
+    if(Nl<1e-6){if(abs(bnX)<0.9){Nx=0.0;Ny=-bnZ;Nz=bnY;}else{Nx=-bnZ;Ny=0.0;Nz=bnX;}let nnl=sqrt(Nx*Nx+Ny*Ny+Nz*Nz);Nx/=nnl;Ny/=nnl;Nz/=nnl;}else{Nx/=Nl;Ny/=Nl;Nz/=Nl;}
+    let Bx=ty*Nz-tz*Ny;let By=tz*Nx-tx*Nz;let Bz=tx*Ny-ty*Nx;
+    let baseV=seg*vertsPerRing;let uv_=f32(seg)/f32(N);let uvj=f32(j)/f32(N);
+    for(var ri=0u;ri<R;ri++){
+      let rj=(ri+1u)%R;let a0=f32(ri)/f32(R)*6.283185307;let a1=f32(rj)/f32(R)*6.283185307;
+      let cos0=cos(a0);let sin0=sin(a0);let cos1=cos(a1);let sin1=sin(a1);
+      let p0x=cx+r*(cos0*Nx+sin0*Bx);let p0y=cy+r*(cos0*Ny+sin0*By);let p0z=cz+r*(cos0*Nz+sin0*Bz);
+      let p1x=cx+r*(cos1*Nx+sin1*Bx);let p1y=cy+r*(cos1*Ny+sin1*By);let p1z=cz+r*(cos1*Nz+sin1*Bz);
+      let nxt=wsX[(j+1u)%N];let nyt=wsY[(j+1u)%N];let nzt=wsZ[(j+1u)%N];
+      var txj=nxt-nx_;var tyj=nyt-ny_;var tzj=nzt-nz_;let tlj=sqrt(txj*txj+tyj*tyj+tzj*tzj);
+      if(tlj<1e-6){txj=tx;tyj=ty;tzj=tz;}else{txj/=tlj;tyj/=tlj;tzj/=tlj;}
+      var Nxj=bnY*tzj-bnZ*tyj;var Nyj=bnZ*txj-bnX*tzj;var Nzj=bnX*tyj-bnY*txj;let Nlj=sqrt(Nxj*Nxj+Nyj*Nyj+Nzj*Nzj);
+      if(Nlj<1e-6){if(abs(bnX)<0.9){Nxj=0.0;Nyj=-bnZ;Nzj=bnY;}else{Nxj=-bnZ;Nyj=0.0;Nzj=bnX;}let nnl=sqrt(Nxj*Nxj+Nyj*Nyj+Nzj*Nzj);Nxj/=nnl;Nyj/=nnl;Nzj/=nnl;}else{Nxj/=Nlj;Nyj/=Nlj;Nzj/=Nlj;}
+      let Bxj=tyj*Nzj-tzj*Nyj;let Byj=tzj*Nxj-txj*Nzj;let Bzj=txj*Nyj-tyj*Nxj;
+      let q0x=nx_+r*(cos0*Nxj+sin0*Bxj);let q0y=ny_+r*(cos0*Nyj+sin0*Byj);let q0z=nz_+r*(cos0*Nzj+sin0*Bzj);
+      let q1x=nx_+r*(cos1*Nxj+sin1*Bxj);let q1y=ny_+r*(cos1*Nyj+sin1*Byj);let q1z=nz_+r*(cos1*Nzj+sin1*Bzj);
+      let Tvec=vec3(tx,ty,tz);let Tjvec=vec3(txj,tyj,tzj);
+      let R00=vec3(cos0*Nx+sin0*Bx,cos0*Ny+sin0*By,cos0*Nz+sin0*Bz);
+      let R01=vec3(cos1*Nx+sin1*Bx,cos1*Ny+sin1*By,cos1*Nz+sin1*Bz);
+      let R10=vec3(cos0*Nxj+sin0*Bxj,cos0*Nyj+sin0*Byj,cos0*Nzj+sin0*Bzj);
+      let R11=vec3(cos1*Nxj+sin1*Bxj,cos1*Nyj+sin1*Byj,cos1*Nzj+sin1*Bzj);
+      let F00=fakeNormal(p0x,p0y,p0z);let F01=fakeNormal(p1x,p1y,p1z);
+      let F10=fakeNormal(q0x,q0y,q0z);let F11=fakeNormal(q1x,q1y,q1z);
+      let n00=normalize(R00+dot(F00,Tvec)*Tvec);let n01=normalize(R01+dot(F01,Tvec)*Tvec);
+      let n10=normalize(R10+dot(F10,Tjvec)*Tjvec);let n11=normalize(R11+dot(F11,Tjvec)*Tjvec);
+      let v0_=f32(ri)/f32(R);let v1_=f32(rj)/f32(R);let vi=baseV+ri*6u;
+      writeVert(vi,p0x,p0y,p0z,n00.x,n00.y,n00.z,uv_,v0_);writeVert(vi+1u,p1x,p1y,p1z,n01.x,n01.y,n01.z,uv_,v1_);
+      writeVert(vi+2u,q0x,q0y,q0z,n10.x,n10.y,n10.z,uvj,v0_);writeVert(vi+3u,p1x,p1y,p1z,n01.x,n01.y,n01.z,uv_,v1_);
+      writeVert(vi+4u,q1x,q1y,q1z,n11.x,n11.y,n11.z,uvj,v1_);writeVert(vi+5u,q0x,q0y,q0z,n10.x,n10.y,n10.z,uvj,v0_);
+    }
+  }
+}
+`});
+
+// ═══════ 🚀 批量皮筋管（全部分配一次 dispatch）═══════
+const circCutBinsAllCS=device.createShaderModule({label:'circCutAll',code:`
+struct BandP{ox:f32,oy:f32,oz:f32,nx:f32,ny:f32,nz:f32,tubeR:f32}
+struct P{triCount:u32,vc:u32,bc:u32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read_write>binRX:array<atomic<u32>>;
+@group(0)@binding(3)var<storage,read_write>binRY:array<atomic<u32>>;
+@group(0)@binding(4)var<storage,read_write>binRZ:array<atomic<u32>>;
+@group(0)@binding(5)var<storage,read_write>binC:array<atomic<u32>>;
+@group(0)@binding(6)var<storage,read>bands:array<BandP>;
+@group(0)@binding(7)var<uniform>p:P;
+const FIXED=1048576.0;const BINS=64u;
+fn addToBin(bandIdx:u32,px:f32,py:f32,pz:f32,cx_:f32,cy_:f32,cz_:f32,nx_:f32,ny_:f32,nz_:f32){
+  var ux_:f32;var uy_:f32;var uz_:f32;
+  if(abs(nx_)<0.9){ux_=1.0;uy_=0.0;uz_=0.0;}else{ux_=0.0;uy_=0.0;uz_=1.0;}
+  let du=ux_*nx_+uy_*ny_+uz_*nz_;ux_-=du*nx_;uy_-=du*ny_;uz_-=du*nz_;
+  let ul=sqrt(ux_*ux_+uy_*uy_+uz_*uz_);ux_/=ul;uy_/=ul;uz_/=ul;
+  let vx=ny_*uz_-nz_*uy_;let vy=nz_*ux_-nx_*uz_;let vz=nx_*uy_-ny_*ux_;
+  let rx=px-cx_;let ry=py-cy_;let rz=pz-cz_;
+  let ru=rx*ux_+ry*uy_+rz*uz_;let rv=rx*vx+ry*vy+rz*vz;
+  let ang=atan2(rv,ru);let bi=u32(floor((ang+3.14159265)/6.28318531*64.0))%BINS;
+  let gi=bandIdx*BINS+bi;
+  atomicAdd(&binRX[gi],u32((px+4.0)*FIXED));atomicAdd(&binRY[gi],u32((py+4.0)*FIXED));
+  atomicAdd(&binRZ[gi],u32((pz+4.0)*FIXED));atomicAdd(&binC[gi],1u);
+}
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>){
+  let ti=gid.x;if(ti>=p.triCount){return;}
+  let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+  let r0=normalize(pos[i0].xyz-vec3(p.cx,p.cy,p.cz));
+  let r1=normalize(pos[i1].xyz-vec3(p.cx,p.cy,p.cz));
+  let r2=normalize(pos[i2].xyz-vec3(p.cx,p.cy,p.cz));
+  for(var b=0u;b<p.bc;b++){
+    let bp=bands[b];
+    let v0=pos[i0].xyz+r0*bp.tubeR;let v1=pos[i1].xyz+r1*bp.tubeR;let v2=pos[i2].xyz+r2*bp.tubeR;
+    let d0=(v0.x-bp.ox)*bp.nx+(v0.y-bp.oy)*bp.ny+(v0.z-bp.oz)*bp.nz;
+    let d1=(v1.x-bp.ox)*bp.nx+(v1.y-bp.oy)*bp.ny+(v1.z-bp.oz)*bp.nz;
+    let d2=(v2.x-bp.ox)*bp.nx+(v2.y-bp.oy)*bp.ny+(v2.z-bp.oz)*bp.nz;
+    let eps=1e-7;
+    let s0=select(0,select(1,-1,d0>eps),abs(d0)>eps);
+    let s1=select(0,select(1,-1,d1>eps),abs(d1)>eps);
+    let s2=select(0,select(1,-1,d2>eps),abs(d2)>eps);
+    if(s0==s1&&s1==s2&&s0!=0){continue;}
+    if(s0==0){addToBin(b,v0.x,v0.y,v0.z,p.cx,p.cy,p.cz,bp.nx,bp.ny,bp.nz);}
+    if(s1==0){addToBin(b,v1.x,v1.y,v1.z,p.cx,p.cy,p.cz,bp.nx,bp.ny,bp.nz);}
+    if(s2==0){addToBin(b,v2.x,v2.y,v2.z,p.cx,p.cy,p.cz,bp.nx,bp.ny,bp.nz);}
+    if((d0>eps&&d1<-eps)||(d0<-eps&&d1>eps)){let t=d0/(d0-d1);addToBin(b,v0.x+t*(v1.x-v0.x),v0.y+t*(v1.y-v0.y),v0.z+t*(v1.z-v0.z),p.cx,p.cy,p.cz,bp.nx,bp.ny,bp.nz);}
+    if((d1>eps&&d2<-eps)||(d1<-eps&&d2>eps)){let t=d1/(d1-d2);addToBin(b,v1.x+t*(v2.x-v1.x),v1.y+t*(v2.y-v1.y),v1.z+t*(v2.z-v1.z),p.cx,p.cy,p.cz,bp.nx,bp.ny,bp.nz);}
+    if((d2>eps&&d0<-eps)||(d2<-eps&&d0>eps)){let t=d2/(d2-d0);addToBin(b,v2.x+t*(v0.x-v2.x),v2.y+t*(v0.y-v2.y),v2.z+t*(v0.z-v2.z),p.cx,p.cy,p.cz,bp.nx,bp.ny,bp.nz);}
+  }
+}
+`});
+
+const circResolveAllCS=device.createShaderModule({label:'circResolveAll',code:`
+struct P{ringSegs:u32}
+@group(0)@binding(0)var<storage,read>binRX:array<u32>;
+@group(0)@binding(1)var<storage,read>binRY:array<u32>;
+@group(0)@binding(2)var<storage,read>binRZ:array<u32>;
+@group(0)@binding(3)var<storage,read>binC:array<u32>;
+@group(0)@binding(4)var<storage,read_write>polyPts:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+const FIXED=1048576.0;const BINS=64u;
+@compute@workgroup_size(64)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let base=wg.x*BINS+lid.x;
+  let sx=binRX[base];let sy=binRY[base];let sz=binRZ[base];let c=binC[base];
+  if(c>0u){polyPts[base]=vec4(f32(sx)/FIXED/f32(c)-4.0,f32(sy)/FIXED/f32(c)-4.0,f32(sz)/FIXED/f32(c)-4.0,1.0);}
+  else{polyPts[base]=vec4(0.0,0.0,0.0,0.0);}
+}
+`});
+
+// 🚀 批量 build — workgroup_id = band index，与 resolve 一样一次 dispatch
+const circBuildTubeAllCS=device.createShaderModule({label:'circBuildAll',code:`
+struct BuildP{tubeR:f32,nx:f32,ny:f32,nz:f32}
+struct P{ringSegs:u32,radialSegs:u32,cx:f32,cy:f32,cz:f32}
+@group(0)@binding(0)var<storage,read>polyPts:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>outPos:array<f32>;
+@group(0)@binding(2)var<storage,read_write>outNorm:array<f32>;
+@group(0)@binding(3)var<storage,read_write>outUV:array<f32>;
+@group(0)@binding(4)var<storage,read>bParams:array<BuildP>;
+@group(0)@binding(5)var<uniform>p:P;
+const BINS=64u;
+var<workgroup>wsX:array<f32,256>;var<workgroup>wsY:array<f32,256>;var<workgroup>wsZ:array<f32,256>;
+var<workgroup>sX:array<f32,256>;var<workgroup>sY:array<f32,256>;var<workgroup>sZ:array<f32,256>;
+fn writeVert(vi:u32,x:f32,y:f32,z:f32,nx_:f32,ny_:f32,nz_:f32,u_:f32,v_:f32){
+  let i3=vi*3u;outPos[i3]=x;outPos[i3+1u]=y;outPos[i3+2u]=z;
+  outNorm[i3]=nx_;outNorm[i3+1u]=ny_;outNorm[i3+2u]=nz_;outUV[vi*2u]=u_;outUV[vi*2u+1u]=v_;
+}
+fn fakeNormal(px:f32,py:f32,pz:f32,cx_:f32,cy_:f32,cz_:f32)->vec3<f32>{
+  let dx=px-cx_;let dy=py-cy_;let dz=pz-cz_;let len=sqrt(dx*dx+dy*dy+dz*dz)+1e-9;
+  return vec3(dx/len,dy/len,dz/len);
+}
+@compute@workgroup_size(256)fn main(@builtin(local_invocation_id)lid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let N=p.ringSegs;let R=p.radialSegs;let bx=wg.x;
+  let bp=bParams[bx];let r=bp.tubeR;let bnX=bp.nx;let bnY=bp.ny;let bnZ=bp.nz;
+  let polyOff=bx*BINS;let totalVerts=N*R*6u;let vtxOff=bx*totalVerts;
+  for(var idx=lid.x;idx<N;idx+=256u){
+    let frac=f32(idx)/f32(N)*64.0;let b0=u32(floor(frac))%BINS;let b1=(b0+1u)%BINS;let t=frac-f32(b0);
+    let pt0=polyPts[polyOff+b0];let pt1=polyPts[polyOff+b1];var x0=pt0.x;var y0=pt0.y;var z0=pt0.z;var x1=pt1.x;var y1=pt1.y;var z1=pt1.z;
+    if(pt0.w<0.5){for(var d=1u;d<64u;d++){let nb=(b0+BINS-d)%BINS;let pt=polyPts[polyOff+nb];if(pt.w>0.5){x0=pt.x;y0=pt.y;z0=pt.z;break;}}}
+    if(pt1.w<0.5){for(var d=1u;d<64u;d++){let nb=(b1+d)%BINS;let pt=polyPts[polyOff+nb];if(pt.w>0.5){x1=pt.x;y1=pt.y;z1=pt.z;break;}}}
+    wsX[idx]=mix(x0,x1,t);wsY[idx]=mix(y0,y1,t);wsZ[idx]=mix(z0,z1,t);
+  }
+  workgroupBarrier();
+  for(var sp=0u;sp<3u;sp++){
+    for(var idx=lid.x;idx<N;idx+=256u){
+      var sx_:f32=0.0;var sy_:f32=0.0;var sz_:f32=0.0;var sw:f32=0.0;
+      for(var di:i32=-2;di<=2;di++){
+        let ni=u32((i32(idx)+di+i32(N))%i32(N));let w=3.0-f32(abs(di));
+        sx_+=wsX[ni]*w;sy_+=wsY[ni]*w;sz_+=wsZ[ni]*w;sw+=w;
+      }
+      sX[idx]=sx_/sw;sY[idx]=sy_/sw;sZ[idx]=sz_/sw;
+    }
+    workgroupBarrier();if(sp<2){for(var idx=lid.x;idx<N;idx+=256u){wsX[idx]=sX[idx];wsY[idx]=sY[idx];wsZ[idx]=sZ[idx];}}
+    workgroupBarrier();
+  }
+  let vertsPerRing=R*6u;
+  for(var seg=lid.x;seg<N;seg+=256u){
+    let j=(seg+1u)%N;let cx=sX[seg];let cy=sY[seg];let cz=sZ[seg];let nx_=sX[j];let ny_=sY[j];let nz_=sZ[j];
+    var tx=nx_-cx;var ty=ny_-cy;var tz=nz_-cz;let tl=sqrt(tx*tx+ty*ty+tz*tz);
+    if(tl<1e-6){tx=1.0;ty=0.0;tz=0.0;}else{tx/=tl;ty/=tl;tz/=tl;}
+    var Nx=bnY*tz-bnZ*ty;var Ny=bnZ*tx-bnX*tz;var Nz=bnX*ty-bnY*tx;let Nl=sqrt(Nx*Nx+Ny*Ny+Nz*Nz);
+    if(Nl<1e-6){if(abs(bnX)<0.9){Nx=0.0;Ny=-bnZ;Nz=bnY;}else{Nx=-bnZ;Ny=0.0;Nz=bnX;}let nnl=sqrt(Nx*Nx+Ny*Ny+Nz*Nz);Nx/=nnl;Ny/=nnl;Nz/=nnl;}else{Nx/=Nl;Ny/=Nl;Nz/=Nl;}
+    let Bx=ty*Nz-tz*Ny;let By=tz*Nx-tx*Nz;let Bz=tx*Ny-ty*Nx;
+    let baseV=seg*vertsPerRing;let uv_=f32(seg)/f32(N);let uvj=f32(j)/f32(N);
+    for(var ri=0u;ri<R;ri++){
+      let rj=(ri+1u)%R;let a0=f32(ri)/f32(R)*6.283185307;let a1=f32(rj)/f32(R)*6.283185307;
+      let cos0=cos(a0);let sin0=sin(a0);let cos1=cos(a1);let sin1=sin(a1);
+      let p0x=cx+r*(cos0*Nx+sin0*Bx);let p0y=cy+r*(cos0*Ny+sin0*By);let p0z=cz+r*(cos0*Nz+sin0*Bz);
+      let p1x=cx+r*(cos1*Nx+sin1*Bx);let p1y=cy+r*(cos1*Ny+sin1*By);let p1z=cz+r*(cos1*Nz+sin1*Bz);
+      let nxt=sX[(j+1u)%N];let nyt=sY[(j+1u)%N];let nzt=sZ[(j+1u)%N];
+      var txj=nxt-nx_;var tyj=nyt-ny_;var tzj=nzt-nz_;let tlj=sqrt(txj*txj+tyj*tyj+tzj*tzj);
+      if(tlj<1e-6){txj=tx;tyj=ty;tzj=tz;}else{txj/=tlj;tyj/=tlj;tzj/=tlj;}
+      var Nxj=bnY*tzj-bnZ*tyj;var Nyj=bnZ*txj-bnX*tzj;var Nzj=bnX*tyj-bnY*txj;let Nlj=sqrt(Nxj*Nxj+Nyj*Nyj+Nzj*Nzj);
+      if(Nlj<1e-6){if(abs(bnX)<0.9){Nxj=0.0;Nyj=-bnZ;Nzj=bnY;}else{Nxj=-bnZ;Nyj=0.0;Nzj=bnX;}let nnl=sqrt(Nxj*Nxj+Nyj*Nyj+Nzj*Nzj);Nxj/=nnl;Nyj/=nnl;Nzj/=nnl;}else{Nxj/=Nlj;Nyj/=Nlj;Nzj/=Nlj;}
+      let Bxj=tyj*Nzj-tzj*Nyj;let Byj=tzj*Nxj-txj*Nzj;let Bzj=txj*Nyj-tyj*Nxj;
+      let q0x=nx_+r*(cos0*Nxj+sin0*Bxj);let q0y=ny_+r*(cos0*Nyj+sin0*Byj);let q0z=nz_+r*(cos0*Nzj+sin0*Bzj);
+      let q1x=nx_+r*(cos1*Nxj+sin1*Bxj);let q1y=ny_+r*(cos1*Nyj+sin1*Byj);let q1z=nz_+r*(cos1*Nzj+sin1*Bzj);
+      let Tvec=vec3(tx,ty,tz);let Tjvec=vec3(txj,tyj,tzj);
+      let R00=vec3(cos0*Nx+sin0*Bx,cos0*Ny+sin0*By,cos0*Nz+sin0*Bz);
+      let R01=vec3(cos1*Nx+sin1*Bx,cos1*Ny+sin1*By,cos1*Nz+sin1*Bz);
+      let R10=vec3(cos0*Nxj+sin0*Bxj,cos0*Nyj+sin0*Byj,cos0*Nzj+sin0*Bzj);
+      let R11=vec3(cos1*Nxj+sin1*Bxj,cos1*Nyj+sin1*Byj,cos1*Nzj+sin1*Bzj);
+      let F00=fakeNormal(p0x,p0y,p0z,p.cx,p.cy,p.cz);let F01=fakeNormal(p1x,p1y,p1z,p.cx,p.cy,p.cz);
+      let F10=fakeNormal(q0x,q0y,q0z,p.cx,p.cy,p.cz);let F11=fakeNormal(q1x,q1y,q1z,p.cx,p.cy,p.cz);
+      let n00=normalize(R00+dot(F00,Tvec)*Tvec);let n01=normalize(R01+dot(F01,Tvec)*Tvec);
+      let n10=normalize(R10+dot(F10,Tjvec)*Tjvec);let n11=normalize(R11+dot(F11,Tjvec)*Tjvec);
+      let v0_=f32(ri)/f32(R);let v1_=f32(rj)/f32(R);
+      let vi=vtxOff+baseV+ri*6u;
+      writeVert(vi,p0x,p0y,p0z,n00.x,n00.y,n00.z,uv_,v0_);writeVert(vi+1u,p1x,p1y,p1z,n01.x,n01.y,n01.z,uv_,v1_);
+      writeVert(vi+2u,q0x,q0y,q0z,n10.x,n10.y,n10.z,uvj,v0_);writeVert(vi+3u,p1x,p1y,p1z,n01.x,n01.y,n01.z,uv_,v1_);
+      writeVert(vi+4u,q1x,q1y,q1z,n11.x,n11.y,n11.z,uvj,v1_);writeVert(vi+5u,q0x,q0y,q0z,n10.x,n10.y,n10.z,uvj,v0_);
+    }
+  }
+}
+`});
+
+
+// Normals recompute (unchanged from original)
+const normCS=device.createShaderModule({label:'norm',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>pos:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read>idx:array<u32>;
+@group(0)@binding(2)var<storage,read>adjOff:array<u32>;
+@group(0)@binding(3)var<storage,read>adjData:array<u32>;
+@group(0)@binding(4)var<storage,read_write>norms:array<vec4<f32>>;
+@group(0)@binding(5)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let vi=gid.x;if(vi>=p.vc){return;}
+  let start=adjOff[vi];let end=adjOff[vi+1u];
+  var sumN=vec3<f32>(0.0);
+  for(var j=start;j<end;j++){
+    let ti=adjData[j];
+    let i0=idx[ti*3u];let i1=idx[ti*3u+1u];let i2=idx[ti*3u+2u];
+    let p0=pos[i0].xyz;let p1=pos[i1].xyz;let p2=pos[i2].xyz;
+    sumN+=normalize(cross(p1-p0,p2-p0));
+  }
+  let N=normalize(sumN);
+  norms[vi]=vec4<f32>(N,0.0);
+}
+`});
+
+const normUnpackCS=device.createShaderModule({label:'normUnpack',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let v=src[i];dst[i*3u]=v.x;dst[i*3u+1u]=v.y;dst[i*3u+2u]=v.z;
+}
+`});
+
+const posUnpackCS=device.createShaderModule({label:'posUnpack',code:`
+struct P{vc:u32}
+@group(0)@binding(0)var<storage,read>src:array<vec4<f32>>;
+@group(0)@binding(1)var<storage,read_write>dst:array<f32>;
+@group(0)@binding(2)var<uniform>p:P;
+@compute@workgroup_size(256)fn main(@builtin(global_invocation_id)gid:vec3<u32>,@builtin(workgroup_id)wg:vec3<u32>){
+  let i=gid.x;if(i>=p.vc){return;}
+  let v=src[i];dst[i*3u]=v.x;dst[i*3u+1u]=v.y;dst[i*3u+2u]=v.z;
+}
+`});
+
+// ══════.?Compute Pipeline Setup ══════.?
+const S_R=(b,v)=>({binding:b,visibility:v,buffer:{type:'storage'}});
+const S_RO=(b,v)=>({binding:b,visibility:v,buffer:{type:'read-only-storage'}});
+const U_B=(b,v)=>({binding:b,visibility:v,buffer:{type:'uniform'}});
+const CS=GPUShaderStage.COMPUTE;
+
+function cpPipe(shader,entry,bgEntries,label){
+  const bgl=device.createBindGroupLayout({entries:bgEntries});
+  const layout=device.createPipelineLayout({bindGroupLayouts:[bgl]});
+  return{pipe:device.createComputePipeline({layout,compute:{module:shader,entryPoint:entry}}),bgl,layout};
+}
+
+const shapePipe=cpPipe(shapeCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'shape');
+const volAccPipe=cpPipe(volAccCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'volAcc');
+const volReducePipe=cpPipe(volReduceCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'volReduce');
+const volApPipe=cpPipe(volApCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),U_B(3,CS)],'volAp');
+const normPipe=cpPipe(normCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'norm');
+const normUnpackPipe=cpPipe(normUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'normUnpack');
+const posUnpackPipe=cpPipe(posUnpackCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'posUnpack');
+const voxelScatterPipe=cpPipe(voxelScatterCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'voxelScatter');
+const voxelNormPipe=cpPipe(voxelNormCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'voxelNorm');
+const voxelApplyPipe=cpPipe(voxelApplyCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'voxelApply');
+const nearestPipe=cpPipe(nearestCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),U_B(3,CS)],'nearest');
+const bandApplyRadiusPipe=cpPipe(bandApplyRadiusCS,'main',[S_RO(0,CS),S_R(1,CS),S_RO(2,CS),S_RO(3,CS),U_B(4,CS)],'bandApplyRadius');
+
+const bandVisTargetPipe=cpPipe(bandVisTargetCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bandVisTarget');
+// 🌊 呼吸动画管道
+const breathPipe=cpPipe(breathCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'breath');
+const breathAddPipe=cpPipe(breathAddCS,'main',[S_RO(0,CS),S_R(1,CS),U_B(2,CS)],'breathAdd');
+// Circular Band (Tube) pipelines
+const circCutBinsPipe=cpPipe(circCutBinsCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),U_B(6,CS)],'circCutBins');
+const circResolvePipe=cpPipe(circResolveCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'circResolve');
+const circBuildTubePipe=cpPipe(circBuildTubeCS,'main',[S_RO(0,CS),S_R(1,CS),S_R(2,CS),S_R(3,CS),U_B(4,CS)],'circBuildTube');
+// 🚀 批量皮筋管管道
+const circCutAllPipe=cpPipe(circCutBinsAllCS,'main',[S_RO(0,CS),S_RO(1,CS),S_R(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),S_RO(6,CS),U_B(7,CS)],'circCutAll');
+const circResolveAllPipe=cpPipe(circResolveAllCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_R(4,CS),U_B(5,CS)],'circResolveAll');
+const circBuildAllPipe=cpPipe(circBuildTubeAllCS,'main',[S_RO(0,CS),S_R(1,CS),S_R(2,CS),S_R(3,CS),S_RO(4,CS),U_B(5,CS)],'circBuildAll');
+
+// ══════ 💥 Boom pipelines ══════
+const boomVorPipe=cpPipe(boomVorCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),S_R(4,CS),S_R(5,CS),S_R(6,CS),S_R(7,CS),S_R(8,CS),U_B(9,CS)],'bVor');
+const boomVorNormPipe=cpPipe(boomVorNormCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_RO(4,CS),S_R(5,CS),U_B(6,CS)],'bVNorm');
+const boomTriAssignPipe=cpPipe(boomTriAssignCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_R(3,CS),U_B(4,CS)],'bTriA');
+const boomEmitPipe=cpPipe(boomEmitCS,'main',[S_RO(0,CS),S_RO(1,CS),S_RO(2,CS),S_RO(3,CS),S_RO(4,CS),S_R(5,CS),S_R(6,CS),S_R(7,CS),U_B(8,CS)],'bEmit');
+const boomPhysPipe=cpPipe(boomPhysCS,'main',[S_R(0,CS),S_R(1,CS),S_R(2,CS),U_B(3,CS)],'bPhys');
+
+// ══════.?GPU Buffers and Bind Groups ══════.?
+let posA,posB,restB,idxB,volB,volTotalB;
+// Boom GPU buffers (assigned in initGPU)
+let nearestProxyB,highResUVB,HR_TRI_COUNT;
+let boomProxyCidB,boomSxB,boomSyB,boomSzB,boomStB,boomCtB,boomChunkOutB,boomSeedsB,boomUB;
+let boomTriCidB,boomTriCountB,boomCursorB,boomChunkVtxOffB;
+let boomFragPosB,boomFragNormB,boomFragVtxCntB;
+let boomFragPosSB,boomFragVelB,boomFragAngB,boomPhysUB;
+let boomChunkStgB,boomFragStgB;
+// Boom bind groups + pipelines
+let boomVorBG_AB,boomVorBG_BA,boomVorNormBG,boomTriAssignBG,boomEmitBG,boomPhysBG;
+let volRedLevels=[],staging,volStaging;
+let voxDxBuf,voxDyBuf,voxDzBuf,voxWBuf,voxOutBuf;
+let highResRestB,highResOutB,highResOut3B;
+let highResIdxB,highResAdjOffB,highResAdjDataB,highResNormB,highResNorm3B;
+let proxyRestNormB,proxyPos3B;
+let voxelScatterBG,voxelNormBG,voxelApplyBG;
+let voxelScatterUB,voxelNormUB,voxelApplyUB;
+let shapeBG_AB,shapeBG_BA,volApBG_AB,volApBG_BA,volAccBG_A,volAccBG_B;
+let hrNormBG,hrNormUnpackBG,highResUnpackBG,proxyUnpackBG_A,proxyUnpackBG_B;
+let shapeUB,volAccUB,volApUB,bandReduceAllUB;
+let bandParamsB,bandRestRadiiB;
+let bandApplyRadiusBG_AB,bandApplyRadiusBG_BA;
+// 🌊 呼吸动画
+let breathUB,breathBG,breathTmpB,breathAddBG_A,breathAddBG_B,breathAddBG_C;
+let convergedB; // 收敛结果快照，永不覆盖，呼吸叠加的基准
+// ── Plan C: GPU band rendering buffers ──
+const MAX_RIBBON_VERTS=256*(4*12+12);
+let bandOffLoB,bandOffHiB; // per-vertex offsets (vc floats each)
+let bandStackUB; // uniform
+let bandStackBG; // bind group
+// ── GPU Ribbon Mesh Gen buffers ──
+let bandBinRB,bandBinRYB,bandBinRZB,bandBinCB; // 4×64 atomics (R=RX, RY, RZ, C)
+let bandPolyPtsB;              // 4×64 vec4 polyline points (reused)
+// ── Shared ribbon mesh buffers (all bands, compute→render direct, 0 copy) ──
+let _sharedPosB,_sharedNormB,_sharedUVB,_sharedTanB;
+let _greenAllB;                // green target line staging (MAP_READ)
+let _sharedRibbonMesh;         // single mesh for all bands
+
+let bandCutUB,bandResolveUB,bandBuildUB; // uniforms
+let WG,VWG;
+// Circular Band (Tube) buffers
+let _circBinRB,_circBinRYB,_circBinRZB,_circBinCB;
+let _circPolyPtsB;
+let _circSharedPosB,_circSharedNormB,_circSharedUVB;
+let _circSharedMesh;
+let _circCutUB,_circResolveUB,_circBuildUB;
+let _circBandParamsB,_circCutAllUB,_circCutAllBG,_circResolveAllBG; // 批量皮筋管
+let _circCurPolyB,_circBuildBG; // build用临时polyline + 预创建bind group缓存
+let _circBuildParamsB,_circBuildAllUB,_circBuildAllBG; // 批量build
+const MAX_TUBE_VERTS=256*16*6;
+
+async function initGPU(){
+  WG=Math.ceil(proxyVertexCount/256);VWG=Math.ceil(proxyTriCount/256);
+  const VB=proxyVertexCount*4*4;
+
+  // Proxy position buffers (for GPU side: shape/volume constraints)
+  posA=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posA');
+  posB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'posB');
+  restB=mkBuf(VB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'rest');
+  idxB=mkBuf(proxyIdxArr.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'idx');
+  proxyRestNormB=mkBuf(proxyVertexCount*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'proxyRestNorm');
+
+  const pos4=new Float32Array(proxyVertexCount*4);
+  const norm4=new Float32Array(proxyVertexCount*4);
+  for(let i=0;i<proxyVertexCount;i++){
+    pos4[i*4]=proxyRestPositions[i*3];pos4[i*4+1]=proxyRestPositions[i*3+1];pos4[i*4+2]=proxyRestPositions[i*3+2];pos4[i*4+3]=1;
+    norm4[i*4]=proxyRestNormals[i*3];norm4[i*4+1]=proxyRestNormals[i*3+1];norm4[i*4+2]=proxyRestNormals[i*3+2];norm4[i*4+3]=0;
+  }
+  queue.writeBuffer(posA,0,pos4);queue.writeBuffer(posB,0,pos4);queue.writeBuffer(restB,0,pos4);
+  queue.writeBuffer(idxB,0,proxyIdxArr);
+  queue.writeBuffer(proxyRestNormB,0,norm4);
+
+  // Volume reduction chain
+  volTotalB=mkBuf(4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volTotal');
+  volB=mkBuf(proxyTriCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'vol');
+  volRedLevels=[];
+  {let srcCount=proxyTriCount,srcBuf=volB;
+    while(true){const dc=Math.ceil(srcCount/256);const lv={srcBuf,srcCount,dstBuf:null,wgCount:dc,ub:null,bg:null};
+      if(dc===1){lv.dstBuf=volTotalB;lv.ub=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volRedU_f');queue.writeBuffer(lv.ub,0,new Uint32Array([srcCount]));lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:volTotalB}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);break;}
+      const db=mkBuf(dc*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'volRedL'+volRedLevels.length);
+      lv.dstBuf=db;lv.ub=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volRedU_L'+volRedLevels.length);queue.writeBuffer(lv.ub,0,new Uint32Array([srcCount]));
+      lv.bg=device.createBindGroup({layout:volReducePipe.bgl,entries:[{binding:0,resource:{buffer:srcBuf}},{binding:1,resource:{buffer:db}},{binding:2,resource:{buffer:lv.ub}}]});volRedLevels.push(lv);srcCount=dc;srcBuf=db;}
+  }
+
+  // Voxel grid buffers (32³ = 32768 cells, 4 u32 accumulators + 1 vec4 output)
+  voxDxBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDx');
+  voxDyBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDy');
+  voxDzBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxDz');
+  voxWBuf=mkBuf(VOX_TOTAL*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'voxW');
+  voxOutBuf=mkBuf(VOX_TOTAL*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'voxOut');
+
+  // High-res mesh buffers
+  const HRB=highResCount*4*4;
+  highResRestB=mkBuf(HRB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrRest');
+  highResOutB=mkBuf(HRB,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrOut');
+  highResOut3B=mkBuf(highResCount*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrPos3');
+
+  const hr4=new Float32Array(highResCount*4);
+  for(let i=0;i<highResCount;i++){
+    hr4[i*4]=highResRestPositions[i*3];hr4[i*4+1]=highResRestPositions[i*3+1];hr4[i*4+2]=highResRestPositions[i*3+2];hr4[i*4+3]=1;
+  }
+  queue.writeBuffer(highResRestB,0,hr4);
+  queue.writeBuffer(highResOutB,0,hr4); // init with rest pos, PBD overwrites with deformed
+
+  // Band params buffer (GPU PBD): 13 floats per band
+  const BAND_PARAM_STRIDE=13;
+  bandParamsB=mkBuf(MAX_CIRC_BANDS*BAND_PARAM_STRIDE*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bandParams');
+  bandRestRadiiB=mkBuf(MAX_CIRC_BANDS*64*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bandRestRadii');
+
+  // Circular Band (Tube) GPU buffers
+  _circBinRB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinRX');
+  _circBinRYB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinRY');
+  _circBinRZB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinRZ');
+  _circBinCB=mkBuf(CIRC_BINS*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circBinC');
+  _circPolyPtsB=mkBuf(CIRC_BINS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'circPolyPts');
+  _circCurPolyB=mkBuf(64*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'circCurPoly');
+  const TVC=MAX_TUBE_VERTS;
+  _circSharedPosB=mkBuf(MAX_CIRC_BANDS*TVC*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'circSharedPos');
+  _circSharedNormB=mkBuf(MAX_CIRC_BANDS*TVC*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'circSharedNorm');
+  _circSharedUVB=mkBuf(MAX_CIRC_BANDS*TVC*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX,'circSharedUV');
+  _circCutUB=mkBuf(48,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circCutU');
+  _circResolveUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circResolveU');
+  _circBuildUB=mkBuf(48,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circBuildU');
+  // 🚀 批量皮筋管：band params storage + uniform
+  _circBandParamsB=mkBuf(MAX_CIRC_BANDS*7*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'circBandParams');
+  _circCutAllUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circCutAllU');
+  _circBuildParamsB=mkBuf(MAX_CIRC_BANDS*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'circBuildP');
+  _circBuildAllUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'circBuildAllU');
+  // 预创建 bind groups（在所有 buffer 声明之后）
+  // 预创建 bind groups（在所有 buffer 声明之后）
+  _circBuildBG=new Array(MAX_CIRC_BANDS);
+  { const tv=TUBE_RING_SEGS*TUBE_RADIAL_SEGS*6;
+    for(let b=0;b<MAX_CIRC_BANDS;b++){
+      _circBuildBG[b]=device.createBindGroup({layout:circBuildTubePipe.bgl,entries:[
+        {binding:0,resource:{buffer:_circCurPolyB}},
+        {binding:1,resource:{buffer:_circSharedPosB,offset:b*tv*3*4,size:tv*3*4}},
+        {binding:2,resource:{buffer:_circSharedNormB,offset:b*tv*3*4,size:tv*3*4}},
+        {binding:3,resource:{buffer:_circSharedUVB,offset:b*tv*2*4,size:tv*2*4}},
+        {binding:4,resource:{buffer:_circBuildUB}}]});
+    }
+  }
+  _circCutAllBG=device.createBindGroup({layout:circCutAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},
+    {binding:2,resource:{buffer:_circBinRB}},{binding:3,resource:{buffer:_circBinRYB}},
+    {binding:4,resource:{buffer:_circBinRZB}},{binding:5,resource:{buffer:_circBinCB}},
+    {binding:6,resource:{buffer:_circBandParamsB}},{binding:7,resource:{buffer:_circCutAllUB}}]});
+  _circResolveAllBG=device.createBindGroup({layout:circResolveAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:_circBinRB}},{binding:1,resource:{buffer:_circBinRYB}},
+    {binding:2,resource:{buffer:_circBinRZB}},{binding:3,resource:{buffer:_circBinCB}},
+    {binding:4,resource:{buffer:_circPolyPtsB}},{binding:5,resource:{buffer:_circResolveUB}}]});
+  _circBuildAllBG=device.createBindGroup({layout:circBuildAllPipe.bgl,entries:[
+    {binding:0,resource:{buffer:_circPolyPtsB}},
+    {binding:1,resource:{buffer:_circSharedPosB}},
+    {binding:2,resource:{buffer:_circSharedNormB}},
+    {binding:3,resource:{buffer:_circSharedUVB}},
+    {binding:4,resource:{buffer:_circBuildParamsB}},
+    {binding:5,resource:{buffer:_circBuildAllUB}}]});
+
+  // .?(adjacency, idx, norms .?same as before) .?
+
+  // High-res adjacency for normals
+  const adjLists=new Array(highResCount);for(let i=0;i<highResCount;i++)adjLists[i]=[];
+  for(let t=0;t<highResIdxArr.length;t+=3){const a=highResIdxArr[t],b=highResIdxArr[t+1],c=highResIdxArr[t+2];adjLists[a].push(t/3);adjLists[b].push(t/3);adjLists[c].push(t/3);}
+  const adjOffsets=new Uint32Array(highResCount+1);let totalAdj=0;
+  for(let i=0;i<highResCount;i++){adjOffsets[i]=totalAdj;totalAdj+=adjLists[i].length;}
+  adjOffsets[highResCount]=totalAdj;const adjData=new Uint32Array(totalAdj);let cursor=0;
+  for(let i=0;i<highResCount;i++)for(const t of adjLists[i])adjData[cursor++]=t;
+
+  highResIdxB=mkBuf(highResIdxArr.length*4,GPUBufferUsage.INDEX|GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'hrIdx');
+  queue.writeBuffer(highResIdxB,0,highResIdxArr);
+  // Load-time upload
+  nearestProxyB=mkBuf(highResCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'nearestProxy');
+  queue.writeBuffer(nearestProxyB,0,nearestProxyIdx);
+  HR_TRI_COUNT=Math.floor(highResIdxArr.length/3);
+  highResUVB=null;
+  if(pineappleMesh&&pineappleMesh.geometry.attributes.uv){
+    highResUVB=mkBuf(highResCount*2*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'hrUV');
+    queue.writeBuffer(highResUVB,0,pineappleMesh.geometry.attributes.uv.array);
+  }
+
+  // ── Boom GPU buffers ──
+  const BM_KC=16; // max hero chunks (allocated once, count controlled at runtime)
+  const BM_TC=HR_TRI_COUNT;
+  boomProxyCidB=mkBuf(proxyVertexCount*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmPxCid');
+  boomSxB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bmSx');
+  boomSyB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bmSy');
+  boomSzB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bmSz');
+  boomStB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bmSt');
+  boomCtB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bmCt');
+  boomChunkOutB=mkBuf(BM_KC*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmChunkOut');
+  boomSeedsB=mkBuf(BM_KC*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bmSeeds');
+  boomUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bmU');
+  boomTriCidB=mkBuf(BM_TC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmTriCid');
+  boomTriCountB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmTriCount');
+  boomCursorB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'bmCursor');
+  boomChunkVtxOffB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'bmVtxOff');
+  const MAX_FRAG_VERTS=BM_TC*3;
+  boomFragPosB=mkBuf(MAX_FRAG_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmFragPos');
+  boomFragNormB=mkBuf(MAX_FRAG_VERTS*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmFragNorm');
+  boomFragVtxCntB=mkBuf(BM_KC*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmFragVc');
+  boomFragPosSB=mkBuf(BM_KC*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmFPos');
+  boomFragVelB=mkBuf(BM_KC*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmFVel');
+  boomFragAngB=mkBuf(BM_KC*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,'bmFAng');
+  boomPhysUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bmPhysU');
+  boomChunkStgB=mkBuf(BM_KC*4*4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'bmChStg');
+  boomFragStgB=mkBuf(Math.max(MAX_FRAG_VERTS*3*4,BM_KC*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'bmFrStg');
+  highResAdjOffB=mkBuf(adjOffsets.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'hrAdjOff');
+  highResAdjDataB=mkBuf(adjData.length*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST,'hrAdjData');
+  queue.writeBuffer(highResAdjOffB,0,adjOffsets);queue.writeBuffer(highResAdjDataB,0,adjData);
+  highResNormB=mkBuf(highResCount*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrNorm');
+  highResNorm3B=mkBuf(highResCount*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'hrNorm3');
+
+  // Uniform buffers
+  shapeUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'shapeU');
+  volAccUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volAccU');
+  volApUB=mkBuf(16,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'volApU');
+  voxelScatterUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxScatterU');
+  voxelNormUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxNormU');
+  voxelApplyUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'voxApplyU');
+  // Band uniform: 8 bytes (vc+bc), shared by reduceAll and applyRadius
+  bandReduceAllUB=mkBuf(8,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'bandReduceAllU');
+  const normUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'normU');
+  queue.writeBuffer(normUB,0,new Uint32Array([highResCount]));
+  const unpackUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'unpackU');
+  queue.writeBuffer(unpackUB,0,new Uint32Array([highResCount]));
+  const proxyUnpackUB=mkBuf(4,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'proxyUnpackU');
+  queue.writeBuffer(proxyUnpackUB,0,new Uint32Array([proxyVertexCount]));
+
+  _circGreenB=mkBuf(MAX_CIRC_BANDS*64*16,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'circGreen');
+  // Staging
+  staging=mkBuf(Math.max(4,proxyVertexCount*4*4),GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'staging');
+  volStaging=mkBuf(4,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'volStaging');
+
+  // ── Bind groups ──
+  // Shape (A→B and B→A)
+  const mkBG2=(bgl,fAB,fBA)=>({AB:device.createBindGroup({layout:bgl,entries:fAB(posA,posB)}),BA:device.createBindGroup({layout:bgl,entries:fBA(posA,posB)})});
+  const sh=mkBG2(shapePipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:shapeUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:restB}},{binding:3,resource:{buffer:shapeUB}}]);
+  shapeBG_AB=sh.AB;shapeBG_BA=sh.BA;
+
+  const vap=mkBG2(volApPipe.bgl,(A,B)=>[{binding:0,resource:{buffer:A}},{binding:1,resource:{buffer:B}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}],(A,B)=>[{binding:0,resource:{buffer:B}},{binding:1,resource:{buffer:A}},{binding:2,resource:{buffer:volTotalB}},{binding:3,resource:{buffer:volApUB}}]);
+  volApBG_AB=vap.AB;volApBG_BA=vap.BA;
+
+  volAccBG_A=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+  volAccBG_B=device.createBindGroup({layout:volAccPipe.bgl,entries:[{binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:idxB}},{binding:2,resource:{buffer:volB}},{binding:3,resource:{buffer:volAccUB}}]});
+
+  // Voxel scatter BG (one for posA, one for posB)
+  voxelScatterBG=device.createBindGroup({layout:voxelScatterPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:restB}},{binding:2,resource:{buffer:voxDxBuf}},{binding:3,resource:{buffer:voxDyBuf}},{binding:4,resource:{buffer:voxDzBuf}},{binding:5,resource:{buffer:voxWBuf}},{binding:6,resource:{buffer:voxelScatterUB}}]});
+  // Voxel normalize BG
+  voxelNormBG=device.createBindGroup({layout:voxelNormPipe.bgl,entries:[
+    {binding:0,resource:{buffer:voxDxBuf}},{binding:1,resource:{buffer:voxDyBuf}},{binding:2,resource:{buffer:voxDzBuf}},{binding:3,resource:{buffer:voxWBuf}},{binding:4,resource:{buffer:voxOutBuf}},{binding:5,resource:{buffer:voxelNormUB}}]});
+  // Voxel apply BG
+  voxelApplyBG=device.createBindGroup({layout:voxelApplyPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResRestB}},{binding:1,resource:{buffer:voxOutBuf}},{binding:2,resource:{buffer:highResOutB}},{binding:3,resource:{buffer:voxelApplyUB}}]});
+
+  // Band applyRadius .?AB / BA ping-pong (5 bindings: src, dst, params, radii, uniform)
+  bandApplyRadiusBG_AB=device.createBindGroup({layout:bandApplyRadiusPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:posB}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandRestRadiiB}},{binding:4,resource:{buffer:bandReduceAllUB}}]});
+  bandApplyRadiusBG_BA=device.createBindGroup({layout:bandApplyRadiusPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:posA}},{binding:2,resource:{buffer:bandParamsB}},{binding:3,resource:{buffer:bandRestRadiiB}},{binding:4,resource:{buffer:bandReduceAllUB}}]});
+
+  // ═══ Boom bind groups ═══
+  // Voronoi (AB=reads posA, BA=reads posB)
+  const _mkVorBG=(src)=>{return device.createBindGroup({layout:boomVorPipe.bgl,entries:[
+    {binding:0,resource:{buffer:src}},{binding:1,resource:{buffer:restB}},{binding:2,resource:{buffer:boomSeedsB}},
+    {binding:3,resource:{buffer:boomProxyCidB}},{binding:4,resource:{buffer:boomSxB}},{binding:5,resource:{buffer:boomSyB}},
+    {binding:6,resource:{buffer:boomSzB}},{binding:7,resource:{buffer:boomStB}},{binding:8,resource:{buffer:boomCtB}},
+    {binding:9,resource:{buffer:boomUB}}]});};
+  boomVorBG_AB=_mkVorBG(posA); boomVorBG_BA=_mkVorBG(posB);
+  boomVorNormBG=device.createBindGroup({layout:boomVorNormPipe.bgl,entries:[
+    {binding:0,resource:{buffer:boomSxB}},{binding:1,resource:{buffer:boomSyB}},{binding:2,resource:{buffer:boomSzB}},
+    {binding:3,resource:{buffer:boomStB}},{binding:4,resource:{buffer:boomCtB}},{binding:5,resource:{buffer:boomChunkOutB}},
+    {binding:6,resource:{buffer:boomUB}}]});
+  // Triangle assign
+  boomTriAssignBG=device.createBindGroup({layout:boomTriAssignPipe.bgl,entries:[
+    {binding:0,resource:{buffer:boomProxyCidB}},{binding:1,resource:{buffer:nearestProxyB}},
+    {binding:2,resource:{buffer:highResIdxB}},{binding:3,resource:{buffer:boomTriCidB}},
+    {binding:4,resource:{buffer:boomUB}}]});
+  // Emit
+  boomEmitBG=device.createBindGroup({layout:boomEmitPipe.bgl,entries:[
+    {binding:0,resource:{buffer:boomTriCidB}},{binding:1,resource:{buffer:highResIdxB}},
+    {binding:2,resource:{buffer:highResOutB}},{binding:3,resource:{buffer:highResNormB}},
+    {binding:4,resource:{buffer:boomChunkVtxOffB}},{binding:5,resource:{buffer:boomCursorB}},
+    {binding:6,resource:{buffer:boomFragPosB}},{binding:7,resource:{buffer:boomFragNormB}},
+    {binding:8,resource:{buffer:boomUB}}]});
+  // Physics
+  boomPhysBG=device.createBindGroup({layout:boomPhysPipe.bgl,entries:[
+    {binding:0,resource:{buffer:boomFragPosSB}},{binding:1,resource:{buffer:boomFragVelB}},
+    {binding:2,resource:{buffer:boomFragAngB}},{binding:3,resource:{buffer:boomPhysUB}}]});
+
+  // High-res normal compute BG
+  hrNormBG=device.createBindGroup({layout:normPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResOutB}},{binding:1,resource:{buffer:highResIdxB}},{binding:2,resource:{buffer:highResAdjOffB}},{binding:3,resource:{buffer:highResAdjDataB}},{binding:4,resource:{buffer:highResNormB}},{binding:5,resource:{buffer:normUB}}]});
+  hrNormUnpackBG=device.createBindGroup({layout:normUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResNormB}},{binding:1,resource:{buffer:highResNorm3B}},{binding:2,resource:{buffer:normUB}}]});
+
+  // High-res position unpack
+  highResUnpackBG=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:highResOutB}},{binding:1,resource:{buffer:highResOut3B}},{binding:2,resource:{buffer:unpackUB}}]});
+
+  // Proxy position unpack (for wireframe)
+  proxyPos3B=mkBuf(proxyVertexCount*3*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'proxyPos3');
+  proxyUnpackBG_A=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},{binding:1,resource:{buffer:proxyPos3B}},{binding:2,resource:{buffer:proxyUnpackUB}}]});
+  proxyUnpackBG_B=device.createBindGroup({layout:posUnpackPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},{binding:1,resource:{buffer:proxyPos3B}},{binding:2,resource:{buffer:proxyUnpackUB}}]});
+
+  // 🌊 呼吸动画 uniform + bind group
+  breathUB=mkBuf(32,GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,'breathU');
+  // 初始写入一次
+  { updateBreathUniform(); }
+  breathBG=device.createBindGroup({layout:breathPipe.bgl,entries:[
+    {binding:0,resource:{buffer:restB}},
+    {binding:1,resource:{buffer:posA}},
+    {binding:2,resource:{buffer:breathUB}},
+  ]});
+  // 🌊 呼吸叠加版 — breathTmpB 作为中间缓冲
+  breathTmpB=mkBuf(proxyVertexCount*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'breathTmp');
+  breathAddBG_A=device.createBindGroup({layout:breathAddPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posA}},
+    {binding:1,resource:{buffer:breathTmpB}},
+    {binding:2,resource:{buffer:breathUB}},
+  ]});
+  breathAddBG_B=device.createBindGroup({layout:breathAddPipe.bgl,entries:[
+    {binding:0,resource:{buffer:posB}},
+    {binding:1,resource:{buffer:breathTmpB}},
+    {binding:2,resource:{buffer:breathUB}},
+  ]});
+  // 🌊 收敛快照缓冲区 — 呼吸叠加的稳定基准，永不覆盖
+  convergedB=mkBuf(proxyVertexCount*4*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC,'converged');
+  breathAddBG_C=device.createBindGroup({layout:breathAddPipe.bgl,entries:[
+    {binding:0,resource:{buffer:convergedB}},
+    {binding:1,resource:{buffer:breathTmpB}},
+    {binding:2,resource:{buffer:breathUB}},
+  ]});
+
+  console.log('GPU pipeline ready. 代理:',proxyVertexCount.toLocaleString(),'顶点 高模:',highResCount.toLocaleString(),'顶点');
+  // 🔍 Check shader compilation
+  for(const [name,shader] of [['bandReduceAll',bandReduceAllCS],['bandApplyRadius',bandApplyRadiusCS]]){
+    const info=await shader.getCompilationInfo();
+    for(const m of info.messages){console.log('⚠️ '+name+' shader:',m.type,m.lineNum+':'+m.linePos,m.message);}
+  }
+  // 🔍 MINIMAL TEST: dispatch a write-only shader to verify dispatch works at all
+  {const testShader=device.createShaderModule({label:'test',code:`@group(0)@binding(0)var<storage,read_write>o:array<vec4<f32>>;@compute@workgroup_size(1)fn main(@builtin(global_invocation_id)gid:vec3<u32>){o[0]=vec4(1.0,2.0,3.0,4.0);}`});
+  const testBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage'}}]});
+  const testPL=device.createPipelineLayout({bindGroupLayouts:[testBGL]});
+  const testPipe=device.createComputePipeline({layout:testPL,compute:{module:testShader,entryPoint:'main'}});
+  const testBG=device.createBindGroup({layout:testBGL,entries:[{binding:0,resource:{buffer:posA}}]});
+  const testCmd=device.createCommandEncoder();const tcp=testCmd.beginComputePass();
+  tcp.setPipeline(testPipe);tcp.setBindGroup(0,testBG);tcp.dispatchWorkgroups(1,1,1);
+  tcp.end();device.queue.submit([testCmd.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  const testStg=mkBuf(16,GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,'testStg');
+  const rdCmd=device.createCommandEncoder();rdCmd.copyBufferToBuffer(posA,0,testStg,0,16);device.queue.submit([rdCmd.finish()]);
+  await testStg.mapAsync(GPUMapMode.READ);
+  const tv=new Float32Array(testStg.getMappedRange(0,16));
+  console.log('🔍 MINIMAL TEST: posA[0] after write = ('+tv[0].toFixed(1)+','+tv[1].toFixed(1)+','+tv[2].toFixed(1)+','+tv[3].toFixed(1)+') expect=(1.0,2.0,3.0,4.0)');
+  testStg.unmap();testStg.destroy();
+  queue.writeBuffer(posA,0,pos4);
+  }
+  
+  // Create shared ribbon mesh (all bands in ONE draw call, 0 copyBufferToBuffer)
+  _circSharedMesh=createCircSharedMesh();
+}
+
+// ── Shared circular tube mesh ──
+function createCircSharedMesh(){
+  const geo=new THREE.BufferGeometry();
+  const posArr=new Float32Array(MAX_TUBE_VERTS*3),normArr=new Float32Array(MAX_TUBE_VERTS*3),uvArr=new Float32Array(MAX_TUBE_VERTS*2);
+  const posAttr=new THREE.Float32BufferAttribute(posArr,3),normAttr=new THREE.Float32BufferAttribute(normArr,3),uvAttr=new THREE.Float32BufferAttribute(uvArr,2);
+  const FC=MAX_CIRC_BANDS*MAX_TUBE_VERTS;
+  for(const a of[posAttr,normAttr])Object.defineProperty(a,'count',{get(){return FC;},configurable:true});
+  for(const a of[uvAttr])Object.defineProperty(a,'count',{get(){return FC;},configurable:true});
+  posAttr.needsUpdate=true;normAttr.needsUpdate=true;uvAttr.needsUpdate=true;
+  geo.setAttribute('position',posAttr);geo.setAttribute('normal',normAttr);geo.setAttribute('uv',uvAttr);geo.setDrawRange(0,0);
+  const mat=new THREE.MeshStandardMaterial({color:'#d4a017',roughness:0.45,metalness:0.0,side:THREE.DoubleSide,depthTest:true,depthWrite:true,polygonOffset:true,polygonOffsetFactor:1.0,polygonOffsetUnits:1.0});
+  const mesh=new THREE.Mesh(geo,mat);mesh.renderOrder=2;mesh.frustumCulled=false;mesh.visible=false;
+  geo.boundingSphere=new THREE.Sphere(new THREE.Vector3(0,0,0),100);geo.boundingBox=new THREE.Box3(new THREE.Vector3(-100,-100,-100),new THREE.Vector3(100,100,100));
+  pineappleGroup.add(mesh);
+  const an=['position','normal','uv'],sb=[_circSharedPosB,_circSharedNormB,_circSharedUVB];
+  for(let i=0;i<an.length;i++){const a=geo.attributes[an[i]];renderer.backend.createAttribute(a);const be=renderer.backend.get(a);if(be)be.buffer=sb[i];a.needsUpdate=false;}
+  return mesh;
+}
+
+// ══════.?GPU PBD: write band params to GPU buffer ══════.?
+function writeBandParams(){
+  if(!bandParamsB)return;
+  const STRIDE=13; // ox,oy,oz,nx,ny,nz,L₀,stiff,inf,preScale,rest_cx,rest_cy,rest_cz
+  const data=new Float32Array(MAX_CIRC_BANDS*STRIDE);
+  for(let b=0;b<circularBands.length;b++){
+    const bn=circularBands[b];const off=b*STRIDE;
+    data[off]=bn.planeOrigin[0];data[off+1]=bn.planeOrigin[1];data[off+2]=bn.planeOrigin[2];
+    data[off+3]=bn.planeNormal[0];data[off+4]=bn.planeNormal[1];data[off+5]=bn.planeNormal[2];
+    data[off+6]=bn.restCircum;data[off+7]=bn.stiffness;data[off+8]=bn.influRadius;
+    data[off+9]=bn.preScale||1.0;
+    data[off+10]=bn.restCentroid?bn.restCentroid[0]:0;
+    data[off+11]=bn.restCentroid?bn.restCentroid[1]:0;
+    data[off+12]=bn.restCentroid?bn.restCentroid[2]:0;
+  }
+  queue.writeBuffer(bandParamsB,0,data);
+}
+
+// Read back proxy positions from GPU for band visualization (CPU polyline)
+async function readbackProxyPositions(srcBuf){
+  const size=proxyVertexCount*4*4;
+  const cmd=device.createCommandEncoder();
+  cmd.copyBufferToBuffer(srcBuf,0,staging,0,size);
+  device.queue.submit([cmd.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const arr=new Float32Array(staging.getMappedRange(0,size));
+  for(let i=0;i<proxyVertexCount;i++){
+    proxyCurPositions[i*3]=arr[i*4];
+    proxyCurPositions[i*3+1]=arr[i*4+1];
+    proxyCurPositions[i*3+2]=arr[i*4+2];
+  }
+  staging.unmap();
+}
+
+// Read back current volume from GPU buffer for HUD display
+async function readbackVolume(){
+  if(!volTotalB||!volStaging||!restVolume)return;
+  const cmd=device.createCommandEncoder();
+  cmd.copyBufferToBuffer(volTotalB,0,volStaging,0,4);
+  device.queue.submit([cmd.finish()]);
+  await volStaging.mapAsync(GPUMapMode.READ);
+  const curVol=new Float32Array(volStaging.getMappedRange(0,4))[0];
+  volStaging.unmap();
+  const ratio=restVolume>0?Math.abs(curVol)/restVolume*100:100;
+  lastVol=Math.abs(curVol);
+  H.vratio.textContent=ratio.toFixed(1);
+}
+
+// Update band visuals from CPU proxy positions (exact polyline, PBR ribbon + target line)
+function updateBandVisual(idx){
+  const b=bands[idx],vis=bandVisuals[idx];
+  if(!vis||!b)return;
+  const exact=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,b.planeOrigin,b.planeNormal);
+  if(exact.points3D.length<9){vis.ribbon.visible=false;vis.lineTarget.visible=false;return;}
+  updateBandRibbonMesh(vis.ribbon, b, idx);
+  // Target green line (thin reference, unchanged)
+  if(exact.perimeter>b.restCircum){
+    const s=b.restCircum/exact.perimeter;
+    const cx=exact.centroid[0],cy=exact.centroid[1],cz=exact.centroid[2];
+    const targetPts=[];
+    for(let i=0;i<exact.points3D.length;i+=3){
+      const dx=exact.points3D[i]-cx,dy=exact.points3D[i+1]-cy,dz=exact.points3D[i+2]-cz;
+      targetPts.push(cx+dx*s,cy+dy*s,cz+dz*s);
+    }
+    updateBandLine(vis.lineTarget,targetPts);vis.lineTarget.visible=showTargetLine;
+  }else{vis.lineTarget.visible=false;}
+}
+function updateAllBandVisuals(){
+  for(let b=0;b<circularBands.length;b++)updateBandVisual(b);
+  if(bands.length>0){
+    const lb=bands[bands.length-1];
+    const exact=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,lb.planeOrigin,lb.planeNormal);
+    H.cratio.textContent=exact.perimeter>0?(exact.perimeter/lb.restCircum).toFixed(3):'--';
+    // Diagnostic: log perimeters of all bands
+    if(bands.length>=2&&convergeFrames===CONVERGE_FRAMES-1){
+      console.log('📏 PBD收敛后周?');
+      for(let b=0;b<circularBands.length;b++){
+        const e=getExactCrossSectionPolyline(proxyCurPositions,proxyIdxArr,bands[b].planeOrigin,bands[b].planeNormal);
+        console.log('  band#'+(b+1)+' P='+e.perimeter.toFixed(4)+' L0='+bands[b].restCircum.toFixed(4)+' ratio='+(e.perimeter/bands[b].restCircum).toFixed(4)+(e.perimeter<bands[b].restCircum?' BROKEN':' OK'));
+      }
+    }
+  }else{H.cratio.textContent='--';}
+}
+
+// ══════.?GPU PBD + post pipeline ══════.?
+let _zeroTriP=null,_zeroRedLv=null;
+// Pre-alloc reusable buffers to avoid per-iteration GC
+let _shapeU=new ArrayBuffer(8);
+let _zeroMaxBins=null;              // MAX_CIRC_BANDS*64 zeros, allocated once
+let _volU16=new ArrayBuffer(16);    // volume apply uniform
+let _voxU32=new ArrayBuffer(32);    // voxel scatter uniform
+let _zeroVox=null;                  // VOX_TOTAL zeros, allocated once
+let _zeroVolU=null,_zeroVolF=null;  // Pre-alloc for per-iteration vol writes
+let _bandSmallU8=null;              // Pre-alloc for band uniform 8 bytes
+async function runGPUPBD(){
+  const bc=circularBands.length;
+  if(!bandParamsB)return;
+  if(bc>0)console.log('⏱️ PBD enter bc='+bc);
+
+  // Upload ALL band params at their proper offsets (done once per frame)
+  writeBandParams();
+
+  // Lazy-alloc zero arrays
+  if(!_zeroTriP||_zeroTriP.length<proxyTriCount){_zeroTriP=new Float32Array(proxyTriCount);}
+  if(!_zeroRedLv){_zeroRedLv=volRedLevels.filter(lv=>lv.dstBuf!==volTotalB).map(lv=>new Float32Array(lv.wgCount));}
+  if(!_zeroMaxBins||_zeroMaxBins.length<MAX_CIRC_BANDS*64){_zeroMaxBins=new Uint32Array(MAX_CIRC_BANDS*64);}
+  if(!_zeroVox||_zeroVox.length<VOX_TOTAL){_zeroVox=new Uint32Array(VOX_TOTAL);}
+  if(!_zeroVolU||_zeroVolU.length<1){_zeroVolU=new Uint32Array(1);}
+  if(!_zeroVolF||_zeroVolF.length<1){_zeroVolF=new Float32Array(1);}
+
+  // Pre-fill reusable uniform buffers (values that don't change per iteration)
+  new Float32Array(_shapeU)[1]=0;
+  new Uint32Array(_shapeU,4)[0]=proxyVertexCount;
+  new Uint32Array(_volU16)[0]=proxyVertexCount;
+  new Float32Array(_volU16,4)[0]=restVolume;
+  new Float32Array(_volU16,8)[0]=VOL_STIFF;
+  new Float32Array(_volU16,12)[0]=restSurfaceArea;
+  new Uint32Array(_voxU32)[1]=64;
+  new Float32Array(_voxU32,8)[0]=voxBMin[0];
+  new Float32Array(_voxU32,12)[0]=voxBMin[1];
+  new Float32Array(_voxU32,16)[0]=voxBMin[2];
+  new Float32Array(_voxU32,20)[0]=voxGS[0];
+  new Float32Array(_voxU32,24)[0]=voxGS[1];
+  new Float32Array(_voxU32,28)[0]=voxGS[2];
+
+  // Pre-clear volB + voxel buffers (once per frame)
+  queue.writeBuffer(volB,0,_zeroTriP);
+  queue.writeBuffer(voxDxBuf,0,_zeroVox);
+  queue.writeBuffer(voxDyBuf,0,_zeroVox);
+  queue.writeBuffer(voxDzBuf,0,_zeroVox);
+  queue.writeBuffer(voxWBuf,0,_zeroVox);
+
+  // Pre-write band uniform (vc+bc, for applyRadius)
+  if(!_bandSmallU8){_bandSmallU8=new Uint32Array(2);}
+  _bandSmallU8[0]=proxyVertexCount;_bandSmallU8[1]=bc;
+  queue.writeBuffer(bandReduceAllUB,0,_bandSmallU8);
+
+  let srcPos=posA,dstPos=posB;
+  const lastIter=PBD_ITER-1;
+  for(let iter=0;iter<PBD_ITER;iter++){
+    const isA=srcPos===posA,isLast=iter===lastIter;
+
+    new Float32Array(_shapeU)[0]=SHAPE_STIFF;
+    queue.writeBuffer(shapeUB,0,_shapeU);
+
+    _zeroVolU[0]=proxyTriCount;
+    queue.writeBuffer(volAccUB,0,_zeroVolU);
+    queue.writeBuffer(volTotalB,0,_zeroVolF);
+    for(let li=0;li<volRedLevels.length;li++){
+      const lv=volRedLevels[li];if(lv.dstBuf!==volTotalB)queue.writeBuffer(lv.dstBuf,0,_zeroRedLv[li]);
+    }
+    new Float32Array(_volU16,8)[0]=VOL_STIFF;
+    queue.writeBuffer(volApUB,0,_volU16);
+
+    if(isLast){
+      new Uint32Array(_voxU32)[0]=proxyVertexCount;
+      queue.writeBuffer(voxelScatterUB,0,_voxU32);
+    }
+
+    const cmd=device.createCommandEncoder();
+    // Shape pass
+    {const cp=cmd.beginComputePass();
+    cp.setPipeline(shapePipe.pipe);
+    cp.setBindGroup(0,isA?shapeBG_AB:shapeBG_BA);
+    cp.dispatchWorkgroups(WG,1,1);
+    cp.end();}
+    [srcPos,dstPos]=[dstPos,srcPos];
+
+    // Band pass
+    if(bc>0){
+      const cp=cmd.beginComputePass();
+      const isAB=srcPos===posA;
+      cp.setPipeline(bandApplyRadiusPipe.pipe);
+      cp.setBindGroup(0,isAB?bandApplyRadiusBG_AB:bandApplyRadiusBG_BA);
+      cp.dispatchWorkgroups(WG,1,1);
+      [srcPos,dstPos]=[dstPos,srcPos];
+      cp.end();
+    }
+
+    // Volume pass
+    {const isAV=srcPos===posA;
+    const cp=cmd.beginComputePass();
+    cp.setPipeline(volAccPipe.pipe);
+    cp.setBindGroup(0,isAV?volAccBG_A:volAccBG_B);
+    cp.dispatchWorkgroups(VWG,1,1);
+    for(const lv of volRedLevels){
+      cp.setPipeline(volReducePipe.pipe);
+      cp.setBindGroup(0,lv.bg);
+      cp.dispatchWorkgroups(lv.wgCount,1,1);
+    }
+    cp.setPipeline(volApPipe.pipe);
+    cp.setBindGroup(0,isAV?volApBG_AB:volApBG_BA);
+    cp.dispatchWorkgroups(WG,1,1);
+    if(isLast){
+      cp.setPipeline(voxelScatterPipe.pipe);
+      cp.setBindGroup(0,voxelScatterBG);
+      cp.dispatchWorkgroups(WG,1,1);
+    }
+    cp.end();}
+
+    device.queue.submit([cmd.finish()]);
+    [srcPos,dstPos]=[dstPos,srcPos];
+  }
+  const finalSrc=srcPos;
+  return finalSrc;
+}
+
+// ══════ Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ══════
+
+// ══════.?Post-PBD: apply ratio to high-res, normals, GPU→GPU copy ══════.?
+async function runGPUPostPBD(srcBuf){
+  // Normalize voxel grid
+  queue.writeBuffer(voxelNormUB,0,new Uint32Array([64]));
+  const cmd0=device.createCommandEncoder();const cp0=cmd0.beginComputePass();
+  cp0.setPipeline(voxelNormPipe.pipe);cp0.setBindGroup(0,voxelNormBG);cp0.dispatchWorkgroups(Math.ceil(VOX_TOTAL/256),1,1);
+  cp0.end();device.queue.submit([cmd0.finish()]);
+
+  const vu=new ArrayBuffer(32);
+  new Uint32Array(vu)[0]=highResCount;new Uint32Array(vu)[1]=64;
+  new Float32Array(vu,8)[0]=voxBMin[0];new Float32Array(vu,12)[0]=voxBMin[1];new Float32Array(vu,16)[0]=voxBMin[2];
+  new Float32Array(vu,20)[0]=voxGS[0];new Float32Array(vu,24)[0]=voxGS[1];new Float32Array(vu,28)[0]=voxGS[2];
+  queue.writeBuffer(voxelApplyUB,0,vu);
+  const cmd=device.createCommandEncoder();const cp=cmd.beginComputePass();
+  cp.setPipeline(voxelApplyPipe.pipe);cp.setBindGroup(0,voxelApplyBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,highResUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.setPipeline(normPipe.pipe);cp.setBindGroup(0,hrNormBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  cp.setPipeline(normUnpackPipe.pipe);cp.setBindGroup(0,hrNormUnpackBG);cp.dispatchWorkgroups(Math.ceil(highResCount/256),1,1);
+  // Unpack proxy positions for wireframe .?use correct buffer
+  cp.setPipeline(posUnpackPipe.pipe);cp.setBindGroup(0,srcBuf===posA?proxyUnpackBG_A:proxyUnpackBG_B);cp.dispatchWorkgroups(WG,1,1);
+  cp.end();device.queue.submit([cmd.finish()]);
+
+  // GPU→GPU copy to Three.js buffers
+  if(pineappleMesh){
+    const posAttr=pineappleMesh.geometry.attributes.position;
+    const normAttr=pineappleMesh.geometry.attributes.normal;
+    const posData=renderer.backend.get(posAttr);
+    const normData=renderer.backend.get(normAttr);
+    if(posData&&posData.buffer&&normData&&normData.buffer){
+      const cmd2=device.createCommandEncoder();
+      cmd2.copyBufferToBuffer(highResOut3B,0,posData.buffer,0,highResCount*3*4);
+      cmd2.copyBufferToBuffer(highResNorm3B,0,normData.buffer,0,highResCount*3*4);
+      device.queue.submit([cmd2.finish()]);
+    }
+  }
+
+  // Copy proxy positions to wireframe
+  if(proxyWireMesh&&proxyWireMesh.visible){
+    const proxyAttr=proxyWireMesh.geometry.attributes.position;
+    const proxyData=renderer.backend.get(proxyAttr);
+    if(proxyData&&proxyData.buffer){
+      const cmd3=device.createCommandEncoder();
+      cmd3.copyBufferToBuffer(proxyPos3B,0,proxyData.buffer,0,proxyVertexCount*3*4);
+      device.queue.submit([cmd3.finish()]);
+    }
+  }
+}
+
+// ══════ GPU Band Visualization ══════
+async function runGPUBandVis(finalSrc){
+  if(!bandOffLoB){H.bandtime.textContent='0 ms';return 0;}
+  const bc=bands.length;
+  if(bc===0){H.bandtime.textContent='0 ms';return 0;}
+  const t0=performance.now();
+  const srcPos=(finalSrc===posA)?posA:posB;
+  if(!_stackU8){_stackU8=new Uint32Array(new ArrayBuffer(32));}
+  if(!_stackF32){_stackF32=new Float32Array(_stackU8.buffer);}
+  if(!_cutU8){_cutU8=new Uint32Array(new ArrayBuffer(32));}
+  if(!_cutF32){_cutF32=new Float32Array(_cutU8.buffer);}
+  if(!_buildU8){_buildU8=new Uint32Array(new ArrayBuffer(32));}
+  if(!_buildF32){_buildF32=new Float32Array(_buildU8.buffer);}
+  if(!_zeroBins){_zeroBins=new Uint32Array(4*64);}
+
+  const hw=RIBBON_HALF_WIDTH, surfOff=RIBBON_SURFACE_OFFSET, thick=RIBBON_THICKNESS;
+  const comp=BAND_COMPRESSION_PER_LAYER;
+  const ringSegs=192, widthSegs=RIBBON_WIDTH_SEGMENTS, totalVerts=ringSegs*(widthSegs*12+12);
+
+  // Compute centroid from rest positions (stable, computed once during model load)
+  let cx=0,cy=0,cz=0;
+  for(let i=0;i<proxyVertexCount;i++){cx+=proxyRestPositions[i*3];cy+=proxyRestPositions[i*3+1];cz+=proxyRestPositions[i*3+2];}
+  cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+
+  // Pre-set uniform fields that don't change per band
+  _cutU8[1]=proxyVertexCount; _cutU8[2]=proxyTriCount;
+  _cutF32[3]=hw; _cutF32[4]=cx; _cutF32[5]=cy; _cutF32[6]=cz;
+  _buildU8[1]=ringSegs; _buildU8[2]=widthSegs;
+  _buildF32[3]=cx; _buildF32[4]=cy; _buildF32[5]=cz;
+  _resU32=_resU32||new Uint32Array(new ArrayBuffer(8));
+
+  // Per-band GPU pipeline (stack→cut→resolve→build)
+  for(let b=0;b<bc;b++){
+    if(!bands[b]||!bandVisuals[b])continue;
+    
+    const enc=device.createCommandEncoder();
+    
+    // Stack (O(vc*bc) — prefix-sum algorithm)
+    _stackU8[0]=b; _stackU8[1]=proxyVertexCount; _stackU8[2]=bc;
+    _stackF32[3]=hw; _stackF32[4]=surfOff; _stackF32[5]=thick; _stackF32[6]=comp;
+    queue.writeBuffer(bandStackUB,0,_stackU8);
+    const stackBG=device.createBindGroup({layout:bandStackPipe.bgl,entries:[
+      {binding:0,resource:{buffer:srcPos}},{binding:1,resource:{buffer:bandParamsB}},
+      {binding:2,resource:{buffer:bandOffLoB}},{binding:3,resource:{buffer:bandOffHiB}},
+      {binding:4,resource:{buffer:bandStackUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandStackPipe.pipe);cp.setBindGroup(0,stackBG);cp.dispatchWorkgroups(WG,1,1);cp.end();}
+    
+    // Clear bins + Cut
+    queue.writeBuffer(bandBinRB,0,_zeroBins);
+    queue.writeBuffer(bandBinRYB,0,_zeroBins);
+    queue.writeBuffer(bandBinRZB,0,_zeroBins);
+    queue.writeBuffer(bandBinCB,0,_zeroBins);
+    _cutU8[0]=b; queue.writeBuffer(bandCutUB,0,_cutU8);
+    const cutBG=device.createBindGroup({layout:bandCutBinsPipe.bgl,entries:[
+      {binding:0,resource:{buffer:srcPos}},{binding:1,resource:{buffer:idxB}},
+      {binding:2,resource:{buffer:bandOffLoB}},{binding:3,resource:{buffer:bandOffHiB}},
+      {binding:4,resource:{buffer:bandParamsB}},{binding:5,resource:{buffer:bandBinRB}},
+      {binding:6,resource:{buffer:bandBinRYB}},{binding:7,resource:{buffer:bandBinRZB}},
+      {binding:8,resource:{buffer:bandBinCB}},{binding:9,resource:{buffer:bandCutUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandCutBinsPipe.pipe);cp.setBindGroup(0,cutBG);cp.dispatchWorkgroups(VWG,1,1);cp.end();}
+    
+    // Resolve
+    _resU32[0]=b; _resU32[1]=ringSegs; queue.writeBuffer(bandResolveUB,0,_resU32);
+    const resolveBG=device.createBindGroup({layout:bandResolvePipe.bgl,entries:[
+      {binding:0,resource:{buffer:bandBinRB}},{binding:1,resource:{buffer:bandBinRYB}},
+      {binding:2,resource:{buffer:bandBinRZB}},{binding:3,resource:{buffer:bandBinCB}},
+      {binding:4,resource:{buffer:bandPolyPtsB}},{binding:5,resource:{buffer:bandResolveUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandResolvePipe.pipe);cp.setBindGroup(0,resolveBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
+    
+    // Build — write directly to shared buffers at band offset (0 copy!)
+    _buildU8[0]=b; queue.writeBuffer(bandBuildUB,0,_buildU8);
+    const bandVtxOff=b*totalVerts; // must match drawRange stride
+    const buildBG=device.createBindGroup({layout:bandBuildMeshPipe.bgl,entries:[
+      {binding:0,resource:{buffer:bandPolyPtsB}},{binding:1,resource:{buffer:bandParamsB}},
+      {binding:2,resource:{buffer:_sharedPosB,offset:bandVtxOff*3*4,size:totalVerts*3*4}},
+      {binding:3,resource:{buffer:_sharedNormB,offset:bandVtxOff*3*4,size:totalVerts*3*4}},
+      {binding:4,resource:{buffer:_sharedUVB,offset:bandVtxOff*2*4,size:totalVerts*2*4}},
+      {binding:5,resource:{buffer:_sharedTanB,offset:bandVtxOff*4*4,size:totalVerts*4*4}},
+      {binding:6,resource:{buffer:bandBuildUB}}]});
+    {const cp=enc.beginComputePass();cp.setPipeline(bandBuildMeshPipe.pipe);cp.setBindGroup(0,buildBG);cp.dispatchWorkgroups(1,1,1);cp.end();}
+    
+    // Copy outer-L polyline to green staging for target line
+    enc.copyBufferToBuffer(bandPolyPtsB,0,_greenAllB,b*64*16,64*16);
+    
+    device.queue.submit([enc.finish()]);
+  }
+  
+  // Green target lines: read back outer-L polylines, scale toward centroid
+  if(bc>0&&_greenAllB){
+    await device.queue.onSubmittedWorkDone();
+    await _greenAllB.mapAsync(GPUMapMode.READ);
+    const gd=new Float32Array(_greenAllB.getMappedRange(0,bc*64*16));
+    for(let b=0;b<bc;b++){
+      const vis=bandVisuals[b];if(!vis||!vis.lineTarget)continue;
+      const band=bands[b];if(!band)continue;
+      const base=b*64*4;
+      let nV=0,cxG=0,cyG=0,czG=0;
+      for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;nV++;cxG+=gd[base+i*4];cyG+=gd[base+i*4+1];czG+=gd[base+i*4+2];}
+      if(nV<3){vis.lineTarget.visible=false;continue;}
+      cxG/=nV;cyG/=nV;czG/=nV;
+      let perim=0,fa=-1,pa=-1;
+      for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;if(fa<0)fa=i;if(pa>=0){const dx=gd[base+i*4]-gd[base+pa*4],dy=gd[base+i*4+1]-gd[base+pa*4+1],dz=gd[base+i*4+2]-gd[base+pa*4+2];perim+=Math.sqrt(dx*dx+dy*dy+dz*dz);}pa=i;}
+      if(fa>=0&&pa>=0&&pa!==fa){const dx=gd[base+fa*4]-gd[base+pa*4],dy=gd[base+fa*4+1]-gd[base+pa*4+1],dz=gd[base+fa*4+2]-gd[base+pa*4+2];perim+=Math.sqrt(dx*dx+dy*dy+dz*dz);}
+      const rc=band.restCircum||perim;
+      if(perim>rc&&rc>0){
+        const s=rc/perim,pts=[];
+        for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;pts.push(cxG+(gd[base+i*4]-cxG)*s,cyG+(gd[base+i*4+1]-cyG)*s,czG+(gd[base+i*4+2]-czG)*s);}
+        updateBandLine(vis.lineTarget,pts);vis.lineTarget.visible=showTargetLine;
+      }else{vis.lineTarget.visible=false;}
+    }
+    _greenAllB.unmap();
+  }
+  
+  // Update shared ribbon mesh: one draw call for all bands, 0 copyBufferToBuffer
+  if(_sharedRibbonMesh){
+    if(bc>0){
+      _sharedRibbonMesh.geometry.setDrawRange(0,bc*totalVerts);
+      _sharedRibbonMesh.visible=true;
+    }else{
+      _sharedRibbonMesh.geometry.setDrawRange(0,0);
+      _sharedRibbonMesh.visible=false;
+    }
+  }
+
+  const elapsed=performance.now()-t0;
+  return elapsed;
+}
+let _stackU8=null,_stackF32=null,_cutU8=null,_cutF32=null,_buildU8=null,_buildF32=null,_resU32=null,_zeroBins=null;
+
+// ══════ GPU Circular Band (Tube) Visualization ══════
+let _circCutU8=null,_circCutF32=null,_circBuildU8=null,_circBuildF32=null,_circResU32=null,_circZeroBins=null;
+
+async function runGPUCircularBandVis(){
+  if(!_circBinRB){return 0;}
+  const bc=circularBands.length;
+  if(bc===0){if(_circSharedMesh){_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}return 0;}
+  const t0=performance.now();
+  const ringSegs=TUBE_RING_SEGS,radialSegs=TUBE_RADIAL_SEGS,totalVerts=ringSegs*radialSegs*6;
+  if(!_circBuildU8){_circBuildU8=new Uint32Array(new ArrayBuffer(48));_circBuildF32=new Float32Array(_circBuildU8.buffer);}
+  if(!_circZeroBins){_circZeroBins=new Uint32Array(CIRC_BINS);}
+  let cx=0,cy=0,cz=0;for(let i=0;i<proxyVertexCount;i++){cx+=proxyRestPositions[i*3];cy+=proxyRestPositions[i*3+1];cz+=proxyRestPositions[i*3+2];}
+  cx/=proxyVertexCount;cy/=proxyVertexCount;cz/=proxyVertexCount;
+
+  // 🚀 批量 cut + resolve（2 dispatch 处理全部皮筋）
+  // 1. Write band params to storage buffer
+  const bpData=new Float32Array(bc*7);
+  for(let b=0;b<bc;b++){
+    const band=circularBands[b];const off=b*7;
+    bpData[off]=band.planeOrigin[0];bpData[off+1]=band.planeOrigin[1];bpData[off+2]=band.planeOrigin[2];
+    bpData[off+3]=band.planeNormal[0];bpData[off+4]=band.planeNormal[1];bpData[off+5]=band.planeNormal[2];
+    bpData[off+6]=band.tubeRadius;
+  }
+  queue.writeBuffer(_circBandParamsB,0,bpData);
+  // 2. Clear all bins
+  queue.writeBuffer(_circBinRB,0,_circZeroBins);
+  queue.writeBuffer(_circBinRYB,0,_circZeroBins);
+  queue.writeBuffer(_circBinRZB,0,_circZeroBins);
+  queue.writeBuffer(_circBinCB,0,_circZeroBins);
+  // 3. Cut uniform
+  const cu32=new Uint32Array(new ArrayBuffer(32));
+  cu32[0]=proxyTriCount;cu32[1]=proxyVertexCount;cu32[2]=bc;
+  new Float32Array(cu32.buffer,12)[0]=cx;new Float32Array(cu32.buffer,16)[0]=cy;new Float32Array(cu32.buffer,20)[0]=cz;
+  queue.writeBuffer(_circCutAllUB,0,cu32);
+  // 4. Resolve uniform
+  const ru32=new Uint32Array(new ArrayBuffer(8));
+  ru32[0]=ringSegs;
+  queue.writeBuffer(_circResolveUB,0,ru32);
+  // 5. Dispatch cut + resolve + build in one encoder
+  const enc=device.createCommandEncoder();
+  {const cp=enc.beginComputePass();
+  cp.setPipeline(circCutAllPipe.pipe);cp.setBindGroup(0,_circCutAllBG);
+  cp.dispatchWorkgroups(VWG,1,1);
+  cp.setPipeline(circResolveAllPipe.pipe);cp.setBindGroup(0,_circResolveAllBG);
+  cp.dispatchWorkgroups(bc,1,1);
+  if(bc>0){
+    // Write build per-band params
+    const buildP=new Float32Array(bc*4);
+    for(let b=0;b<bc;b++){
+      const band=circularBands[b];const o=b*4;
+      buildP[o]=band.tubeRadius;buildP[o+1]=band.planeNormal[0];
+      buildP[o+2]=band.planeNormal[1];buildP[o+3]=band.planeNormal[2];
+    }
+    queue.writeBuffer(_circBuildParamsB,0,buildP);
+    const bu32=new Uint32Array(new ArrayBuffer(32));
+    bu32[0]=ringSegs;bu32[1]=radialSegs;
+    new Float32Array(bu32.buffer,8)[0]=cx;new Float32Array(bu32.buffer,12)[0]=cy;new Float32Array(bu32.buffer,16)[0]=cz;
+    queue.writeBuffer(_circBuildAllUB,0,bu32);
+    cp.setPipeline(circBuildAllPipe.pipe);cp.setBindGroup(0,_circBuildAllBG);
+    cp.dispatchWorkgroups(bc,1,1);
+  }
+  cp.end();}
+  // Copy polylines for green target line
+  for(let b=0;b<bc;b++){enc.copyBufferToBuffer(_circPolyPtsB,b*64*16,_circGreenB,b*64*16,64*16);}
+  device.queue.submit([enc.finish()]);
+  if(_circSharedMesh){if(bc>0){_circSharedMesh.geometry.setDrawRange(0,bc*totalVerts);_circSharedMesh.visible=true;}else{_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}}
+  // Green target line: read back center polyline, scale toward centroid
+  if(bc>0&&_circGreenB&&showTargetLine){
+    await device.queue.onSubmittedWorkDone();
+    await _circGreenB.mapAsync(GPUMapMode.READ);
+    const gd=new Float32Array(_circGreenB.getMappedRange(0,bc*64*16));
+    for(let b=0;b<bc;b++){
+      const vis=circBandVisuals[b];if(!vis||!vis.lineTarget)continue;
+      const band=circularBands[b];if(!band)continue;
+      const base=b*64*4;
+      let nV=0,cxG=0,cyG=0,czG=0;
+      for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;nV++;cxG+=gd[base+i*4];cyG+=gd[base+i*4+1];czG+=gd[base+i*4+2];}
+      if(nV<3){vis.lineTarget.visible=false;continue;}
+      cxG/=nV;cyG/=nV;czG/=nV;
+      let perim=0,fa=-1,pa=-1;
+      for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;if(fa<0)fa=i;if(pa>=0){const dx=gd[base+i*4]-gd[base+pa*4],dy=gd[base+i*4+1]-gd[base+pa*4+1],dz=gd[base+i*4+2]-gd[base+pa*4+2];perim+=Math.hypot(dx,dy,dz);}pa=i;}
+      if(fa>=0&&pa>=0&&pa!==fa){const dx=gd[base+fa*4]-gd[base+pa*4],dy=gd[base+fa*4+1]-gd[base+pa*4+1],dz=gd[base+fa*4+2]-gd[base+pa*4+2];perim+=Math.hypot(dx,dy,dz);}
+      const rc=band.restCircum||perim;
+      if(perim>rc&&rc>0){
+        const s=rc/perim,pts=[];
+        for(let i=0;i<64;i++){if(gd[base+i*4+3]<0.5)continue;pts.push(cxG+(gd[base+i*4]-cxG)*s,cyG+(gd[base+i*4+1]-cyG)*s,czG+(gd[base+i*4+2]-czG)*s);}
+        updateBandLine(vis.lineTarget,pts);vis.lineTarget.visible=true;
+      }else{vis.lineTarget.visible=false;}
+    }
+    _circGreenB.unmap();
+  }
+  const elapsed=performance.now()-t0;return elapsed;
+}
+
+
+// ══════.?Interaction ══════.?
+let mdx=0,mdy=0,dragging=false,prevCamYaw=0,prevCamPitch=0;
+let previewLine=null;
+
+function ensurePreviewLine(){
+  if(previewLine)return;
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(2048*3),3));
+  geo.setDrawRange(0,0);
+  const mat=new THREE.LineBasicMaterial({color:'#ffff00',transparent:true,opacity:0.6,depthTest:false,depthWrite:false});
+  previewLine=new THREE.Line(geo,mat);
+  previewLine.renderOrder=2;previewLine.frustumCulled=false;
+  previewLine.visible=false;
+  pineappleGroup.add(previewLine);
+}
+
+function updatePreviewLine(points3D){
+  const nPts=points3D.length/3;
+  if(nPts===0){previewLine.visible=false;return;}
+  previewLine.visible=true;
+  const posAttr=previewLine.geometry.attributes.position;
+  if((nPts+1)*3>posAttr.array.length)return;
+  posAttr.array.set(points3D);
+  posAttr.array[nPts*3]=points3D[0];posAttr.array[nPts*3+1]=points3D[1];posAttr.array[nPts*3+2]=points3D[2];
+  posAttr.needsUpdate=true;
+  previewLine.geometry.setDrawRange(0,nPts+1);
+}
+
+// Raycast against proxy mesh (simple ray-sphere-like intersection using rest positions)
+function raycastProxyMesh(origin,dir){
+  // Use the proxy mesh triangles for precise hit detection
+  let bestT=Infinity,bestPoint=null,bestNormal=null;
+  for(let t=0;t<proxyIdxArr.length;t+=3){
+    const ai=proxyIdxArr[t]*3,bi=proxyIdxArr[t+1]*3,ci=proxyIdxArr[t+2]*3;
+    // Use current positions for raycast
+    const pos=proxyRestPositions;
+    const ax=pos[ai],ay=pos[ai+1],az=pos[ai+2];
+    const bx=pos[bi],by=pos[bi+1],bz=pos[bi+2];
+    const cx=pos[ci],cy=pos[ci+1],cz=pos[ci+2];
+    // Möller-Trumbore
+    const e1x=bx-ax,e1y=by-ay,e1z=bz-az;
+    const e2x=cx-ax,e2y=cy-ay,e2z=cz-az;
+    const hx=dir[1]*e2z-dir[2]*e2y,hy=dir[2]*e2x-dir[0]*e2z,hz=dir[0]*e2y-dir[1]*e2x;
+    const a=e1x*hx+e1y*hy+e1z*hz;
+    if(Math.abs(a)<1e-7)continue;
+    const f=1/a;
+    const sx=origin[0]-ax,sy=origin[1]-ay,sz=origin[2]-az;
+    const u=f*(sx*hx+sy*hy+sz*hz);
+    if(u<0||u>1)continue;
+    const qx=sy*e1z-sz*e1y,qy=sz*e1x-sx*e1z,qz=sx*e1y-sy*e1x;
+    const v=f*(dir[0]*qx+dir[1]*qy+dir[2]*qz);
+    if(v<0||u+v>1)continue;
+    const tt=f*(e2x*qx+e2y*qy+e2z*qz);
+    if(tt>1e-6&&tt<bestT){
+      bestT=tt;
+      bestPoint=[origin[0]+dir[0]*tt,origin[1]+dir[1]*tt,origin[2]+dir[2]*tt];
+      // Triangle normal
+      const nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
+      const nl=Math.sqrt(nx*nx+ny*ny+nz*nz);
+      bestNormal=[nx/nl,ny/nl,nz/nl];
+    }
+  }
+  return bestPoint?{point:bestPoint,normal:bestNormal}:null;
+}
+
+canvas.onmousedown=e=>{
+  mdx=e.clientX;mdy=e.clientY;dragging=true;
+  const p=camera.position;
+  prevCamYaw=Math.atan2(p.x,p.z);
+  prevCamPitch=Math.asin(p.y/p.length());
+};
+window.onmouseup=e=>{
+  if(!dragging||!loaded)return;dragging=false;
+  const dx=e.clientX-mdx,dy=e.clientY-mdy;
+  if(Math.sqrt(dx*dx+dy*dy)>3)return;
+
+  // Build view ray
+  const rect=canvas.getBoundingClientRect();
+  const ndcX=((mdx-rect.left)/rect.width)*2-1,ndcY=-((mdy-rect.top)/rect.height)*2+1;
+  const camPos=camera.position;
+  const asp=canvas.width/canvas.height,f=1/Math.tan(Math.PI*40/360);
+  const dirX=ndcX*asp/f,dirY=ndcY/f,dirZ=-1;
+  // Transform to world space
+  const fx=-camPos.x,fy=-camPos.y,fz=-camPos.z;const fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const fdx=fx/fl,fdy=fy/fl,fdz=fz/fl;
+  const rtx=fdz,rtz=-fdx;const rl=Math.sqrt(rtx*rtx+rtz*rtz);
+  const rnx=rtx/rl,rny=0,rnz=rtz/rl;
+  const ux=fdy*rnz-fdz*rny,uy=fdz*rnx-fdx*rnz,uz=fdx*rny-fdy*rnx;
+  const wx=dirX*rnx+dirY*ux+dirZ*(-fdx),wy=dirX*rny+dirY*uy+dirZ*(-fdy),wz=dirX*rnz+dirY*uz+dirZ*(-fdz);
+  const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
+  const Dx=wx/wl,Dy=wy/wl,Dz=wz/wl;
+
+  const hit=raycastProxyMesh([camPos.x,camPos.y,camPos.z],[Dx,Dy,Dz]);
+  if(hit){
+    addCircularBand(hit.point,[0,1,0]);
+  }
+};
+canvas.onmousemove=e=>{
+  if(dragging){
+    const dx=e.clientX-mdx,dy=e.clientY-mdy;
+    const dist=camera.position.length();
+    const yaw=prevCamYaw-dx*0.005;
+    const pitch=Math.max(-1.4,Math.min(1.4,prevCamPitch+dy*0.005));
+    camera.position.set(dist*Math.cos(pitch)*Math.sin(yaw),dist*Math.sin(pitch),dist*Math.cos(pitch)*Math.cos(yaw));
+    camera.lookAt(0,0,0);
+    return;
+  }
+  if(!loaded)return;
+  ensurePreviewLine();
+  const rect=canvas.getBoundingClientRect();
+  const ndcX=((e.clientX-rect.left)/rect.width)*2-1,ndcY=-((e.clientY-rect.top)/rect.height)*2+1;
+  const camPos=camera.position;
+  const asp=canvas.width/canvas.height,f=1/Math.tan(Math.PI*40/360);
+  const dirX=ndcX*asp/f,dirY=ndcY/f,dirZ=-1;
+  const fx=-camPos.x,fy=-camPos.y,fz=-camPos.z;const fl=Math.sqrt(fx*fx+fy*fy+fz*fz);
+  const fdx=fx/fl,fdy=fy/fl,fdz=fz/fl;
+  const rtx=fdz,rtz=-fdx;const rl=Math.sqrt(rtx*rtx+rtz*rtz);
+  const rnx=rtx/rl,rny=0,rnz=rtz/rl;
+  const ux=fdy*rnz-fdz*rny,uy=fdz*rnx-fdx*rnz,uz=fdx*rny-fdy*rnx;
+  const wx=dirX*rnx+dirY*ux+dirZ*(-fdx),wy=dirX*rny+dirY*uy+dirZ*(-fdy),wz=dirX*rnz+dirY*uz+dirZ*(-fdz);
+  const wl=Math.sqrt(wx*wx+wy*wy+wz*wz);
+  const Dx=wx/wl,Dy=wy/wl,Dz=wz/wl;
+  const hit=raycastProxyMesh([camPos.x,camPos.y,camPos.z],[Dx,Dy,Dz]);
+  if(hit){
+    const exact=getExactCrossSectionPolyline(proxyRestPositions,proxyIdxArr,hit.point,[0,1,0]);
+    if(exact.points3D.length>=9){updatePreviewLine(exact.points3D);}
+    else{previewLine.visible=false;}
+  }else{previewLine.visible=false;}
+};
+canvas.onwheel=e=>{e.preventDefault();let d=e.deltaY;if(e.deltaMode===1)d*=40;if(e.deltaMode===2)d*=800;camera.position.multiplyScalar(1+d*0.001);camera.position.clampLength(1.5,15);},{passive:false};
+
+window.onkeydown=e=>{
+  const key=e.key.toLowerCase();
+  if(key==='b'){quickBindBand();return;}
+  if(key==='r'||key==='t'){removeCircularBand();return;}
+  if(key==='c'){removeAllCircularBands();return;}
+};
+
+window.onresize=()=>{
+  canvas.width=window.innerWidth;canvas.height=window.innerHeight;
+  renderer.setSize(window.innerWidth,window.innerHeight);
+  camera.aspect=window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+};
+
+// ══════ 💥 EXPLOSION SYSTEM ══════
+
+// Shared geometries and materials
+let _boomFragGeo = null, _boomFragMat = null;
+let _boomJuiceGeo = null, _boomJuiceMat = null;
+let _boomHeroMat = null;
+let _camBasePos = new THREE.Vector3();
+
+function createBoomFragmentGeo() {
+  const s = 0.04 + Math.random() * 0.08;
+  const j = () => (Math.random() - 0.5) * s * 1.5;
+  const v = [0, s*1.3, 0, -s*0.8+j(), -s*0.4+j(), s*0.6+j(), s*0.7+j(), -s*0.5+j(), -s*0.5+j(), j()*0.5, -s*0.3+j(), s*0.2+j()];
+  const idx = [0,1,2, 0,2,3, 0,3,1, 1,3,2];
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(v), 3));
+  geo.setIndex(idx); geo.computeVertexNormals();
+  return geo;
+}
+
+function initBoomAssets() {
+  if (_boomFragGeo) return;
+  _boomFragGeo = createBoomFragmentGeo();
+  _boomFragMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(0.13,0.8,0.5), roughness:0.4, metalness:0.05 });
+  _boomJuiceGeo = new THREE.SphereGeometry(0.02, 4, 3);
+  _boomJuiceMat = new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(0.15,1.0,0.65) });
+  _boomHeroMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(0.13,0.7,0.55), roughness:0.35, metalness:0.1, side:THREE.DoubleSide });
+}
+
+async function triggerBoom(srcBuf) {
+  if (boomState !== 'idle' || !loaded) return;
+  if (!boomProxyCidB) { console.warn('Boom GPU not ready'); return; }
+  console.log('💥 BOOM (GPU path)!');
+  boomState = 'booming'; boomTime = 0;
+  initBoomAssets();
+
+  // Camera shake
+  _camBasePos.copy(camera.position);
+  boomCamShake = { active: true, intensity: 0.25, duration: 0.5, time: 0 };
+
+  const useBuf = srcBuf || posA;
+  const isA = (useBuf === posA);
+  const KC = BOOM_HERO_COUNT;
+  const TC = HR_TRI_COUNT;
+
+  // ── Upload Voronoi seeds (random in rest bounds) ──
+  let smin=[Infinity,Infinity,Infinity],smax=[-Infinity,-Infinity,-Infinity];
+  for(let i=0;i<proxyVertexCount;i++){for(let k=0;k<3;k++){const v=proxyRestPositions[i*3+k];if(v<smin[k])smin[k]=v;if(v>smax[k])smax[k]=v;}}
+  const sd=new Float32Array(KC*3);
+  for(let s=0;s<KC;s++){sd[s*3]=smin[0]+Math.random()*(smax[0]-smin[0]);sd[s*3+1]=smin[1]+Math.random()*(smax[1]-smin[1]);sd[s*3+2]=smin[2]+Math.random()*(smax[2]-smin[2]);}
+  queue.writeBuffer(boomSeedsB,0,sd);
+
+  // ── Step 1: GPU Voronoi ──
+  queue.writeBuffer(boomSxB,0,new Int32Array(KC));
+  queue.writeBuffer(boomSyB,0,new Int32Array(KC));
+  queue.writeBuffer(boomSzB,0,new Int32Array(KC));
+  queue.writeBuffer(boomStB,0,new Int32Array(KC));
+  queue.writeBuffer(boomCtB,0,new Uint32Array(KC));
+  queue.writeBuffer(boomUB,0,new Uint32Array([proxyVertexCount,KC]));
+  const cmd1=device.createCommandEncoder();
+  {const cp=cmd1.beginComputePass();cp.setPipeline(boomVorPipe.pipe);cp.setBindGroup(0,isA?boomVorBG_AB:boomVorBG_BA);cp.dispatchWorkgroups(Math.ceil(proxyVertexCount/256),1,1);
+  cp.setPipeline(boomVorNormPipe.pipe);cp.setBindGroup(0,boomVorNormBG);cp.dispatchWorkgroups(Math.ceil(KC/64),1,1);cp.end();}
+  device.queue.submit([cmd1.finish()]);
+
+  // ── Step 2: GPU Triangle assign ──
+  queue.writeBuffer(boomUB,0,new Uint32Array([TC,KC]));
+  const cmd2=device.createCommandEncoder();
+  {const cp=cmd2.beginComputePass();cp.setPipeline(boomTriAssignPipe.pipe);cp.setBindGroup(0,boomTriAssignBG);cp.dispatchWorkgroups(Math.ceil(TC/256),1,1);cp.end();}
+  device.queue.submit([cmd2.finish()]);
+
+  // ── Step 3: CPU construct hero chunks from GPU triCidArr ──
+  // Skip broken GPU emit; triCidArr already has valid per-triangle chunk assignment
+  await readbackProxyPositions(useBuf);
+  
+  // Approximate deformed high-res positions from proxy displacement
+  const hrCurCPU = new Float32Array(highResCount*3);
+  for(let i=0;i<highResCount;i++){
+    const pi=nearestProxyIdx[i];
+    const dx=proxyCurPositions[pi*3]-proxyRestPositions[pi*3];
+    const dy=proxyCurPositions[pi*3+1]-proxyRestPositions[pi*3+1];
+    const dz=proxyCurPositions[pi*3+2]-proxyRestPositions[pi*3+2];
+    hrCurCPU[i*3]=highResRestPositions[i*3]+dx;
+    hrCurCPU[i*3+1]=highResRestPositions[i*3+1]+dy;
+    hrCurCPU[i*3+2]=highResRestPositions[i*3+2]+dz;
+  }
+  
+  // Read back triCidArr and chunkOut from GPU
+  await device.queue.onSubmittedWorkDone();
+  const rcCmdCpu=device.createCommandEncoder();
+  rcCmdCpu.copyBufferToBuffer(boomTriCidB,0,boomFragStgB,0,TC*4);
+  device.queue.submit([rcCmdCpu.finish()]);
+  await boomFragStgB.mapAsync(GPUMapMode.READ);
+  const triCidArr=new Uint32Array(boomFragStgB.getMappedRange(0,TC*4));
+  // Note: do NOT unmap yet — triCidArr used later in triangle grouping
+
+  const rcCmdCpu2=device.createCommandEncoder();
+  rcCmdCpu2.copyBufferToBuffer(boomChunkOutB,0,boomChunkStgB,0,KC*4*4);
+  device.queue.submit([rcCmdCpu2.finish()]);
+  await boomChunkStgB.mapAsync(GPUMapMode.READ);
+  const chunkOutArr=new Float32Array(boomChunkStgB.getMappedRange(0,KC*4*4));
+  // Note: do NOT unmap — chunkOutArr used later for COM/strain
+
+  // Group triangles by GPU-assigned chunk
+  const cpuChunkTris=Array.from({length:KC},()=>[]);
+  const cpuChunkVerts=Array.from({length:KC},()=>new Set());
+  for(let t=0;t<TC;t++){
+    const cid=triCidArr[t];if(cid>=cpuChunkTris.length)continue;
+    const t3=t*3;
+    const a=highResIdxArr[t3],b=highResIdxArr[t3+1],c=highResIdxArr[t3+2];
+    cpuChunkTris[cid].push(a,b,c);
+    cpuChunkVerts[cid].add(a);cpuChunkVerts[cid].add(b);cpuChunkVerts[cid].add(c);
+  }
+  
+  // Compute explosion center + max strain from GPU chunkOut
+  const bNormal=circularBands.length>0?circularBands[Math.floor(circularBands.length/2)].planeNormal:[0,1,0];
+  let cx=0,cy=0,cz=0,maxStrain=0;let ccnt=0;
+  for(let c=0;c<KC;c++){
+    const st=chunkOutArr[c*4+3];if(st>0){cx+=chunkOutArr[c*4];cy+=chunkOutArr[c*4+1];cz+=chunkOutArr[c*4+2];ccnt++;if(st>maxStrain)maxStrain=st;}
+  }
+  if(ccnt>0){cx/=ccnt;cy/=ccnt;cz/=ccnt;}
+  if(maxStrain<0.001)maxStrain=0.001;
+  
+  // Build hero chunk meshes
+  boomHeroChunks=[];
+  const origUVs=pineappleMesh.geometry.attributes.uv?pineappleMesh.geometry.attributes.uv.array:null;
+  const origNorms=highResRestNormals;
+  for(let k=0;k<KC;k++){
+    const tris=cpuChunkTris[k];if(tris.length<18)continue;
+    const vset=cpuChunkVerts[k];const vmap=new Map();const nv=[];const nn=[];const nuv=[];const nidx=[];let vcn=0;
+    for(const vi of vset){
+      vmap.set(vi,vcn++);
+      nv.push(hrCurCPU[vi*3],hrCurCPU[vi*3+1],hrCurCPU[vi*3+2]);
+      if(origNorms){nn.push(origNorms[vi*3],origNorms[vi*3+1],origNorms[vi*3+2]);}
+      if(origUVs)nuv.push(origUVs[vi*2],origUVs[vi*2+1]);
+    }
+    for(let t=0;t<tris.length;t+=3)nidx.push(vmap.get(tris[t]),vmap.get(tris[t+1]),vmap.get(tris[t+2]));
+    const geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.Float32BufferAttribute(new Float32Array(nv),3));
+    if(origNorms)geo.setAttribute('normal',new THREE.Float32BufferAttribute(new Float32Array(nn),3));
+    if(origUVs)geo.setAttribute('uv',new THREE.Float32BufferAttribute(new Float32Array(nuv),2));
+    geo.setIndex(nidx);
+    const mat=pineappleMesh.material.clone();
+    mat.side=THREE.DoubleSide;
+    mat.needsUpdate=true;
+    const mesh=new THREE.Mesh(geo,mat);scene.add(mesh);mesh.frustumCulled=false;
+    const mx=chunkOutArr[k*4],my=chunkOutArr[k*4+1],mz=chunkOutArr[k*4+2];
+    const pa=geo.attributes.position.array;
+    for(let i=0;i<pa.length;i+=3){pa[i]-=mx;pa[i+1]-=my;pa[i+2]-=mz;}
+    geo.attributes.position.needsUpdate=true;geo.computeBoundingSphere();
+    mesh.position.set(mx,my,mz);
+    const rx=mx-cx,ry=my-cy,rz=mz-cz;const rd=Math.sqrt(rx*rx+ry*ry+rz*rz)||1;
+    let vx=rx/rd,vy=ry/rd,vz=rz/rd;
+    vx+=bNormal[0]*0.5;vy+=bNormal[1]*0.5;vz+=bNormal[2]*0.5;
+    const vl=Math.sqrt(vx*vx+vy*vy+vz*vz);vx/=vl;vy/=vl;vz/=vl;
+    const st=chunkOutArr[k*4+3]/maxStrain;
+    const speed=BOOM_FORCE*(0.5+st*0.9);
+    boomHeroChunks.push({mesh,vel:new THREE.Vector3(vx*speed,vy*speed,vz*speed),
+      angVel:new THREE.Vector3((Math.random()-0.5)*6,(Math.random()-0.5)*6,(Math.random()-0.5)*6),life:0,maxLife:2.0+Math.random()*1.0});
+  }
+  console.log('💥 CPU hero: '+boomHeroChunks.length+' chunks, COM=('+cx.toFixed(2)+','+cy.toFixed(2)+','+cz.toFixed(2)+') maxStrain='+maxStrain.toFixed(3));
+  // Release mapped staging buffers
+  boomFragStgB.unmap();
+  boomChunkStgB.unmap();
+
+  // ── Debris InstancedMesh ──
+  const MAX_DEBRIS=500;
+  if(boomDebrisMesh){boomDebrisMesh.geometry.dispose();boomDebrisMesh.material.dispose();scene.remove(boomDebrisMesh);}
+  const debrisGeo=createBoomFragmentGeo();
+  const debrisMat=new THREE.MeshStandardMaterial({color:new THREE.Color().setHSL(0.13,0.8,0.5),roughness:0.4,metalness:0.05});
+  boomDebrisMesh=new THREE.InstancedMesh(debrisGeo,debrisMat,MAX_DEBRIS);
+  boomDebrisMesh.castShadow=true;boomDebrisMesh.count=BOOM_DEBRIS_COUNT;scene.add(boomDebrisMesh);
+  boomDebrisData=[];
+  const _dummy=new THREE.Object3D();
+  for(let i=0;i<BOOM_DEBRIS_COUNT;i++){
+    const theta=Math.random()*Math.PI*2,phi=Math.acos(2*Math.random()-1);
+    let dx=Math.sin(phi)*Math.cos(theta),dy=Math.sin(phi)*Math.sin(theta),dz=Math.cos(phi);
+    dy+=bNormal[1]*(Math.random()-0.5)*0.3;
+    const dl=Math.sqrt(dx*dx+dy*dy+dz*dz);dx/=dl;dy/=dl;dz/=dl;
+    const speed=BOOM_FORCE*(0.3+Math.random()*1.2);
+    const pos=new THREE.Vector3(cx+(Math.random()-0.5)*0.2,cy+(Math.random()-0.5)*0.2,cz+(Math.random()-0.5)*0.2);
+    const vel=new THREE.Vector3(dx*speed,dy*speed,dz*speed);
+    const rot=new THREE.Euler(Math.random()*Math.PI,Math.random()*Math.PI,Math.random()*Math.PI);
+    const angVel=new THREE.Vector3((Math.random()-0.5)*15,(Math.random()-0.5)*15,(Math.random()-0.5)*15);
+    _dummy.position.copy(pos);_dummy.rotation.copy(rot);_dummy.scale.setScalar(1);_dummy.updateMatrix();
+    boomDebrisMesh.setMatrixAt(i,_dummy.matrix);
+    boomDebrisData.push({pos,vel,rot,angVel,scale:1,life:0,maxLife:1.8+Math.random()*1.0});
+  }
+  boomDebrisMesh.instanceMatrix.needsUpdate=true;
+
+  // ── Juice InstancedMesh ──
+  const MAX_JUICE=300;
+  if(boomJuiceMesh){boomJuiceMesh.geometry.dispose();boomJuiceMesh.material.dispose();scene.remove(boomJuiceMesh);}
+  const juiceGeo=new THREE.SphereGeometry(0.02,4,3);
+  const juiceMat=new THREE.MeshBasicMaterial({color:new THREE.Color().setHSL(0.15,1.0,0.65),transparent:true,opacity:0.9});
+  boomJuiceMesh=new THREE.InstancedMesh(juiceGeo,juiceMat,MAX_JUICE);
+  boomJuiceMesh.count=BOOM_JUICE_COUNT;scene.add(boomJuiceMesh);
+  boomJuiceData=[];
+  for(let i=0;i<BOOM_JUICE_COUNT;i++){
+    const theta=Math.random()*Math.PI*2,phi=Math.acos(2*Math.random()-1);
+    const dx=Math.sin(phi)*Math.cos(theta),dy=Math.sin(phi)*Math.sin(theta),dz=Math.cos(phi);
+    const speed=BOOM_FORCE*(0.5+Math.random()*1.5);
+    const pos=new THREE.Vector3(cx+(Math.random()-0.5)*0.3,cy+(Math.random()-0.5)*0.3,cz+(Math.random()-0.5)*0.3);
+    const vel=new THREE.Vector3(dx*speed,dy*speed*1.3,dz*speed);
+    _dummy.position.copy(pos);_dummy.rotation.set(0,0,0);_dummy.scale.setScalar(1);_dummy.updateMatrix();
+    boomJuiceMesh.setMatrixAt(i,_dummy.matrix);
+    boomJuiceData.push({pos,vel,scale:1,life:0,maxLife:0.8+Math.random()*1.5});
+  }
+  boomJuiceMesh.instanceMatrix.needsUpdate=true;
+
+  console.log('💥 '+BOOM_DEBRIS_COUNT+' debris + '+BOOM_JUICE_COUNT+' juice + '+boomHeroChunks.length+' hero chunks');
+
+  for (const vis of circBandVisuals) { if (vis.lineTarget) vis.lineTarget.visible = false; }
+  if (_circSharedMesh) _circSharedMesh.visible = false;
+}
+
+function updateBoom(dt) {
+  if (boomState !== 'booming') return;
+  boomTime += dt; const cdt = Math.min(dt, 0.05);
+
+  // Camera shake
+  if (boomCamShake.active) {
+    boomCamShake.time += cdt;
+    if (boomCamShake.time >= boomCamShake.duration) {
+      boomCamShake.active = false;
+      camera.position.copy(_camBasePos);
+    } else {
+      const t = boomCamShake.time/boomCamShake.duration, decay = 1-t;
+      const i = boomCamShake.intensity*decay;
+      camera.position.set(_camBasePos.x+(Math.random()-0.5)*i*2, _camBasePos.y+(Math.random()-0.5)*i*2, _camBasePos.z+(Math.random()-0.5)*i);
+    }
+  }
+
+  // Main mesh shrink (scale only, no transparency — avoids green backdrop bleeding through)
+  if (pineappleMesh && boomTime < 0.2) {
+    const t = boomTime/0.2;
+    pineappleMesh.scale.setScalar(Math.max(0.01, 1-t*t));
+  } else if (pineappleMesh && boomTime >= 0.2) { pineappleMesh.visible = false; }
+
+  // Debris InstancedMesh physics
+  if(boomDebrisMesh&&boomDebrisData.length>0){
+    const _d=new THREE.Object3D();
+    let active=0;
+    for(let i=0;i<boomDebrisData.length;i++){
+      const p=boomDebrisData[i];
+      p.life+=cdt;if(p.life>p.maxLife)continue;
+      active++;
+      p.vel.y-=BOOM_GRAVITY*cdt;
+      p.pos.x+=p.vel.x*cdt;p.pos.y+=p.vel.y*cdt;p.pos.z+=p.vel.z*cdt;
+      p.rot.x+=p.angVel.x*cdt;p.rot.y+=p.angVel.y*cdt;p.rot.z+=p.angVel.z*cdt;
+      const lr=p.life/p.maxLife;p.scale=lr>0.7?Math.max(0.01,1-(lr-0.7)/0.3):1;
+      _d.position.copy(p.pos);_d.rotation.copy(p.rot);_d.scale.setScalar(p.scale);_d.updateMatrix();
+      boomDebrisMesh.setMatrixAt(i,_d.matrix);
+    }
+    boomDebrisMesh.count=active;
+    boomDebrisMesh.instanceMatrix.needsUpdate=true;
+  }
+  // Juice InstancedMesh physics
+  if(boomJuiceMesh&&boomJuiceData.length>0){
+    const _d=new THREE.Object3D();
+    let active=0;
+    for(let i=0;i<boomJuiceData.length;i++){
+      const j=boomJuiceData[i];
+      j.life+=cdt;if(j.life>j.maxLife)continue;
+      active++;
+      j.vel.y-=BOOM_GRAVITY*0.8*cdt;
+      j.pos.x+=j.vel.x*cdt;j.pos.y+=j.vel.y*cdt;j.pos.z+=j.vel.z*cdt;
+      const lr=j.life/j.maxLife;j.scale=lr>0.5?1-(lr-0.5):1;
+      _d.position.copy(j.pos);_d.rotation.set(0,0,0);_d.scale.setScalar(Math.max(0.01,j.scale));_d.updateMatrix();
+      boomJuiceMesh.setMatrixAt(i,_d.matrix);
+    }
+    boomJuiceMesh.count=active;
+    boomJuiceMesh.instanceMatrix.needsUpdate=true;
+  }
+  // Hero chunks (individual meshes, unchanged)
+  for (const c of boomHeroChunks) {
+    c.life += cdt; if (c.life>c.maxLife){c.mesh.visible=false;continue;}
+    c.vel.y -= BOOM_GRAVITY*0.7*cdt;
+    c.mesh.position.x+=c.vel.x*cdt; c.mesh.position.y+=c.vel.y*cdt; c.mesh.position.z+=c.vel.z*cdt;
+    c.mesh.rotation.x+=c.angVel.x*cdt; c.mesh.rotation.y+=c.angVel.y*cdt; c.mesh.rotation.z+=c.angVel.z*cdt;
+  }
+
+  if (boomTime > BOOM_DURATION) cleanupBoom();
+}
+
+function cleanupBoom() {
+  if(boomDebrisMesh){boomDebrisMesh.geometry.dispose();boomDebrisMesh.material.dispose();scene.remove(boomDebrisMesh);boomDebrisMesh=null;}
+  if(boomJuiceMesh){boomJuiceMesh.geometry.dispose();boomJuiceMesh.material.dispose();scene.remove(boomJuiceMesh);boomJuiceMesh=null;}
+  boomDebrisData=[];boomJuiceData=[];
+  for(const c of boomHeroChunks){if(c.mesh){c.mesh.geometry.dispose();c.mesh.material.dispose();scene.remove(c.mesh);}}
+  boomHeroChunks=[];boomState='done';boomCamShake.active=false;
+  console.log('💥 Cleanup done');
+}
+
+function resetBoom() {
+  cleanupBoom(); boomState='idle'; boomTime=0; boomCamShake.active=false;
+  if(pineappleMesh){pineappleMesh.visible=true;pineappleMesh.scale.setScalar(1);}
+  removeAllCircularBands(); needsRestore=true; H.pbdtime.textContent='已重置';
+  document.getElementById('flash').style.opacity='0';
+  // Ensure staging buffers are unmapped
+  try{boomFragStgB.unmap();}catch(e){}
+  try{boomChunkStgB.unmap();}catch(e){}
+  console.log('🔄 Reset');
+}
+
+// ══════.?Animation Loop ══════.?
+const clock={last:performance.now()};
+let fpsFrames=0,fpsTime=0;
+
+// 🌊 呼吸叠加辅助：从 convergedB（永不覆盖的快照）读取，叠呼吸后写 posA → scatter → postPBD
+async function overlayBreath() {
+  const breathTime = performance.now() * 0.001;
+  queue.writeBuffer(breathUB, 0, new Float32Array([breathTime]).buffer);
+  const cmd = device.createCommandEncoder();
+  const cp = cmd.beginComputePass();
+  cp.setPipeline(breathAddPipe.pipe);
+  cp.setBindGroup(0, breathAddBG_C); // 始终从 convergedB 读取
+  cp.dispatchWorkgroups(Math.ceil(proxyVertexCount / 256), 1, 1);
+  cp.end();
+  device.queue.submit([cmd.finish()]);
+  const copyCmd = device.createCommandEncoder();
+  copyCmd.copyBufferToBuffer(breathTmpB, 0, posA, 0, proxyVertexCount * 4 * 4);
+  device.queue.submit([copyCmd.finish()]);
+  await scatterAndPostPBD();
+}
+
+// 🌊 scatter + postPBD（不含呼吸shader）
+async function scatterAndPostPBD() {
+  if (!_voxU32) _voxU32 = new ArrayBuffer(32);
+  const vu32 = new Uint32Array(_voxU32);
+  vu32[0] = proxyVertexCount; vu32[1] = 64;
+  new Float32Array(_voxU32, 8)[0] = voxBMin[0];
+  new Float32Array(_voxU32, 12)[0] = voxBMin[1];
+  new Float32Array(_voxU32, 16)[0] = voxBMin[2];
+  new Float32Array(_voxU32, 20)[0] = voxGS[0];
+  new Float32Array(_voxU32, 24)[0] = voxGS[1];
+  new Float32Array(_voxU32, 28)[0] = voxGS[2];
+  queue.writeBuffer(voxelScatterUB, 0, _voxU32);
+  if (!_zeroVox || _zeroVox.length < VOX_TOTAL) _zeroVox = new Uint32Array(VOX_TOTAL);
+  queue.writeBuffer(voxDxBuf, 0, _zeroVox);
+  queue.writeBuffer(voxDyBuf, 0, _zeroVox);
+  queue.writeBuffer(voxDzBuf, 0, _zeroVox);
+  queue.writeBuffer(voxWBuf, 0, _zeroVox);
+  const scatterCmd = device.createCommandEncoder();
+  const scatterCP = scatterCmd.beginComputePass();
+  scatterCP.setPipeline(voxelScatterPipe.pipe);
+  scatterCP.setBindGroup(0, voxelScatterBG);
+  scatterCP.dispatchWorkgroups(Math.ceil(proxyVertexCount / 256), 1, 1);
+  scatterCP.end();
+  device.queue.submit([scatterCmd.finish()]);
+  await runGPUPostPBD(posA);
+}
+
+async function animate(){
+  const now=performance.now(),dt=Math.min((now-clock.last)/1000,0.1);clock.last=now;
+  if(!loaded){requestAnimationFrame(animate);return;}
+
+  const t0=performance.now();
+
+  // ══════ 💥 Boom handling ══════
+  if (boomState === 'booming') {
+    updateBoom(dt);
+    renderer.render(scene, camera);
+    fpsFrames++; fpsTime += dt;
+    if (fpsTime >= 1.0) { H.fps.textContent = Math.round(fpsFrames/fpsTime); H.framems.textContent = (performance.now()-t0).toFixed(1); fpsFrames=0; fpsTime=0; }
+    if (boomState === 'done') H.pbdtime.textContent = '已爆裂';
+    requestAnimationFrame(animate);
+    return;
+  }
+
+  // Update band stiffness animations (deep-bite → ease-out)
+  const anyAnimating = updateBandStiffnessAnimations(dt);
+  if (anyAnimating) { pbdConverged = false; convergeFrames = 0; }
+
+  if(circularBands.length>0&&!pbdConverged){
+    const pbdT0=performance.now();
+    const finalSrc=await runGPUPBD();
+    // 🌊 每帧更新快照 + 叠呼吸（收敛中也连续呼吸）
+    const copyCmd = device.createCommandEncoder();
+    copyCmd.copyBufferToBuffer(finalSrc, 0, convergedB, 0, proxyVertexCount * 4 * 4);
+    device.queue.submit([copyCmd.finish()]);
+    _boomLastSrc = convergedB;
+    await overlayBreath();
+    const frameTime=performance.now()-pbdT0;
+    pbdAccumTime+=frameTime;
+    convergeFrames++;
+    visUpdateCounter++;
+    const allAnimsDone = !circularBands.some(b => b.animProgress < 1);
+    const doVis = (visUpdateCounter >= CONVERGE_FRAMES);
+    const doConverge = (allAnimsDone && convergeFrames >= CONVERGE_FRAMES);
+    if (doVis || doConverge) {
+      if (doVis) visUpdateCounter = 0;
+      if (doConverge) {
+        pbdConverged=true;H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
+        if(showVolumeReadback)await readbackVolume();
+        if (boomState==='idle' && circularBands.length >= boomTriggerBandCount) {
+          console.log('💥 Auto-boom! Bands: '+circularBands.length+' >= '+boomTriggerBandCount);
+          await triggerBoom(finalSrc);
+          requestAnimationFrame(animate); return;
+        }
+      }
+      await runGPUCircularBandVis().then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';}); // 读 posA（PBD+呼吸）
+    }
+    if (!pbdConverged) {
+      if(anyAnimating){H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms ⟳';}
+      else{H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms';}
+    }
+  }else if(circularBands.length>0&&pbdConverged){
+    H.pbdtime.textContent=pbdAccumTime.toFixed(1)+' ms OK';
+    // 🌊 收敛后呼吸 + 更新皮筋管
+    await overlayBreath();
+    await runGPUCircularBandVis().then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
+  }else if(needsRestore){
+    const pos4r=new Float32Array(proxyVertexCount*4);
+    for(let i=0;i<proxyVertexCount;i++){pos4r[i*4]=proxyRestPositions[i*3];pos4r[i*4+1]=proxyRestPositions[i*3+1];pos4r[i*4+2]=proxyRestPositions[i*3+2];pos4r[i*4+3]=1;}
+    queue.writeBuffer(posA,0,pos4r);
+    queue.writeBuffer(posB,0,pos4r);
+    queue.writeBuffer(voxDxBuf,0,new Uint32Array(VOX_TOTAL));
+    queue.writeBuffer(voxDyBuf,0,new Uint32Array(VOX_TOTAL));
+    queue.writeBuffer(voxDzBuf,0,new Uint32Array(VOX_TOTAL));
+    queue.writeBuffer(voxWBuf,0,new Uint32Array(VOX_TOTAL));
+    proxyCurPositions.set(proxyRestPositions);
+    await runGPUPostPBD(posA);
+    needsRestore=false;lastVol=restVolume;
+    H.pbdtime.textContent='Restored';
+    H.vratio.textContent='100.0';
+    await runGPUCircularBandVis().then(t=>{H.bandtime.textContent=t.toFixed(1)+' ms';});
+  }else{
+    H.pbdtime.textContent='空闲';
+    // 🌊 空闲呼吸：breathCS 从 restB 位移到 posA → scatter → postPBD
+    const breathTime = performance.now() * 0.001;
+    queue.writeBuffer(breathUB, 0, new Float32Array([breathTime]).buffer);
+    const breathCmd = device.createCommandEncoder();
+    const breathCP = breathCmd.beginComputePass();
+    breathCP.setPipeline(breathPipe.pipe);
+    breathCP.setBindGroup(0, breathBG);
+    breathCP.dispatchWorkgroups(Math.ceil(proxyVertexCount / 256), 1, 1);
+    breathCP.end();
+    device.queue.submit([breathCmd.finish()]);
+    await scatterAndPostPBD();
+  }
+
+  // 🌟 持续自转 — 所有子对象都在pineappleGroup下，旋转同步，始终展示3D立体感
+  if (autoRotate) {
+    const ROT_SPEED = 0.25; // 弧度/秒，约25秒一圈
+    pineappleGroup.rotateY(dt * ROT_SPEED);
+  }
+
+  const tRender0=performance.now();
+  renderer.render(scene,camera);
+  const renderMs=performance.now()-tRender0;
+  fpsFrames++;fpsTime+=dt;
+  if(fpsTime>=1.0){
+    H.fps.textContent=Math.round(fpsFrames/fpsTime);
+    H.framems.textContent=(performance.now()-t0).toFixed(1);
+    fpsFrames=0;fpsTime=0;
+  }
+  requestAnimationFrame(animate);
+}
+
+console.log('🔧 皮筋游戏 GPU PBD + Three.js WebGPU');
+console.log('   Click surface to bind band (surface normal)');
+console.log('   T = bind circular band  |  R = cut one  |  C = cut all');
+console.log('   Right panel to adjust params');
+animate();
+</script>
+</body>
+</html>

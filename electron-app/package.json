@@ -1,0 +1,49 @@
+{
+  "name": "pineapple-circular-band",
+  "version": "1.0.0",
+  "description": "皮筋游戏 GPU PBD + Three.js WebGPU",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win portable",
+    "build:installer": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win"
+  },
+  "build": {
+    "appId": "com.pineapple.circularband",
+    "productName": "PineappleCircularBand",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "pineapple_CircularBand.html",
+      "ui.png",
+      "pineapple_py.glb",
+      "pineapple.glb",
+      "vendor/**"
+    ],
+    "asar": false,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": null,
+      "sign": null
+    },
+    "forceCodeSigning": false,
+    "portable": {
+      "artifactName": "PineappleCircularBand.exe"
+    }
+  },
+  "devDependencies": {
+    "electron": "^42.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "dependencies": {
+    "three": "^0.177.0"
+  }
+}
