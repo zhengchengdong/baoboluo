@@ -100,57 +100,7 @@ function connectBarrageWebSocket() {
     };
 
     barrageWs.onmessage = (event) => {
-      try {
-        const raw = typeof event.data === 'string' ? event.data : event.data.toString();
-        // 尝试解析 JSON（弹幕服务可能发送 JSON 格式）
-        let parsed;
-        try {
-          parsed = JSON.parse(raw);
-        } catch {
-          // 不是 JSON，直接打印原始文本
-          console.log(`🎯 [弹幕] ${raw.trim()}`);
-          return;
-        }
-
-        // ── 格式化输出弹幕 ──
-        const msgType = parsed.MsgType ?? parsed.msgType ?? parsed.type ?? '?';
-        const content = parsed.Content ?? parsed.content ?? parsed.msg ?? '';
-        const user = parsed.UserName ?? parsed.userName ?? parsed.nickname ?? '';
-        const roomTitle = parsed.RoomTitle ?? parsed.roomTitle ?? '';
-
-        // 类型名称映射
-        const typeNames = {
-          1: '💬 弹幕',
-          2: '👍 点赞',
-          3: '🚶 进入',
-          4: '⭐ 关注',
-          5: '🎁 礼物',
-          6: '📊 统计',
-          7: '🏷️ 粉丝团',
-          8: '🔗 分享',
-          9: '📴 下播',
-        };
-        const typeLabel = typeNames[msgType] || `📦 类型${msgType}`;
-
-        if (content) {
-          const userStr = user ? ` [${user}]` : '';
-          console.log(`🎯 ${typeLabel}${userStr}: ${content}`);
-        } else if (msgType === 5 && parsed.GiftName) {
-          // 礼物消息特殊处理
-          const count = parsed.GiftCount ?? 1;
-          console.log(`🎯 🎁 礼物 [${user}]: ${parsed.GiftName} x${count}`);
-        } else if (msgType === 2) {
-          const likeCount = parsed.LikeCount ?? parsed.Count ?? '';
-          console.log(`🎯 👍 点赞 [${user}]: ${likeCount}次`);
-        } else if (msgType === 3) {
-          console.log(`🎯 🚶 ${user || '有人'} 进入了直播间`);
-        } else {
-          // 兜底：打印完整 JSON
-          console.log(`🎯 ${typeLabel}: ${JSON.stringify(parsed)}`);
-        }
-      } catch (e) {
-        console.log(`🎯 [弹幕-raw] ${event.data}`);
-      }
+      // 弹幕消息暂不打印，保留客户端连接供后续使用
     };
 
     barrageWs.onerror = (event) => {
