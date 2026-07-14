@@ -4,9 +4,9 @@
   "description": "皮筋游戏 GPU PBD + Three.js WebGPU",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "build": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win portable",
-    "build:installer": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win"
+    "start": "chcp 65001 >nul && electron .",
+    "build": "chcp 65001 >nul && set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win portable",
+    "build:installer": "chcp 65001 >nul && set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win"
   },
   "build": {
     "appId": "com.pineapple.circularband",
@@ -22,6 +22,12 @@
       "pineapple_py.glb",
       "pineapple.glb",
       "vendor/**"
+    ],
+    "extraResources": [
+      {
+        "from": "WssBarrageServer",
+        "to": "WssBarrageServer"
+      }
     ],
     "asar": false,
     "win": {
