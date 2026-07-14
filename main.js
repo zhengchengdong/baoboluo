@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const iconv = require('iconv-lite');
+const { parseBarrage, MsgTypeName } = require('./barrageTypes');
 
 // ── 🔑 必须在 app.whenReady() 之前注册自定义协议的权限 ──
 // standard: true → 等同于 http 协议，支持 CORS / fetch / import / 相对路径
@@ -100,7 +101,11 @@ function connectBarrageWebSocket() {
     };
 
     barrageWs.onmessage = (event) => {
-      // 弹幕消息暂不打印，保留客户端连接供后续使用
+      const msg = parseBarrage(event.data);
+      if (msg) {
+        const typeName = MsgTypeName[msg.Type] || `类型${msg.Type}`;
+        console.log(`[${typeName}]`, msg);
+      }
     };
 
     barrageWs.onerror = (event) => {
