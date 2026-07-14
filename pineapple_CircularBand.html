@@ -342,6 +342,10 @@ const envMap = pmremGenerator.fromScene(scene, 0.5).texture;
 // scene.environment = envMap;
 pmremGenerator.dispose();
 
+// 🌟 父级Group — 所有菠萝相关对象挂在下面，方便统一旋转
+const pineappleGroup = new THREE.Group();
+scene.add(pineappleGroup);
+
 // ── Radial Gradient Texture (shared by spotlight + halo) ──
 // Mimics SpotLight penumbra: smoothstep from inner radius to outer radius
 function createRadialGradientTexture(size, softness, skewY = 0) {
@@ -856,7 +860,7 @@ function makeBandLine(color,opacity){
   const mat=new THREE.LineBasicMaterial({color,transparent:true,opacity,depthTest:false,depthWrite:false});
   const line=new THREE.Line(geo,mat);
   line.renderOrder=2;line.frustumCulled=false;line.visible=false;
-  scene.add(line);return line;
+  pineappleGroup.add(line);return line;
 }
 function updateBandLine(line,points3D){
   const nPts=points3D.length/3;
@@ -968,7 +972,7 @@ function removeCircularBand(){
   if(circularBands.length===0)return;
   circularBands.pop();
   const vis=circBandVisuals.pop();
-  if(vis&&vis.lineTarget){vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();scene.remove(vis.lineTarget);}
+  if(vis&&vis.lineTarget){vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();pineappleGroup.remove(vis.lineTarget);}
   needsRestore=true;markPbdDirty();circVisDirty=true;
   H.bcount.textContent=circularBands.length;
   if(circularBands.length>0)updateLastBandPanel(circularBands.length-1);
@@ -981,7 +985,7 @@ function removeAllCircularBands(){
   while(circularBands.length>0){
     circularBands.pop();
     const vis=circBandVisuals.pop();
-    if(vis&&vis.lineTarget){vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();scene.remove(vis.lineTarget);}
+    if(vis&&vis.lineTarget){vis.lineTarget.geometry.dispose();vis.lineTarget.material.dispose();pineappleGroup.remove(vis.lineTarget);}
   }
   needsRestore=true;markPbdDirty();circVisDirty=true;
   H.bcount.textContent=0;
@@ -1191,7 +1195,7 @@ async function loadModels(){
   geo.setIndex(new THREE.BufferAttribute(hrIdx,1));
   const mat=srcMesh.material||new THREE.MeshStandardMaterial({color:'#cc9944',roughness:0.6,metalness:0.0});
   pineappleMesh=new THREE.Mesh(geo,mat);
-  scene.add(pineappleMesh);
+  pineappleGroup.add(pineappleMesh);
 
   // Proxy wireframe overlay
   const edgeMap=new Map();
@@ -1209,7 +1213,7 @@ async function loadModels(){
   wireGeo.setIndex(new THREE.BufferAttribute(edgeIdx,1));
   proxyWireMesh=new THREE.LineSegments(wireGeo,new THREE.LineBasicMaterial({color:'#ff44ff',transparent:true,opacity:0.7,depthTest:false,depthWrite:false}));
   proxyWireMesh.visible=false;proxyWireMesh.renderOrder=999;
-  scene.add(proxyWireMesh);
+  pineappleGroup.add(proxyWireMesh);
 
   // ── TEST: offset vertices along direction to centroid ──
   if(false){
@@ -1238,7 +1242,7 @@ async function loadModels(){
     const bigWire=new THREE.LineSegments(bigWireGeo,new THREE.LineBasicMaterial({color:'#00ffff',transparent:true,opacity:0.8,depthTest:true,depthWrite:true}));
     bigWire.renderOrder=998;
     bigWire.name='enlargedProxyWire';
-    scene.add(bigWire);
+    pineappleGroup.add(bigWire);
     console.log('🔵 青色线框 = 每个顶点沿质心方向推0.3单位，centroid:('+cx.toFixed(2)+','+cy.toFixed(2)+','+cz.toFixed(2)+')');
   }
 
@@ -2312,7 +2316,7 @@ function createCircSharedMesh(){
   const mat=new THREE.MeshStandardMaterial({color:'#d4a017',roughness:0.45,metalness:0.0,side:THREE.DoubleSide,depthTest:true,depthWrite:true,polygonOffset:true,polygonOffsetFactor:1.0,polygonOffsetUnits:1.0});
   const mesh=new THREE.Mesh(geo,mat);mesh.renderOrder=2;mesh.frustumCulled=false;mesh.visible=false;
   geo.boundingSphere=new THREE.Sphere(new THREE.Vector3(0,0,0),100);geo.boundingBox=new THREE.Box3(new THREE.Vector3(-100,-100,-100),new THREE.Vector3(100,100,100));
-  scene.add(mesh);
+  pineappleGroup.add(mesh);
   const an=['position','normal','uv'],sb=[_circSharedPosB,_circSharedNormB,_circSharedUVB];
   for(let i=0;i<an.length;i++){const a=geo.attributes[an[i]];renderer.backend.createAttribute(a);const be=renderer.backend.get(a);if(be)be.buffer=sb[i];a.needsUpdate=false;}
   return mesh;
@@ -2801,7 +2805,7 @@ function ensurePreviewLine(){
   previewLine=new THREE.Line(geo,mat);
   previewLine.renderOrder=2;previewLine.frustumCulled=false;
   previewLine.visible=false;
-  scene.add(previewLine);
+  pineappleGroup.add(previewLine);
 }
 
 function updatePreviewLine(points3D){
@@ -3311,6 +3315,10 @@ async function animate(){
   }else{
     H.pbdtime.textContent='空闲';
   }
+
+  // 🌟 持续自转 — 所有子对象都在pineappleGroup下，旋转同步，始终展示3D立体感
+  const ROT_SPEED = 0.25; // 弧度/秒，约25秒一圈
+  pineappleGroup.rotateY(dt * ROT_SPEED);
 
   const tRender0=performance.now();
   renderer.render(scene,camera);
