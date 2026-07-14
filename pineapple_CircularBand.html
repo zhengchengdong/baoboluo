@@ -42,7 +42,7 @@ canvas { display:block; cursor:crosshair; }
  <div>皮筋耗时: <span class="val" id="bandtime">--</span> ms</div>
 </div>
 <div id="info">
- Click surface to bind band (normal dir) &nbsp; <span class="kb">R</span>=割一&nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">?GPU PBD + Three.js WebGPU</span>
+ Click surface to bind band (normal dir) &nbsp; <span class="kb">B</span>=快绑 &nbsp; <span class="kb">R</span>=割一&nbsp; <span class="kb">C</span>=全部割掉 &nbsp; <span class="kb">拖拽</span>=旋转 &nbsp; <span class="kb">滚轮</span>=缩放 &nbsp; <span style="color:#ff44cc">?GPU PBD + Three.js WebGPU</span>
 </div>
 <div id="flash"></div>
 <div id="shakeHint">💥</div>
@@ -66,6 +66,12 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="sl_ab" min="0.5" max="100.0" step="0.5" value="100.0">
  <label>回弹时长 <span class="val" id="sv_ad">0.40</span>s</label>
  <input type="range" id="sl_ad" min="0.1" max="2.0" step="0.05" value="0.40">
+
+ <h3>⚡ 快绑皮筋 <span class="kb">B</span></h3>
+ <label>Y中心 <span class="val" id="sv_yc">-0.52</span></label>
+ <input type="range" id="sl_yc" min="-3.0" max="3.0" step="0.01" value="-0.52">
+ <label>Y散布σ <span class="val" id="sv_ys">0.15</span></label>
+ <input type="range" id="sl_ys" min="0.02" max="1.00" step="0.01" value="0.15">
 
  <h3>💥 爆裂</h3>
  <div class="row"><span>碎屑</span><input type="range" id="sl_bd" min="0" max="500" step="10" value="100"><span class="val" id="sv_bd">100</span></div>
@@ -534,6 +540,9 @@ let showProxyWire=false;
 let modelMinY=-1.5,modelMaxY=1.5; // Y range of proxy model (for delta field)
 let voxBMin=[0,0,0],voxGS=[0.1,0.1,0.1],VOX_TOTAL=64*64*64; // 64³ voxel grid
 
+let BAND_Y_CENTER = -0.52;   // 快绑正态分布中心Y
+let BAND_Y_SPREAD = 0.15;   // σ for quick-bind normal distribution (Y axis)
+
 // PBD params
 let SHAPE_STIFF=0.30, BAND_STIFF=0.001, VOL_STIFF=0.90, BAND_INFLU=0.60;
 let BAND_REST_CIRCUM=0.72, PBD_ITER=10;
@@ -563,6 +572,8 @@ $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
 $('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUFF.toFixed(1);for(const b of circularBands)b.buffStiffness=ANIM_BUFF;};
 $('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);for(const b of circularBands)b.animDuration=ANIM_DURATION;};
+$('sl_yc').oninput=e=>{BAND_Y_CENTER=+e.target.value;$('sv_yc').textContent=BAND_Y_CENTER.toFixed(2);};
+$('sl_ys').oninput=e=>{BAND_Y_SPREAD=+e.target.value;$('sv_ys').textContent=BAND_Y_SPREAD.toFixed(2);};
 $('sl_bt').oninput=e=>{boomTriggerBandCount=+e.target.value;$('sv_bt').textContent=boomTriggerBandCount;};
 $('sl_bd').oninput=e=>{BOOM_DEBRIS_COUNT=+e.target.value;$('sv_bd').textContent=BOOM_DEBRIS_COUNT;};
 $('sl_bj').oninput=e=>{BOOM_JUICE_COUNT=+e.target.value;$('sv_bj').textContent=BOOM_JUICE_COUNT;};
@@ -954,6 +965,33 @@ $('sl_rs').oninput=e=>{
 };
 
 // ══════.?Circular Band (Tube) add/remove ══════.?
+// ══════⚡ Quick-bind helper ══════
+// Box-Muller: generate normally-distributed random number
+function randomNormal(mean, std) {
+  let u1, u2;
+  do { u1 = Math.random(); } while (u1 === 0); // avoid log(0)
+  u2 = Math.random();
+  const z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+  return mean + z * std;
+}
+
+function quickBindBand() {
+  if (!loaded || boomState !== 'idle') return;
+  const centerY = BAND_Y_CENTER;
+  // Clamp Y within model bounds
+  const minY = modelMinY + 0.05;
+  const maxY = modelMaxY - 0.05;
+  let y;
+  for (let tries = 0; tries < 50; tries++) {
+    y = randomNormal(centerY, BAND_Y_SPREAD);
+    if (y >= minY && y <= maxY) break;
+    if (tries === 49) y = Math.max(minY, Math.min(maxY, y)); // fallback clamp
+  }
+  const origin = [modelCentroid[0], y, modelCentroid[2]];
+  addCircularBand(origin, [0, 1, 0]);
+}
+
+// ══════.?Circular Band (Tube) add/remove ══════.?
 function addCircularBand(origin, normal){
   if(boomState!=='idle')return;
   if(circularBands.length>=MAX_CIRC_BANDS){console.warn('max circular bands');return;}
@@ -1180,6 +1218,8 @@ async function loadModels(){
   for(let i=0;i<proxyVertexCount;i++){const y=proxyRestPositions[i*3+1];if(y<modelMinY)modelMinY=y;if(y>modelMaxY)modelMaxY=y;}
   if(!isFinite(modelMinY)){modelMinY=-1.5;modelMaxY=1.5;}
   console.log('📏 代理Y范围:',modelMinY.toFixed(3),'~',modelMaxY.toFixed(3));
+  // 更新快绑滑块范围为模型实际Y范围
+  $('sl_yc').min = modelMinY; $('sl_yc').max = modelMaxY;
 
   // Compute voxel grid bounds (3D bounding box, expanded 5%)
   const vpad=0.05;
@@ -3057,6 +3097,7 @@ canvas.onwheel=e=>{e.preventDefault();let d=e.deltaY;if(e.deltaMode===1)d*=40;if
 
 window.onkeydown=e=>{
   const key=e.key.toLowerCase();
+  if(key==='b'){quickBindBand();return;}
   if(key==='r'||key==='t'){removeCircularBand();return;}
   if(key==='c'){removeAllCircularBands();return;}
 };
