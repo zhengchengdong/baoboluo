@@ -91,6 +91,10 @@ canvas { display:block; cursor:crosshair; }
   📊 读回体积保持率 (HUD)
  </label>
  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="cb_rot" checked style="accent-color:#ffaa00;width:16px;height:16px;">
+  🔄 自动旋转
+ </label>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
   <input type="checkbox" id="cb_target" style="accent-color:#ff44cc;width:16px;height:16px;">
   🟢 显示目标周长参考线
  </label>
@@ -546,8 +550,8 @@ $('sl_rc').oninput=e=>{
 };
 $('sl_pi').oninput=e=>{PBD_ITER=+e.target.value;$('sv_pi').textContent=PBD_ITER;H.pbditer.textContent=PBD_ITER;markPbdDirty();};
 $('sl_cf').oninput=e=>{CONVERGE_FRAMES=+e.target.value;$('sv_cf').textContent=CONVERGE_FRAMES;markPbdDirty();};
-$('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUFF.toFixed(1);};
-$('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);};
+$('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUFF.toFixed(1);for(const b of circularBands)b.buffStiffness=ANIM_BUFF;};
+$('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);for(const b of circularBands)b.animDuration=ANIM_DURATION;};
 $('sl_bt').oninput=e=>{boomTriggerBandCount=+e.target.value;$('sv_bt').textContent=boomTriggerBandCount;};
 $('sl_bd').oninput=e=>{BOOM_DEBRIS_COUNT=+e.target.value;$('sv_bd').textContent=BOOM_DEBRIS_COUNT;};
 $('sl_bj').oninput=e=>{BOOM_JUICE_COUNT=+e.target.value;$('sv_bj').textContent=BOOM_JUICE_COUNT;};
@@ -558,6 +562,9 @@ $('btn_reset').onclick=resetBoom;
 // Volume readback toggle
 let showVolumeReadback = true;
 $('cb_vol').onchange = e => { showVolumeReadback = e.target.checked; };
+// Auto-rotation toggle
+let autoRotate = true;
+$('cb_rot').onchange = e => { autoRotate = e.target.checked; };
 $('cb_target').onchange = e => {
   showTargetLine = e.target.checked;
   for(const vis of circBandVisuals){if(vis.lineTarget)vis.lineTarget.visible=showTargetLine;}
@@ -1017,7 +1024,12 @@ $('sl_ny').oninput=()=>{$('sv_ny').textContent=(+$('sl_ny').value).toFixed(2);ap
 $('sl_nz').oninput=()=>{$('sv_nz').textContent=(+$('sl_nz').value).toFixed(2);applyLastNormal();};
 $('sl_bk').oninput=()=>{
   const v=+$('sl_bk').value;$('sv_bk').textContent=v.toFixed(3);
-  if(circularBands.length>0){circularBands[circularBands.length-1].baseStiffness=v;markPbdDirty();}
+  if(circularBands.length>0){
+    const b=circularBands[circularBands.length-1];
+    b.baseStiffness=v;
+    if(b.animProgress>=1)b.stiffness=v;
+    markPbdDirty();
+  }
 };
 function applyLastNormal(){
   if(circularBands.length===0)return;
@@ -1623,7 +1635,8 @@ struct P{vc:u32,bc:u32}
     let eff_target=targetR+(r_cur-targetR)*blend;
     if(r_cur>eff_target){
       let s_target=eff_target/max(r_cur,0.0001);
-      let s=1.0-param.stiffness*(1.0-s_target);
+      let s_raw=1.0-param.stiffness*(1.0-s_target);
+      let s=max(s_raw, 0.0); // 🔒 防止过推穿透质心
       cur.x=param.rest_cx+dx*s+signedD*param.nx;
       cur.y=param.rest_cy+dy*s+signedD*param.ny;
       cur.z=param.rest_cz+dz*s+signedD*param.nz;
@@ -3317,8 +3330,10 @@ async function animate(){
   }
 
   // 🌟 持续自转 — 所有子对象都在pineappleGroup下，旋转同步，始终展示3D立体感
-  const ROT_SPEED = 0.25; // 弧度/秒，约25秒一圈
-  pineappleGroup.rotateY(dt * ROT_SPEED);
+  if (autoRotate) {
+    const ROT_SPEED = 0.25; // 弧度/秒，约25秒一圈
+    pineappleGroup.rotateY(dt * ROT_SPEED);
+  }
 
   const tRender0=performance.now();
   renderer.render(scene,camera);
