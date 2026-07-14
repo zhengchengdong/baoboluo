@@ -161,6 +161,34 @@ function checkRootCert() {
   });
 }
 
+// ── 安装弹幕服务根证书（需要管理员权限）──
+function installRootCert() {
+  const certPath = isDev
+    ? path.join(__dirname, 'WssBarrageServer', 'rootCert.pfx')
+    : path.join(process.resourcesPath, 'WssBarrageServer', 'rootCert.pfx');
+
+  if (!fs.existsSync(certPath)) {
+    console.warn('[证书安装] 找不到证书文件:', certPath);
+    return Promise.resolve(false);
+  }
+
+  console.log('[证书安装] 正在安装根证书...', certPath);
+  return new Promise((resolve) => {
+    execFile('powershell.exe', [
+      '-NoProfile', '-Command',
+      `Import-PfxCertificate -FilePath "${certPath}" -CertStoreLocation Cert:\\CurrentUser\\Root -Exportable`
+    ], { timeout: 15000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error('[证书安装] 安装失败:', stderr || err.message);
+        resolve(false);
+        return;
+      }
+      console.log('[证书安装] 安装成功:', stdout.trim());
+      resolve(true);
+    });
+  });
+}
+
 // ── MIME 类型映射 ──
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -258,13 +286,17 @@ app.whenReady().then(async () => {
   registerLocalProtocol();
   createWindow();
 
-  // 检测根证书是否已安装，未安装则提示管理员运行并退出
-  const certOk = await checkRootCert();
+  // 检测根证书是否已安装，若未安装则尝试自动安装
+  let certOk = await checkRootCert();
+  if (!certOk) {
+    console.log('[证书] 未检测到根证书，尝试自动安装...');
+    certOk = await installRootCert();
+  }
   if (!certOk) {
     dialog.showMessageBoxSync({
       type: 'warning',
-      title: '证书未安装',
-      message: '弹幕服务根证书未安装，请以管理员身份重新启动本程序。',
+      title: '证书安装失败',
+      message: '弹幕服务根证书安装失败，请以管理员身份重新启动本程序。',
       detail: '首次使用需要管理员权限来安装 HTTPS 解密证书。\n\n请右键点击程序 → "以管理员身份运行"。\n安装后下次启动无需管理员权限。',
       buttons: ['确定'],
     });
