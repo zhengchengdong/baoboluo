@@ -195,7 +195,7 @@ canvas { display:block; cursor:crosshair; }
 <canvas id="canvas"></canvas>
 
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.177.0/build/three.webgpu.js", "three/addons/loaders/GLTFLoader.js": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/loaders/GLTFLoader.js" } }
+{ "imports": { "three": "./vendor/three.webgpu.js", "three/addons/loaders/GLTFLoader.js": "./vendor/jsm/loaders/GLTFLoader.js" } }
 </script>
 
 <script type="module">
@@ -212,7 +212,17 @@ const H={
 const canvas=$('canvas');
 
 // ═══════ WebGPU adapter ═══════
-if(!navigator.gpu){alert('需要WebGPU！Chrome 113+');throw new Error('No WebGPU');}
+if(!navigator.gpu){
+  const msg='❌ navigator.gpu 不可用。\n\n'+
+    'GPU 信息:\n'+
+    '  WebGL: '+(document.createElement('canvas').getContext('webgl2')?'✅ 可用':'❌ 不可用')+'\n'+
+    '  UserAgent: '+navigator.userAgent+'\n\n'+
+    '可能原因: 显卡驱动过旧 / 显卡不支持 Vulkan/D3D12\n'+
+    '尝试: 更新显卡驱动到最新版';
+  alert(msg);
+  console.error(msg);
+  throw new Error('No WebGPU');
+}
 let adapter=null;for(let i=0;i<3&&!adapter;i++){adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!adapter&&i<2)await new Promise(r=>setTimeout(r,500));}
 if(!adapter){alert('无法获取GPU适配器');throw new Error('No adapter');}
 const device=await adapter.requestDevice({requiredLimits:{maxStorageBuffersPerShaderStage:10}});
@@ -1143,7 +1153,7 @@ async function loadModel(name, doProcess, refTransform=null){
 
 async function loadModels(){
   // Load proxy (small mesh for PBD)
-  const proxyResult=await loadModel('pineapple_py.glb?t='+Date.now(), true);
+  const proxyResult=await loadModel('pineapple_py.glb', true);
   // Load high-res (display mesh) .?use proxy's transform for alignment
   const hr=await loadModel('pineapple.glb', false, proxyResult.transform);
   const srcGeo=hr.srcGeo;const hrPos=hr.pos;const hrIdx=hr.idxArr;
