@@ -1,7 +1,7 @@
-const { app, BrowserWindow, protocol, net } = require('electron');
+const { app, BrowserWindow, protocol, net, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const iconv = require('iconv-lite');
 
 // ── 🔑 必须在 app.whenReady() 之前注册自定义协议的权限 ──
@@ -79,6 +79,23 @@ function stopBarrageServer() {
     barrageProcess.kill();
     barrageProcess = null;
   }
+}
+
+// ── 检测弹幕服务根证书是否已安装 ──
+function checkRootCert() {
+  return new Promise((resolve) => {
+    execFile('powershell.exe', [
+      '-NoProfile', '-Command',
+      'Get-ChildItem -Path Cert:\\CurrentUser\\Root | Where-Object { $_.Subject -like "*Titanium*" } | Select-Object -First 1'
+    ], { timeout: 10000 }, (err, stdout) => {
+      if (err) {
+        console.warn('[证书检测] PowerShell 执行失败:', err.message);
+        resolve(false);
+        return;
+      }
+      resolve(stdout.includes('Titanium'));
+    });
+  });
 }
 
 // ── MIME 类型映射 ──
@@ -177,6 +194,20 @@ app.whenReady().then(async () => {
 
   registerLocalProtocol();
   createWindow();
+
+  // 检测根证书是否已安装，未安装则提示管理员运行并退出
+  const certOk = await checkRootCert();
+  if (!certOk) {
+    dialog.showMessageBoxSync({
+      type: 'warning',
+      title: '证书未安装',
+      message: '弹幕服务根证书未安装，请以管理员身份重新启动本程序。',
+      detail: '首次使用需要管理员权限来安装 HTTPS 解密证书。\n\n请右键点击程序 → "以管理员身份运行"。\n安装后下次启动无需管理员权限。',
+      buttons: ['确定'],
+    });
+    app.quit();
+    return;
+  }
 
   // 启动弹幕抓取服务
   startBarrageServer();

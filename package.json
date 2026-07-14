@@ -21,7 +21,9 @@
       "ui.png",
       "pineapple_py.glb",
       "pineapple.glb",
-      "vendor/**"
+      "vendor/**",
+      "node_modules/**",
+      "package.json"
     ],
     "extraResources": [
       {
@@ -50,6 +52,7 @@
     "electron-builder": "^25.0.0"
   },
   "dependencies": {
+    "iconv-lite": "^0.6.3",
     "three": "^0.177.0"
   }
 }
