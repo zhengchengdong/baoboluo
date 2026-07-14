@@ -33,6 +33,9 @@ app.commandLine.appendSwitch('enable-gpu-rasterization');
 
 let mainWindow = null;
 let barrageProcess = null;
+let barrageWs = null;
+let barrageWsReconnectTimer = null;
+const BARRAGE_WS_PORT = 8888;
 
 // ── 启动抖音弹幕抓取服务 ──
 function startBarrageServer() {
@@ -56,11 +59,11 @@ function startBarrageServer() {
   });
 
   barrageProcess.stdout?.on('data', (data) => {
-    console.log(`[弹幕] ${iconv.decode(data, 'gbk').trim()}`);
+    console.log(`[弹幕服务-stdout] ${iconv.decode(data, 'gbk').trim()}`);
   });
 
   barrageProcess.stderr?.on('data', (data) => {
-    console.error(`[弹幕-错误] ${iconv.decode(data, 'gbk').trim()}`);
+    console.error(`[弹幕服务-stderr] ${iconv.decode(data, 'gbk').trim()}`);
   });
 
   barrageProcess.on('error', (err) => {
@@ -71,9 +74,114 @@ function startBarrageServer() {
     console.log(`[弹幕服务] 已退出 (code=${code})`);
     barrageProcess = null;
   });
+
+  // 等弹幕服务启动后，连接其 WebSocket 获取弹幕
+  setTimeout(() => connectBarrageWebSocket(), 2000);
+}
+
+// ── 通过 WebSocket 连接弹幕服务，捕获弹幕消息 ──
+function connectBarrageWebSocket() {
+  const wsUrl = `ws://127.0.0.1:${BARRAGE_WS_PORT}`;
+  console.log(`\n╔══════════════════════════════════════╗`);
+  console.log(`║  🎯 弹幕 WebSocket 连接中...          ║`);
+  console.log(`║  ${wsUrl}              ║`);
+  console.log(`╚══════════════════════════════════════╝\n`);
+
+  try {
+    barrageWs = new WebSocket(wsUrl);
+
+    barrageWs.onopen = () => {
+      console.log('✅ [弹幕WebSocket] 已连接！等待抖音直播间弹幕...\n');
+      // 清除重连定时器
+      if (barrageWsReconnectTimer) {
+        clearTimeout(barrageWsReconnectTimer);
+        barrageWsReconnectTimer = null;
+      }
+    };
+
+    barrageWs.onmessage = (event) => {
+      try {
+        const raw = typeof event.data === 'string' ? event.data : event.data.toString();
+        // 尝试解析 JSON（弹幕服务可能发送 JSON 格式）
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          // 不是 JSON，直接打印原始文本
+          console.log(`🎯 [弹幕] ${raw.trim()}`);
+          return;
+        }
+
+        // ── 格式化输出弹幕 ──
+        const msgType = parsed.MsgType ?? parsed.msgType ?? parsed.type ?? '?';
+        const content = parsed.Content ?? parsed.content ?? parsed.msg ?? '';
+        const user = parsed.UserName ?? parsed.userName ?? parsed.nickname ?? '';
+        const roomTitle = parsed.RoomTitle ?? parsed.roomTitle ?? '';
+
+        // 类型名称映射
+        const typeNames = {
+          1: '💬 弹幕',
+          2: '👍 点赞',
+          3: '🚶 进入',
+          4: '⭐ 关注',
+          5: '🎁 礼物',
+          6: '📊 统计',
+          7: '🏷️ 粉丝团',
+          8: '🔗 分享',
+          9: '📴 下播',
+        };
+        const typeLabel = typeNames[msgType] || `📦 类型${msgType}`;
+
+        if (content) {
+          const userStr = user ? ` [${user}]` : '';
+          console.log(`🎯 ${typeLabel}${userStr}: ${content}`);
+        } else if (msgType === 5 && parsed.GiftName) {
+          // 礼物消息特殊处理
+          const count = parsed.GiftCount ?? 1;
+          console.log(`🎯 🎁 礼物 [${user}]: ${parsed.GiftName} x${count}`);
+        } else if (msgType === 2) {
+          const likeCount = parsed.LikeCount ?? parsed.Count ?? '';
+          console.log(`🎯 👍 点赞 [${user}]: ${likeCount}次`);
+        } else if (msgType === 3) {
+          console.log(`🎯 🚶 ${user || '有人'} 进入了直播间`);
+        } else {
+          // 兜底：打印完整 JSON
+          console.log(`🎯 ${typeLabel}: ${JSON.stringify(parsed)}`);
+        }
+      } catch (e) {
+        console.log(`🎯 [弹幕-raw] ${event.data}`);
+      }
+    };
+
+    barrageWs.onerror = (event) => {
+      console.error('❌ [弹幕WebSocket] 连接错误:', event.message || 'unknown error');
+    };
+
+    barrageWs.onclose = (event) => {
+      console.log(`⚠️ [弹幕WebSocket] 连接关闭 (code=${event.code})，3秒后重连...`);
+      barrageWs = null;
+      // 自动重连
+      barrageWsReconnectTimer = setTimeout(() => connectBarrageWebSocket(), 3000);
+    };
+
+  } catch (e) {
+    console.error('❌ [弹幕WebSocket] 创建连接失败:', e.message);
+    // 重试
+    barrageWsReconnectTimer = setTimeout(() => connectBarrageWebSocket(), 3000);
+  }
 }
 
 function stopBarrageServer() {
+  // 关闭 WebSocket 连接
+  if (barrageWs) {
+    try { barrageWs.close(); } catch (e) { /* ignore */ }
+    barrageWs = null;
+  }
+  if (barrageWsReconnectTimer) {
+    clearTimeout(barrageWsReconnectTimer);
+    barrageWsReconnectTimer = null;
+  }
+
   if (barrageProcess && !barrageProcess.killed) {
     console.log('[弹幕服务] 正在关闭...');
     barrageProcess.kill();
