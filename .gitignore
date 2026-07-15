@@ -16,6 +16,9 @@ Thumbs.db
 *.exr
 *.pfx
 
+# Barrage server certs
+WssBarrageServer/crts/
+
 # Build output
 dist/
 build/
