@@ -190,6 +190,10 @@ canvas { display:block; cursor:crosshair; }
  <div class="row"><span>平行光X</span><input type="range" id="sl_dx" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dx">0</span></div>
  <div class="row"><span>平行光Y</span><input type="range" id="sl_dy" min="-10" max="10" step="0.1" value="0"><span class="val" id="sv_dy">0</span></div>
  <div class="row"><span>平行光Z</span><input type="range" id="sl_dz" min="-10" max="10" step="0.1" value="5"><span class="val" id="sv_dz">5</span></div>
+
+ <h3>🎯 弹幕联动</h3>
+ <label>绑皮筋间隔 <span class="val" id="sv_bi2">50</span> ms</label>
+ <input type="range" id="sl_bi2" min="30" max="500" step="10" value="50">
 </div>
 
 <canvas id="canvas"></canvas>
@@ -703,6 +707,12 @@ $('sd_sw').textContent = shadowW;
 $('sd_sh').textContent = shadowH;
 $('sd_svy').textContent = shadowY.toFixed(1);
 updateShadow();
+
+// 🎯 弹幕联动滑块
+$('sl_bi2').oninput = function() {
+  BIND_INTERVAL = +this.value;
+  $('sv_bi2').textContent = BIND_INTERVAL;
+};
 
 // UI sliders
 $('ui_cb').onchange = function() { if (uiPlane) uiPlane.visible = this.checked; };
@@ -3793,22 +3803,88 @@ console.log('   Click surface to bind band (surface normal)');
 console.log('   T = bind circular band  |  R = cut one  |  C = cut all');
 console.log('   Right panel to adjust params');
 
-// ══════ 🎯 弹幕联动：666 绑皮筋 ══════
+// ══════ 🎯 弹幕联动：666 绑皮筋 + 礼物联动 ══════
 // 记录每个玩家本轮累计绑了多少根皮筋，key = User.Id
 let playerBandCount = {};
+
+// ── 皮筋逐个绑队列（避免瞬发）──
+let _bindQueue = 0;       // 待绑定数量
+let _bindTimer = null;    // 定时器 ID
+let BIND_INTERVAL = 50;  // 每根间隔 ms（可由UI调整）
+
+function enqueueBinds(count) {
+  if (boomState !== 'idle' || !loaded) return;
+  _bindQueue += count;
+  if (!_bindTimer) {
+    _bindTimer = setInterval(() => {
+      if (_bindQueue <= 0 || boomState !== 'idle') {
+        clearInterval(_bindTimer);
+        _bindTimer = null;
+        _bindQueue = 0;
+        return;
+      }
+      quickBindBand();
+      _bindQueue--;
+      if (_bindQueue <= 0) {
+        clearInterval(_bindTimer);
+        _bindTimer = null;
+      }
+    }, BIND_INTERVAL);
+  }
+}
+
+// 礼物 → 皮筋映射
+const GIFT_BIND_MAP = {
+  '小心心':   3,
+  '棒棒糖':  10,
+  '加油鸭':  20,
+  '送你花花': 60,
+};
+const GIFT_CUT_MAP = {
+  '大啤酒': 5,
+};
 
 // 监听弹幕消息（来自主进程 IPC）
 if (window.electronAPI && window.electronAPI.onBarrage) {
   window.electronAPI.onBarrage((msg) => {
-    // 只看弹幕类型（Type=1）且内容包含 666
+    const userId = msg.User?.Id;
+    const nickname = msg.User?.Nickname || '?';
+
+    // ── Type 1: 普通弹幕 666 → 绑1根 ──
     if (msg.Type === 1 && msg.Content && /666/.test(msg.Content)) {
-      quickBindBand();
-      // 记录玩家皮筋数
-      const userId = msg.User?.Id;
-      if (userId) {
-        playerBandCount[userId] = (playerBandCount[userId] || 0) + 1;
+      enqueueBinds(1);
+      if (userId) playerBandCount[userId] = (playerBandCount[userId] || 0) + 1;
+      console.log('[666]', nickname, '绑1根, 累计:', playerBandCount);
+    }
+
+    // ── Type 5: 礼物 → 绑N根 / 割N根 ──
+    if (msg.Type === 5 && msg.GiftName) {
+      // 过滤可连击礼物的中间状态：Content 末尾 "==> idXXX|0" 跳过，"|1" 才处理
+      // 没有 "==> id" 标记的普通礼物直接处理
+      const comboMatch = msg.Content?.match(/==>\s*id\d+\|(\d)/);
+      if (comboMatch) {
+        if (comboMatch[1] === '0') {
+          console.log('[礼物]', nickname, msg.GiftName, '连击中... 跳过');
+          return;
+        }
+        // comboMatch[1] === '1' → 连击结束，用 GiftCount 作为最终数量继续处理
       }
-      console.log('[666]', msg.User?.Nickname, '绑皮筋, 累计:', playerBandCount);
+
+      const bindCount = GIFT_BIND_MAP[msg.GiftName];
+      if (bindCount) {
+        const total = bindCount * (msg.GiftCount || 1);
+        enqueueBinds(total);
+        if (userId) playerBandCount[userId] = (playerBandCount[userId] || 0) + total;
+        console.log('[礼物]', nickname, '送出', msg.GiftName, 'x' + (msg.GiftCount || 1), '→ 绑', total, '根, 累计:', playerBandCount);
+      }
+
+      const cutCount = GIFT_CUT_MAP[msg.GiftName];
+      if (cutCount) {
+        const total = cutCount * (msg.GiftCount || 1);
+        const n = Math.min(total, circularBands.length);
+        for (let i = 0; i < n; i++) removeCircularBand();
+        console.log('[礼物]', nickname, '送出', msg.GiftName, 'x' + (msg.GiftCount || 1), '→ 割', n, '根 (剩余', circularBands.length, ')');
+      }
     }
   });
 } else {
@@ -3818,6 +3894,9 @@ if (window.electronAPI && window.electronAPI.onBarrage) {
 // 重置玩家皮筋计数（爆裂/新局时调用）
 function resetPlayerBandCount() {
   playerBandCount = {};
+  // 清空排队中的绑定
+  _bindQueue = 0;
+  if (_bindTimer) { clearInterval(_bindTimer); _bindTimer = null; }
 }
 
 animate();
