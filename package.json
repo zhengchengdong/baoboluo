@@ -19,7 +19,7 @@
       "preload.js",
       "barrageTypes.js",
       "pineapple_CircularBand.html",
-      "ui.png",
+      "res/ui.png",
       "pineapple_py.glb",
       "pineapple.glb",
       "vendor/**",

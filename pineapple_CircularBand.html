@@ -446,7 +446,7 @@ const uiMat = new THREE.MeshBasicMaterial({
   depthTest: false,
   depthWrite: false,
 });
-const uiTexture = new THREE.TextureLoader().load('ui.png', function(tex) {
+const uiTexture = new THREE.TextureLoader().load('res/ui.png', function(tex) {
   tex.colorSpace = THREE.SRGBColorSpace;
   uiMat.map = tex;
   uiMat.needsUpdate = true;
