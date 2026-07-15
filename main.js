@@ -105,6 +105,10 @@ function connectBarrageWebSocket() {
       if (msg) {
         const typeName = MsgTypeName[msg.Type] || `类型${msg.Type}`;
         console.log(`[${typeName}]`, msg);
+        // 转发给渲染进程（游戏页面）
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('barrage', msg);
+        }
       }
     };
 

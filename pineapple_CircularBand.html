@@ -3617,6 +3617,7 @@ function cleanupBoom() {
   boomDebrisData=[];boomJuiceData=[];
   for(const c of boomHeroChunks){if(c.mesh){c.mesh.geometry.dispose();c.mesh.material.dispose();scene.remove(c.mesh);}}
   boomHeroChunks=[];boomState='done';boomCamShake.active=false;
+  resetPlayerBandCount();
   console.log('💥 Cleanup done');
 }
 
@@ -3628,6 +3629,7 @@ function resetBoom() {
   // Ensure staging buffers are unmapped
   try{boomFragStgB.unmap();}catch(e){}
   try{boomChunkStgB.unmap();}catch(e){}
+  resetPlayerBandCount();
   console.log('🔄 Reset');
 }
 
@@ -3790,6 +3792,34 @@ console.log('🔧 皮筋游戏 GPU PBD + Three.js WebGPU');
 console.log('   Click surface to bind band (surface normal)');
 console.log('   T = bind circular band  |  R = cut one  |  C = cut all');
 console.log('   Right panel to adjust params');
+
+// ══════ 🎯 弹幕联动：666 绑皮筋 ══════
+// 记录每个玩家本轮累计绑了多少根皮筋，key = User.Id
+let playerBandCount = {};
+
+// 监听弹幕消息（来自主进程 IPC）
+if (window.electronAPI && window.electronAPI.onBarrage) {
+  window.electronAPI.onBarrage((msg) => {
+    // 只看弹幕类型（Type=1）且内容包含 666
+    if (msg.Type === 1 && msg.Content && /666/.test(msg.Content)) {
+      quickBindBand();
+      // 记录玩家皮筋数
+      const userId = msg.User?.Id;
+      if (userId) {
+        playerBandCount[userId] = (playerBandCount[userId] || 0) + 1;
+      }
+      console.log('[666]', msg.User?.Nickname, '绑皮筋, 累计:', playerBandCount);
+    }
+  });
+} else {
+  console.warn('[弹幕联动] electronAPI 不可用，666 弹幕绑定未启用');
+}
+
+// 重置玩家皮筋计数（爆裂/新局时调用）
+function resetPlayerBandCount() {
+  playerBandCount = {};
+}
+
 animate();
 </script>
 </body>
