@@ -165,6 +165,17 @@ canvas { display:block; cursor:crosshair; }
  <input type="range" id="halo_slsz" min="1" max="20" step="0.5" value="7.5">
  <div class="row"><span>Y偏移</span><input type="range" id="halo_sly" min="-5" max="10" step="0.1" value="-0.4"><span class="val" id="halo_svy">-0.4</span></div>
 
+ <h3>🔢 剩余皮筋数</h3>
+ <label>颜色 <input type="color" id="digit_color" value="#ffffff" style="width:100%;height:28px;border:none;cursor:pointer;"></label>
+ <label>透明度 <span class="val" id="digit_so">1.00</span></label>
+ <input type="range" id="digit_slo" min="0" max="1.0" step="0.01" value="1.00">
+ <label>大小 <span class="val" id="digit_ssz">2.0</span></label>
+ <input type="range" id="digit_slsz" min="0.1" max="8" step="0.01" value="0.21">
+ <label>间距 <span class="val" id="digit_ssp">0.15</span></label>
+ <input type="range" id="digit_slsp" min="0" max="2" step="0.01" value="0.03">
+ <div class="row"><span>X偏移</span><input type="range" id="digit_slx" min="-10" max="10" step="0.01" value="-0.68"><span class="val" id="digit_svx">-0.68</span></div>
+ <div class="row"><span>Y偏移</span><input type="range" id="digit_sly" min="-10" max="10" step="0.01" value="2.46"><span class="val" id="digit_svy">2.46</span></div>
+
  <h3>�🔦 追光灯</h3>
  <label>色相 <span class="val" id="spot_sh">0°</span></label>
  <input type="range" id="spot_slh" min="0" max="360" step="1" value="0">
@@ -588,7 +599,7 @@ $('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUF
 $('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);for(const b of circularBands)b.animDuration=ANIM_DURATION;};
 $('sl_yc').oninput=e=>{BAND_Y_CENTER=+e.target.value;$('sv_yc').textContent=BAND_Y_CENTER.toFixed(2);};
 $('sl_ys').oninput=e=>{BAND_Y_SPREAD=+e.target.value;$('sv_ys').textContent=BAND_Y_SPREAD.toFixed(2);};
-$('sl_bt').oninput=e=>{boomTriggerBandCount=+e.target.value;$('sv_bt').textContent=boomTriggerBandCount;};
+$('sl_bt').oninput=e=>{boomTriggerBandCount=+e.target.value;$('sv_bt').textContent=boomTriggerBandCount;updateDigitDisplay();};
 $('sl_bd').oninput=e=>{BOOM_DEBRIS_COUNT=+e.target.value;$('sv_bd').textContent=BOOM_DEBRIS_COUNT;};
 $('sl_bj').oninput=e=>{BOOM_JUICE_COUNT=+e.target.value;$('sv_bj').textContent=BOOM_JUICE_COUNT;};
 $('sl_bhc').oninput=e=>{BOOM_HERO_COUNT=+e.target.value;_boomK=BOOM_HERO_COUNT;$('sv_bhc').textContent=BOOM_HERO_COUNT;};
@@ -691,6 +702,146 @@ $('halo_ssf').textContent = haloSoft.toFixed(2);
 $('halo_so').textContent = haloOpac.toFixed(2);
 $('halo_ssz').textContent = haloSize;
 updateHalo();
+
+// ══════ 🔢 剩余皮筋数 数字显示 ══════
+// Pre-load all digit textures (0-9) from res/numbers/
+const digitTextures = new Array(10).fill(null);
+const digitTexLoader = new THREE.TextureLoader();
+for (let d = 0; d < 10; d++) {
+  digitTexLoader.load('res/numbers/' + d + '.png', function(tex) {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    digitTextures[d] = tex;
+    // If all textures loaded, init digit planes
+    if (digitTextures.every(t => t !== null)) initDigitPlanes();
+  });
+}
+
+const MAX_DIGITS = 3;
+const digitPlanes = [];        // Array of THREE.Mesh, up to MAX_DIGITS
+const digitGroup = new THREE.Group();
+digitGroup.name = 'digitCountGroup';
+scene.add(digitGroup);
+
+let digitColor = '#ffffff', digitOpac = 1.0, digitSize = 0.21, digitSpacing = 0.03;
+let digitOffsetX = -0.68, digitOffsetY = 2.46;
+let _lastDigitCount = -1;      // Track last displayed count to avoid redundant updates
+
+function initDigitPlanes() {
+  // Dispose old planes if re-initializing
+  for (const p of digitPlanes) {
+    p.geometry.dispose();
+    p.material.dispose();
+    digitGroup.remove(p);
+  }
+  digitPlanes.length = 0;
+
+  // Create up to MAX_DIGITS planes (all hidden initially)
+  // Use a 1x1 base geometry; scale will be set in updateDigitDisplay based on texture aspect
+  const baseGeo = new THREE.PlaneGeometry(1, 1);
+  for (let i = 0; i < MAX_DIGITS; i++) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: digitColor,
+      transparent: true,
+      blending: THREE.NormalBlending,
+      depthTest: true,
+      depthWrite: false,
+      opacity: digitOpac,
+    });
+    const plane = new THREE.Mesh(baseGeo, mat);
+    plane.renderOrder = 1;
+    plane.visible = false;
+    plane.name = 'digitPlane_' + i;
+    digitGroup.add(plane);
+    digitPlanes.push(plane);
+  }
+  _lastDigitCount = -1; // Force update on init
+  updateDigitDisplay();
+}
+
+function updateDigitDisplay() {
+  const boundCount = circularBands ? circularBands.length : 0;
+  const count = Math.max(0, boomTriggerBandCount - boundCount); // 剩余几根就爆炸
+  if (count === _lastDigitCount && digitPlanes.length > 0) return; // No change
+  _lastDigitCount = count;
+
+  // Convert count to string, pad to at least 1 digit
+  const countStr = String(Math.max(0, Math.min(999, count)));
+  const numDigits = countStr.length;
+
+  // Update each digit plane
+  for (let i = 0; i < MAX_DIGITS; i++) {
+    const plane = digitPlanes[i];
+    if (!plane) continue;
+
+    if (i < numDigits) {
+      const digit = parseInt(countStr[i], 10);
+      const tex = digitTextures[digit];
+      if (tex) {
+        plane.material.map = tex;
+        plane.material.color.set(digitColor);
+        plane.material.opacity = digitOpac;
+        plane.material.needsUpdate = true;
+
+        // Scale to maintain aspect ratio (digit images assumed ~square)
+        const aspect = tex.image.width / tex.image.height;
+        plane.scale.set(digitSize * aspect, digitSize, 1);
+        plane.visible = true;
+      }
+    } else {
+      plane.visible = false;
+    }
+  }
+
+  // Position digit planes side by side, centered
+  _positionDigitPlanes(numDigits);
+}
+
+function _positionDigitPlanes(numDigits) {
+  if (numDigits === 0) return;
+  // Calculate total width of all visible digit planes
+  let totalWidth = 0;
+  const widths = [];
+  for (let i = 0; i < numDigits; i++) {
+    const plane = digitPlanes[i];
+    const w = plane.scale.x;
+    widths.push(w);
+    totalWidth += w;
+    if (i < numDigits - 1) totalWidth += digitSpacing;
+  }
+
+  // Center the group horizontally
+  let cursorX = -totalWidth / 2;
+  for (let i = 0; i < numDigits; i++) {
+    const plane = digitPlanes[i];
+    const halfW = widths[i] / 2;
+    plane.position.set(
+      digitOffsetX + cursorX + halfW,
+      digitOffsetY,
+      -2.99  // Same depth as halo, on the backdrop wall
+    );
+    cursorX += widths[i] + digitSpacing;
+  }
+}
+
+// Update digit material properties (called from sliders)
+function updateDigitMaterial() {
+  const c = new THREE.Color(digitColor);
+  for (const plane of digitPlanes) {
+    plane.material.color.copy(c);
+    plane.material.opacity = digitOpac;
+    plane.material.needsUpdate = true;
+  }
+}
+
+// Digit display slider wiring
+$('digit_color').oninput = function() { digitColor = this.value; updateDigitMaterial(); };
+$('digit_slo').oninput = function() { digitOpac = +this.value; $('digit_so').textContent = digitOpac.toFixed(2); updateDigitMaterial(); };
+$('digit_slsz').oninput = function() { digitSize = +this.value; $('digit_ssz').textContent = digitSize.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
+$('digit_slsp').oninput = function() { digitSpacing = +this.value; $('digit_ssp').textContent = digitSpacing.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
+$('digit_slx').oninput = function() { digitOffsetX = +this.value; $('digit_svx').textContent = digitOffsetX.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
+$('digit_sly').oninput = function() { digitOffsetY = +this.value; $('digit_svy').textContent = digitOffsetY.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
 
 // Shadow sliders
 $('sd_slo').oninput = function() { shadowOpac = +this.value; $('sd_so').textContent = shadowOpac.toFixed(2); updateShadow(); };
@@ -1043,6 +1194,7 @@ function addCircularBand(origin, normal){
   circVisDirty=true;markPbdDirty();visUpdateCounter=0;
   H.bcount.textContent=circularBands.length;
   updateLastBandPanel(circularBands.length-1);
+  updateDigitDisplay();
 }
 
 // Update per-band stiffness animations (deep-bite then ease-out)
@@ -1074,6 +1226,7 @@ function removeCircularBand(){
   if(circularBands.length===0&&_circSharedMesh){
     _circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;
   }
+  updateDigitDisplay();
 }
 function removeAllCircularBands(){
   while(circularBands.length>0){
@@ -1084,6 +1237,7 @@ function removeAllCircularBands(){
   needsRestore=true;markPbdDirty();circVisDirty=true;
   H.bcount.textContent=0;
   if(_circSharedMesh){_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}
+  updateDigitDisplay();
 }
 
 // ══════.?Last band panel ══════.?
