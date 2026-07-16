@@ -732,7 +732,17 @@ const MAX_DIGITS = 3;
 const digitPlanes = [];        // Array of THREE.Mesh, up to MAX_DIGITS
 const digitGroup = new THREE.Group();
 digitGroup.name = 'digitCountGroup';
-scene.add(digitGroup);
+
+// ══════ 🔄 Zoom Group — 数字+说明文字整体缩放动画 ══════
+const zoomGroup = new THREE.Group();
+zoomGroup.name = 'zoomGroup';
+zoomGroup.position.set(0, 0, -2.99); // anchored on backdrop wall
+scene.add(zoomGroup);
+zoomGroup.add(digitGroup);
+
+let _zoomT = 2;                // animation progress 0→1, starts "done"
+const ZOOM_DURATION = 0.25;   // seconds
+let _zoomLocalBottom = 0;      // cached min-Y of all visible children in zoomGroup local space
 
 let digitColor = '#ffffff', digitOpac = 1.0, digitSize = 0.21, digitSpacing = 0.03;
 let digitOffsetX = -0.68, digitOffsetY = 2.46;
@@ -829,7 +839,7 @@ function _positionDigitPlanes(numDigits) {
     plane.position.set(
       digitOffsetX + cursorX + halfW,
       digitOffsetY,
-      -2.99  // Same depth as halo, on the backdrop wall
+      0  // depth inherited from zoomGroup
     );
     cursorX += widths[i] + digitSpacing;
   }
@@ -853,7 +863,44 @@ $('digit_slsp').oninput = function() { digitSpacing = +this.value; $('digit_ssp'
 $('digit_slx').oninput = function() { digitOffsetX = +this.value; $('digit_svx').textContent = digitOffsetX.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
 $('digit_sly').oninput = function() { digitOffsetY = +this.value; $('digit_svy').textContent = digitOffsetY.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
 
-// ══════ 📝 说明文字贴图 ──────────────────────
+// ══════ � Zoom 弹跳动画 ──────────────────────
+function _calcZoomBottom() {
+  let bottom = Infinity;
+  // Check digit planes (inside digitGroup, which is at origin in zoomGroup)
+  for (const plane of digitPlanes) {
+    if (!plane.visible) continue;
+    const bmin = plane.position.y - plane.scale.y / 2;
+    if (bmin < bottom) bottom = bmin;
+  }
+  // Check textImgPlane
+  if (textImgPlane && textImgPlane.visible) {
+    const bmin = textImgPlane.position.y - textImgPlane.scale.y / 2;
+    if (bmin < bottom) bottom = bmin;
+  }
+  return isFinite(bottom) ? bottom : 0;
+}
+
+function triggerZoom() {
+  _zoomLocalBottom = _calcZoomBottom();
+  _zoomT = 0;
+}
+
+function updateZoomAnim(dt) {
+  if (_zoomT >= 1) return;
+  _zoomT = Math.min(1, _zoomT + dt / ZOOM_DURATION);
+  const t = _zoomT;
+  // bounce: peak ~1.25 at t≈0.35, decays to 1
+  const s = 1 + 0.3 * Math.sin(Math.PI * t) * (1 - t);
+  zoomGroup.scale.setScalar(s);
+  // compensate Y so bottom edge stays fixed
+  zoomGroup.position.y = _zoomLocalBottom * (1 - s);
+  if (_zoomT >= 1) {
+    zoomGroup.scale.setScalar(1);
+    zoomGroup.position.y = 0;
+  }
+}
+
+// ══════ �📝 说明文字贴图 ──────────────────────
 let textImgPlane = null;
 let textImgVisible = true, textImgSize = 0.21, textImgOffsetX = -0.02, textImgOffsetY = 2.44;
 const textImgLoader = new THREE.TextureLoader();
@@ -875,16 +922,16 @@ textImgLoader.load('res/text1.png', function(tex) {
   textImgPlane = new THREE.Mesh(geo, mat);
   textImgPlane.renderOrder = 1;
   textImgPlane.name = 'textImage';
-  textImgPlane.position.set(textImgOffsetX, textImgOffsetY, -2.99);
+  textImgPlane.position.set(textImgOffsetX, textImgOffsetY, 0);
   textImgPlane.scale.setScalar(textImgSize);
-  scene.add(textImgPlane);
+  zoomGroup.add(textImgPlane);
 });
 
 function updateTextImg() {
   if (!textImgPlane) return;
   textImgPlane.visible = textImgVisible;
   textImgPlane.scale.setScalar(textImgSize);
-  textImgPlane.position.set(textImgOffsetX, textImgOffsetY, -2.99);
+  textImgPlane.position.set(textImgOffsetX, textImgOffsetY, 0);
 }
 
 $('text_cb').onchange = function() { textImgVisible = this.checked; updateTextImg(); };
@@ -1244,6 +1291,7 @@ function addCircularBand(origin, normal){
   H.bcount.textContent=circularBands.length;
   updateLastBandPanel(circularBands.length-1);
   updateDigitDisplay();
+  triggerZoom();
 }
 
 // Update per-band stiffness animations (deep-bite then ease-out)
@@ -3899,6 +3947,9 @@ async function animate(){
   if(!loaded){requestAnimationFrame(animate);return;}
 
   const t0=performance.now();
+
+  // 🔄 Zoom bounce animation (digit+text group)
+  updateZoomAnim(dt);
 
   // ══════ 💥 Boom handling ══════
   if (boomState === 'booming') {
