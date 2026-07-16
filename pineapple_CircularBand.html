@@ -176,6 +176,16 @@ canvas { display:block; cursor:crosshair; }
  <div class="row"><span>X偏移</span><input type="range" id="digit_slx" min="-10" max="10" step="0.01" value="-0.68"><span class="val" id="digit_svx">-0.68</span></div>
  <div class="row"><span>Y偏移</span><input type="range" id="digit_sly" min="-10" max="10" step="0.01" value="2.46"><span class="val" id="digit_svy">2.46</span></div>
 
+ <h3>📝 说明文字</h3>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="text_cb" checked style="accent-color:#44aaff;width:16px;height:16px;">
+  可见
+ </label>
+ <label>大小 <span class="val" id="text_ssz">1.0</span></label>
+ <input type="range" id="text_slsz" min="0.1" max="6" step="0.01" value="0.21">
+ <div class="row"><span>X偏移</span><input type="range" id="text_slx" min="-10" max="10" step="0.01" value="-0.02"><span class="val" id="text_svx">-0.02</span></div>
+ <div class="row"><span>Y偏移</span><input type="range" id="text_sly" min="-10" max="10" step="0.01" value="2.44"><span class="val" id="text_svy">2.44</span></div>
+
  <h3>�🔦 追光灯</h3>
  <label>色相 <span class="val" id="spot_sh">0°</span></label>
  <input type="range" id="spot_slh" min="0" max="360" step="1" value="0">
@@ -842,6 +852,45 @@ $('digit_slsz').oninput = function() { digitSize = +this.value; $('digit_ssz').t
 $('digit_slsp').oninput = function() { digitSpacing = +this.value; $('digit_ssp').textContent = digitSpacing.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
 $('digit_slx').oninput = function() { digitOffsetX = +this.value; $('digit_svx').textContent = digitOffsetX.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
 $('digit_sly').oninput = function() { digitOffsetY = +this.value; $('digit_svy').textContent = digitOffsetY.toFixed(2); _lastDigitCount = -1; updateDigitDisplay(); };
+
+// ══════ 📝 说明文字贴图 ──────────────────────
+let textImgPlane = null;
+let textImgVisible = true, textImgSize = 0.21, textImgOffsetX = -0.02, textImgOffsetY = 2.44;
+const textImgLoader = new THREE.TextureLoader();
+textImgLoader.load('res/text1.png', function(tex) {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  const aspect = tex.image.width / tex.image.height;
+  const geo = new THREE.PlaneGeometry(aspect, 1);
+  const mat = new THREE.MeshBasicMaterial({
+    map: tex,
+    color: '#ffffff',
+    transparent: true,
+    blending: THREE.NormalBlending,
+    depthTest: true,
+    depthWrite: false,
+    opacity: 1.0,
+  });
+  textImgPlane = new THREE.Mesh(geo, mat);
+  textImgPlane.renderOrder = 1;
+  textImgPlane.name = 'textImage';
+  textImgPlane.position.set(textImgOffsetX, textImgOffsetY, -2.99);
+  textImgPlane.scale.setScalar(textImgSize);
+  scene.add(textImgPlane);
+});
+
+function updateTextImg() {
+  if (!textImgPlane) return;
+  textImgPlane.visible = textImgVisible;
+  textImgPlane.scale.setScalar(textImgSize);
+  textImgPlane.position.set(textImgOffsetX, textImgOffsetY, -2.99);
+}
+
+$('text_cb').onchange = function() { textImgVisible = this.checked; updateTextImg(); };
+$('text_slsz').oninput = function() { textImgSize = +this.value; $('text_ssz').textContent = textImgSize.toFixed(2); updateTextImg(); };
+$('text_slx').oninput = function() { textImgOffsetX = +this.value; $('text_svx').textContent = textImgOffsetX.toFixed(2); updateTextImg(); };
+$('text_sly').oninput = function() { textImgOffsetY = +this.value; $('text_svy').textContent = textImgOffsetY.toFixed(2); updateTextImg(); };
 
 // Shadow sliders
 $('sd_slo').oninput = function() { shadowOpac = +this.value; $('sd_so').textContent = shadowOpac.toFixed(2); updateShadow(); };
