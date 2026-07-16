@@ -186,6 +186,16 @@ canvas { display:block; cursor:crosshair; }
  <div class="row"><span>X偏移</span><input type="range" id="text_slx" min="-10" max="10" step="0.01" value="-0.02"><span class="val" id="text_svx">-0.02</span></div>
  <div class="row"><span>Y偏移</span><input type="range" id="text_sly" min="-10" max="10" step="0.01" value="2.44"><span class="val" id="text_svy">2.44</span></div>
 
+ <h3>📊 进度条</h3>
+ <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+  <input type="checkbox" id="prog_cb" checked style="accent-color:#44aaff;width:16px;height:16px;">
+  可见
+ </label>
+ <label>整体缩放 <span class="val" id="prog_ssc">0.25</span></label>
+ <input type="range" id="prog_slsc" min="0.01" max="2.0" step="0.01" value="0.19">
+ <div class="row"><span>X偏移</span><input type="range" id="prog_slx" min="-10" max="10" step="0.01" value="0.00"><span class="val" id="prog_svx">0.00</span></div>
+ <div class="row"><span>Y偏移</span><input type="range" id="prog_sly" min="-10" max="10" step="0.01" value="2.21"><span class="val" id="prog_svy">2.21</span></div>
+
  <h3>�🔦 追光灯</h3>
  <label>色相 <span class="val" id="spot_sh">0°</span></label>
  <input type="range" id="spot_slh" min="0" max="360" step="1" value="0">
@@ -609,7 +619,7 @@ $('sl_ab').oninput=e=>{ANIM_BUFF=+e.target.value;$('sv_ab').textContent=ANIM_BUF
 $('sl_ad').oninput=e=>{ANIM_DURATION=+e.target.value;$('sv_ad').textContent=ANIM_DURATION.toFixed(2);for(const b of circularBands)b.animDuration=ANIM_DURATION;};
 $('sl_yc').oninput=e=>{BAND_Y_CENTER=+e.target.value;$('sv_yc').textContent=BAND_Y_CENTER.toFixed(2);};
 $('sl_ys').oninput=e=>{BAND_Y_SPREAD=+e.target.value;$('sv_ys').textContent=BAND_Y_SPREAD.toFixed(2);};
-$('sl_bt').oninput=e=>{boomTriggerBandCount=+e.target.value;$('sv_bt').textContent=boomTriggerBandCount;updateDigitDisplay();};
+$('sl_bt').oninput=e=>{boomTriggerBandCount=+e.target.value;$('sv_bt').textContent=boomTriggerBandCount;updateDigitDisplay();updateProgressBar();};
 $('sl_bd').oninput=e=>{BOOM_DEBRIS_COUNT=+e.target.value;$('sv_bd').textContent=BOOM_DEBRIS_COUNT;};
 $('sl_bj').oninput=e=>{BOOM_JUICE_COUNT=+e.target.value;$('sv_bj').textContent=BOOM_JUICE_COUNT;};
 $('sl_bhc').oninput=e=>{BOOM_HERO_COUNT=+e.target.value;_boomK=BOOM_HERO_COUNT;$('sv_bhc').textContent=BOOM_HERO_COUNT;};
@@ -866,13 +876,11 @@ $('digit_sly').oninput = function() { digitOffsetY = +this.value; $('digit_svy')
 // ══════ � Zoom 弹跳动画 ──────────────────────
 function _calcZoomBottom() {
   let bottom = Infinity;
-  // Check digit planes (inside digitGroup, which is at origin in zoomGroup)
   for (const plane of digitPlanes) {
     if (!plane.visible) continue;
     const bmin = plane.position.y - plane.scale.y / 2;
     if (bmin < bottom) bottom = bmin;
   }
-  // Check textImgPlane
   if (textImgPlane && textImgPlane.visible) {
     const bmin = textImgPlane.position.y - textImgPlane.scale.y / 2;
     if (bmin < bottom) bottom = bmin;
@@ -938,6 +946,120 @@ $('text_cb').onchange = function() { textImgVisible = this.checked; updateTextIm
 $('text_slsz').oninput = function() { textImgSize = +this.value; $('text_ssz').textContent = textImgSize.toFixed(2); updateTextImg(); };
 $('text_slx').oninput = function() { textImgOffsetX = +this.value; $('text_svx').textContent = textImgOffsetX.toFixed(2); updateTextImg(); };
 $('text_sly').oninput = function() { textImgOffsetY = +this.value; $('text_svy').textContent = textImgOffsetY.toFixed(2); updateTextImg(); };
+
+// ══════ 📊 进度条 — Canvas destination-in ────
+let progVisible = true, progScale = 0.19, progOffsetX = 0.00, progOffsetY = 2.21;
+let progContainerMesh = null, progFillMesh = null, progShadowMesh = null;
+let _progAspect = 1, _progCvs = null, _progCtx = null, _progCvsTex = null;
+
+const progTexLoader = new THREE.TextureLoader();
+let _pcTex = null, _pfImg = null, _progReady = 0;
+
+function _onProgResLoad() {
+  _progReady++;
+  if (_progReady >= 2) _initProgressBar();
+}
+
+progTexLoader.load('res/pc.png', function(tex) {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+  _pcTex = tex;
+  _onProgResLoad();
+});
+// Load pf.png as Image (not texture) for Canvas drawing
+const pfImg = new Image();
+pfImg.onload = function() { _pfImg = pfImg; _onProgResLoad(); };
+pfImg.src = 'res/pf.png';
+
+function _initProgressBar() {
+  if (!_pcTex || !_pfImg) return;
+  _progAspect = _pfImg.width / _pfImg.height;
+
+  // ── Offscreen canvas for fill compositing ──
+  _progCvs = document.createElement('canvas');
+  _progCvs.width = _pfImg.width; _progCvs.height = _pfImg.height;
+  _progCtx = _progCvs.getContext('2d');
+  _progCvsTex = new THREE.CanvasTexture(_progCvs);
+  _progCvsTex.colorSpace = THREE.SRGBColorSpace;
+  _progCvsTex.minFilter = THREE.LinearFilter;
+  _progCvsTex.magFilter = THREE.LinearFilter;
+
+  // ── Single merged plane (container + fill in one canvas) ──
+  const geo = new THREE.PlaneGeometry(_progAspect, 1);
+  const mat = new THREE.MeshBasicMaterial({
+    map: _progCvsTex, color: '#ffffff',
+    transparent: true, blending: THREE.NormalBlending,
+    depthTest: true, depthWrite: false,
+  });
+  progFillMesh = new THREE.Mesh(geo, mat);
+  progFillMesh.renderOrder = 3;
+  progFillMesh.name = 'progFill';
+  scene.add(progFillMesh);
+
+  // ── Shadow plane ──
+  const sGeo = new THREE.PlaneGeometry(_progAspect * 0.96, 0.8);
+  const sMat = new THREE.MeshBasicMaterial({
+    map: _pcTex, color: '#000000',
+    transparent: true, opacity: 0.22,
+    blending: THREE.NormalBlending, depthTest: true, depthWrite: false,
+  });
+  progShadowMesh = new THREE.Mesh(sGeo, sMat);
+  progShadowMesh.renderOrder = 1;
+  progShadowMesh.name = 'progShadow';
+  scene.add(progShadowMesh);
+
+  _applyProgTransform();
+  updateProgressBar();
+}
+
+function _applyProgTransform() {
+  if (!progFillMesh) return;
+  const offY = 0.015;
+  progFillMesh.scale.setScalar(progScale);
+  progFillMesh.position.set(progOffsetX, progOffsetY, -2.99);
+  progFillMesh.visible = progVisible;
+  progShadowMesh.scale.setScalar(progScale);
+  progShadowMesh.position.set(progOffsetX, progOffsetY - progScale * 0.08 - offY, -2.995);
+  progShadowMesh.visible = progVisible;
+}
+
+function updateProgressBar() {
+  if (!_progCtx || !_pfImg) return;
+  const boundCount = circularBands ? circularBands.length : 0;
+  const progress = Math.min(1, Math.max(0, boundCount / (boomTriggerBandCount || 1)));
+
+  const ctx = _progCtx, w = _pfImg.width, h = _pfImg.height;
+  const shift = Math.round((1 - progress) * w);
+
+  // 1. Compute fill pixels: base pf.png masked by shifted pf.png
+  _progCvs.width = w;
+  ctx.drawImage(_pfImg, 0, 0);
+  const baseData = ctx.getImageData(0, 0, w, h);
+  _progCvs.width = w;
+  ctx.drawImage(_pfImg, -shift, 0);
+  const maskData = ctx.getImageData(0, 0, w, h);
+  const b = baseData.data, m = maskData.data;
+  for (let i = 3; i < b.length; i += 4) {
+    b[i] = Math.round(b[i] * m[i] / 255);
+  }
+  // Put fill into a temp canvas
+  const tmpCvs = document.createElement('canvas');
+  tmpCvs.width = w; tmpCvs.height = h;
+  tmpCvs.getContext('2d').putImageData(baseData, 0, 0);
+
+  // 2. Draw container (pc.png), then fill on top (alpha composited)
+  _progCvs.width = w;
+  ctx.drawImage(_pcTex.image, 0, 0, w, h);
+  ctx.drawImage(tmpCvs, 0, 0);
+
+  _progCvsTex.needsUpdate = true;
+}
+
+// Slider wiring
+$('prog_cb').onchange = function() { progVisible = this.checked; _applyProgTransform(); };
+$('prog_slsc').oninput = function() { progScale = +this.value; $('prog_ssc').textContent = progScale.toFixed(2); _applyProgTransform(); };
+$('prog_slx').oninput = function() { progOffsetX = +this.value; $('prog_svx').textContent = progOffsetX.toFixed(2); _applyProgTransform(); };
+$('prog_sly').oninput = function() { progOffsetY = +this.value; $('prog_svy').textContent = progOffsetY.toFixed(2); _applyProgTransform(); };
 
 // Shadow sliders
 $('sd_slo').oninput = function() { shadowOpac = +this.value; $('sd_so').textContent = shadowOpac.toFixed(2); updateShadow(); };
@@ -1291,6 +1413,7 @@ function addCircularBand(origin, normal){
   H.bcount.textContent=circularBands.length;
   updateLastBandPanel(circularBands.length-1);
   updateDigitDisplay();
+  updateProgressBar();
   triggerZoom();
 }
 
@@ -1324,6 +1447,7 @@ function removeCircularBand(){
     _circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;
   }
   updateDigitDisplay();
+  updateProgressBar();
 }
 function removeAllCircularBands(){
   while(circularBands.length>0){
@@ -1335,6 +1459,7 @@ function removeAllCircularBands(){
   H.bcount.textContent=0;
   if(_circSharedMesh){_circSharedMesh.geometry.setDrawRange(0,0);_circSharedMesh.visible=false;}
   updateDigitDisplay();
+  updateProgressBar();
 }
 
 // ══════.?Last band panel ══════.?
