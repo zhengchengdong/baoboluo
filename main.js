@@ -53,10 +53,13 @@ function startBarrageServer() {
 
   console.log('[弹幕服务] 启动中...', exePath);
 
-  barrageProcess = spawn(exePath, [], {
+  // exe 声明了 requireAdministrator（需要改系统代理），裸 CreateProcess 会 EACCES，
+  // 必须走 shell（cmd）触发 UAC 提升
+  barrageProcess = spawn(`"${exePath}"`, [], {
     cwd: barrageDir,
     stdio: 'pipe',
     windowsHide: true,
+    shell: true,
   });
 
   barrageProcess.stdout?.on('data', (data) => {
